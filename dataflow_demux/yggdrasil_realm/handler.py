@@ -176,7 +176,14 @@ class DemuxHandler(BaseHandler):
         if not samplesheets:
             return [self._deferred(ctx, "demux_sample_info missing samplesheets.")]
 
-        hpc_runfolder_path = os.path.join(destination_path, runfolder_id)
+        hpc_base = os.environ.get("DMX_HPC_BASE_PATH", "")
+        if hpc_base:
+            hpc_runfolder_path = os.path.join(
+                hpc_base, destination_path.lstrip("/"), runfolder_id
+            )
+            logger.debug("DMX_HPC_BASE_PATH='%s'; resolved runfolder path: %s", hpc_base, hpc_runfolder_path)
+        else:
+            hpc_runfolder_path = os.path.join(destination_path, runfolder_id)
 
         # Group samplesheet entries by lane_id
         grouped: defaultdict[str, list[dict]] = defaultdict(list)
@@ -196,6 +203,8 @@ class DemuxHandler(BaseHandler):
             "triggering_source": source_db,
             "hpc_runfolder_path": hpc_runfolder_path,
             "runfolder_id": runfolder_id,
+            "samplesheets": samplesheets,
+            "uploaded_lims_info": demux_doc.get("uploaded_lims_info", []),
             "flowcell_status_doc": {
                 "_id": fc_doc.get("_id"),
                 "_rev": fc_doc.get("_rev"),
@@ -207,7 +216,7 @@ class DemuxHandler(BaseHandler):
             },
         }
 
-        # Build the single per-flowcell common plan (validate_runfolder + upload_stats).
+        # Build the single per-flowcell common plan (validate_runfolder + upsert_x_flowcell_pre_demux).
         # Always created, independent of whether any lane plans succeed.
         common_steps = initial_steps(scenario=common_scenario)
         common_plan_draft = PlanDraft(

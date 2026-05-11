@@ -4,7 +4,7 @@ _PREFIX = "dataflow_demux.yggdrasil_realm.steps"
 
 
 def initial_steps(scenario: dict) -> list[StepSpec]:
-    """Per-flowcell common plan: validate_runfolder → upload_stats."""
+    """Per-flowcell common plan: validate_runfolder → upsert_x_flowcell_pre_demux."""
     return [
         StepSpec(
             step_id="validate_runfolder",
@@ -13,9 +13,9 @@ def initial_steps(scenario: dict) -> list[StepSpec]:
             params={"scenario": scenario},
         ),
         StepSpec(
-            step_id="upload_stats",
-            name="Upload Runfolder Stats",
-            fn_ref=f"{_PREFIX}.upload_stats",
+            step_id="upsert_x_flowcell_pre_demux",
+            name="Upsert x_flowcells Pre-Demux Document",
+            fn_ref=f"{_PREFIX}.upsert_x_flowcell_pre_demux",
             params={"scenario": scenario},
             deps=["validate_runfolder"],
         ),
