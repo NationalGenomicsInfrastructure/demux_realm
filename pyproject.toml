@@ -43,3 +43,7 @@ extraPaths = ["../Yggdrasil"]
 
 [tool.mypy]
 mypy_path = ["../Yggdrasil"]
+
+[[tool.mypy.overrides]]
+module = ["pytest"]
+ignore_missing_imports = true
