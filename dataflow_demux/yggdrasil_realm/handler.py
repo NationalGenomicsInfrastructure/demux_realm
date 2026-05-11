@@ -181,7 +181,11 @@ class DemuxHandler(BaseHandler):
             hpc_runfolder_path = os.path.join(
                 hpc_base, destination_path.lstrip("/"), runfolder_id
             )
-            logger.debug("DMX_HPC_BASE_PATH='%s'; resolved runfolder path: %s", hpc_base, hpc_runfolder_path)
+            logger.debug(
+                "DMX_HPC_BASE_PATH='%s'; resolved runfolder path: %s",
+                hpc_base,
+                hpc_runfolder_path,
+            )
         else:
             hpc_runfolder_path = os.path.join(destination_path, runfolder_id)
 
