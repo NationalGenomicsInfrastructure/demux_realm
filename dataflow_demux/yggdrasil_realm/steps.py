@@ -1,18 +1,33 @@
 import json
 import logging
+from pathlib import Path
 
 from yggdrasil.flow.artifacts import SimpleArtifactRef
 from yggdrasil.flow.model import StepResult
 from yggdrasil.flow.step import StepContext, step
 
-from .utils import render_bcl_convert_samplesheet, validate_lane_payload
+from .utils import (
+    build_lims_lookup,
+    build_x_flowcell_payload,
+    derive_xflowcell_name,
+    flatten_samplesheets,
+    parse_run_info_xml,
+    parse_run_parameters_xml,
+    render_bcl_convert_samplesheet,
+    validate_lane_payload,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @step
 def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
-    """Validates that the runfolder exists in the HPC."""
+    """Validates that the runfolder exists in the HPC.
+
+    TODO: verify that the FCID derived from RunInfo.xml (<Run Id> last '_'-separated
+    segment) matches scenario['canonical_flowcell_id'] (sourced from flowcell_status
+    and demux_sample_info) to catch runfolder/sample-sheet mismatches early.
+    """
     hpc_path = scenario["hpc_runfolder_path"]
     logger.info(f"Validating expected HPC runfolder path: {hpc_path}")
 
@@ -22,28 +37,69 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
 
 
 @step
-def upload_stats(ctx: StepContext, scenario: dict) -> StepResult:
-    """Parses XML runfolder stats and uploads them to CouchDB (mocked)."""
-    runfolder_id = scenario.get("runfolder_id", "unknown")
-    logger.info("Uploading runfolder stats for %s to CouchDB (mocked).", runfolder_id)
+def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
+    """Builds the pre-demux x_flowcells document and writes it as a JSON artifact.
 
-    # TODO: parse RunInfo.xml / InterOp stats and upload to flowcell_status CouchDB doc
-    mock_stats = {
-        "runfolder_id": runfolder_id,
-        "status": "mocked",
-        "xml_files_parsed": [],
-        "total_clusters": 0,
-    }
-    stats_file = ctx.workdir / "runfolder_stats.json"
-    stats_file.write_text(json.dumps(mock_stats, indent=2))
-    ctx.record_artifact(SimpleArtifactRef("runfolder_stats", "stats"), path=stats_file)
+    Reads RunInfo.xml and RunParameters.xml from hpc_runfolder_path, flattens
+    demux_sample_info samplesheets into samplesheet_csv, and merges with any
+    existing x_flowcells document (preserving unrelated fields, _id, _rev).
+    CouchDB write is deferred until Yggdrasil exposes write access via DataAccess.
+    """
+    runfolder_path = Path(scenario["hpc_runfolder_path"])
+    runfolder_id = scenario["runfolder_id"]
+    samplesheets = scenario["samplesheets"]
 
+    run_info_path = runfolder_path / "RunInfo.xml"
+    run_params_path = runfolder_path / "RunParameters.xml"
+    for p in (run_info_path, run_params_path):
+        if not p.exists():
+            raise FileNotFoundError(f"Required file missing: {p}")
+
+    if not isinstance(samplesheets, list) or not samplesheets:
+        raise ValueError("scenario['samplesheets'] must be a non-empty list.")
+    for i, entry in enumerate(samplesheets):
+        if not isinstance(entry, dict) or not isinstance(
+            entry.get("BCLConvert_Data"), list
+        ):
+            raise ValueError(f"samplesheets[{i}] missing BCLConvert_Data list.")
+
+    name = derive_xflowcell_name(runfolder_id)
+    run_info = parse_run_info_xml(run_info_path)
+    # <Flowcell> in RunInfo.xml is the chip serial/lot number, not the NGI flowcell ID.
+    # Override with the canonical flowcell ID from the scenario.
+    run_info["Flowcell"] = scenario["canonical_flowcell_id"]
+    run_params = parse_run_parameters_xml(run_params_path)
+    lims_lookup = build_lims_lookup(scenario.get("uploaded_lims_info", []))
+    samplesheet_csv = flatten_samplesheets(
+        samplesheets,
+        flowcell_id=scenario["canonical_flowcell_id"],
+        lims_lookup=lims_lookup,
+    )
+    payload = build_x_flowcell_payload(name, run_info, run_params, samplesheet_csv)
+
+    read_client = ctx.data.couchdb("x_flowcells_db")  # type: ignore[union-attr]
+    existing_doc = read_client.find_one_blocking({"name": name})
+    if existing_doc:
+        # payload overrides pre-demux owned fields; existing _id/_rev and any
+        # unrelated fields (e.g. post-demux Json_Stats) survive via **existing_doc.
+        doc_out = {**existing_doc, **payload}
+        action = "update"
+    else:
+        doc_out = payload
+        action = "create"
+
+    out_file = ctx.workdir / "x_flowcell_pre_demux.json"
+    out_file.write_text(json.dumps(doc_out, indent=2))
+    ctx.record_artifact(
+        SimpleArtifactRef("x_flowcell_pre_demux", "x_flowcells"), path=out_file
+    )
+
+    logger.info("x_flowcell document (%s) written to artifact: %s", action, out_file)
     return StepResult(
         metrics={
-            "stats_upload_status": "mocked",
-            "runfolder_id": runfolder_id,
-            "xml_files_parsed": 0,
-            "total_clusters_mock": 0,
+            "x_flowcell_name": name,
+            "samplesheet_rows": len(samplesheet_csv),
+            "action": action,
         }
     )
 
