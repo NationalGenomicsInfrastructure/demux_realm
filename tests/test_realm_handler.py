@@ -78,7 +78,8 @@ async def test_canonical_matching_scope():
 
 
 @pytest.mark.asyncio
-async def test_identical_plan_reconstruction(mock_ctx):
+async def test_identical_plan_reconstruction(mock_ctx, monkeypatch):
+    monkeypatch.delenv("DMX_HPC_BASE_PATH", raising=False)
     handler = DemuxHandler()
     handler.realm_id = "dmx_realm"
 

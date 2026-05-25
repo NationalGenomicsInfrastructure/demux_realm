@@ -1,7 +1,6 @@
-import json
 import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -12,7 +11,7 @@ from dataflow_demux.yggdrasil_realm.steps import upsert_x_flowcell_pre_demux
 _step = upsert_x_flowcell_pre_demux.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
-# Shared XML content and samplesheet fixture
+# Shared XML content and samplesheet fixtures
 # ---------------------------------------------------------------------------
 
 _RUN_INFO_XML = textwrap.dedent("""\
@@ -91,93 +90,99 @@ def scenario(runfolder):
     }
 
 
-def _make_ctx(tmp_path, existing_doc=None):
+def _make_ctx(tmp_path, *, save_status="created", save_doc_id="couch-id-abc123"):
+    """Return (ctx, x_flowcells_client) with a pre-configured save() mock."""
     ctx = MagicMock()
     ctx.workdir = tmp_path / "workdir"
     ctx.workdir.mkdir(exist_ok=True)
 
+    write_result = MagicMock()
+    write_result.status = save_status
+    write_result.doc_id = save_doc_id
+
     x_flowcells_client = MagicMock()
-    x_flowcells_client.find_one_blocking.return_value = existing_doc
-    ctx.data.couchdb.return_value = x_flowcells_client
+    x_flowcells_client.save.return_value = write_result
+    ctx.data.connection.return_value = x_flowcells_client
     return ctx, x_flowcells_client
 
 
+def _saved_payload(x_client):
+    """Return the doc dict that was passed as the first arg to client.save()."""
+    return x_client.save.call_args.args[0]
+
+
 # ---------------------------------------------------------------------------
-# Create path (no existing doc)
+# CouchDB write — call shape
 # ---------------------------------------------------------------------------
 
 
-def test_step_create_produces_artifact(tmp_path, scenario):
-    ctx, _ = _make_ctx(tmp_path)
-
-    result = _step(ctx, scenario)
-
-    assert result.metrics["action"] == "create"
-    assert result.metrics["x_flowcell_name"] == "20260312_ASC2177698-SC3"
-    assert result.metrics["samplesheet_rows"] == 1
-
-    out_file = ctx.workdir / "x_flowcell_pre_demux.json"
-    assert out_file.exists()
-
-
-def test_step_create_doc_has_no_id_or_rev(tmp_path, scenario):
+def test_step_calls_connection_with_correct_db(tmp_path, scenario):
     ctx, _ = _make_ctx(tmp_path)
     _step(ctx, scenario)
-
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    assert "_id" not in doc
-    assert "_rev" not in doc
+    ctx.data.connection.assert_called_once_with("x_flowcells_db")
 
 
-def test_step_create_doc_has_required_fields(tmp_path, scenario):
-    ctx, _ = _make_ctx(tmp_path)
+def test_step_save_uses_selector_and_upsert_mode(tmp_path, scenario):
+    ctx, x_client = _make_ctx(tmp_path)
     _step(ctx, scenario)
-
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    assert doc["name"] == "20260312_ASC2177698-SC3"
-    assert "RunInfo" in doc
-    assert "RunParameters" in doc
-    assert isinstance(doc["samplesheet_csv"], list)
-    assert len(doc["samplesheet_csv"]) == 1
+    x_client.save.assert_called_once()
+    kwargs = x_client.save.call_args.kwargs
+    assert kwargs["selector"] == {"name": {"$eq": "20260312_ASC2177698-SC3"}}
+    assert kwargs["mode"] == "upsert"
 
 
-def test_step_create_samplesheet_csv_row_fields(tmp_path, scenario):
-    ctx, _ = _make_ctx(tmp_path)
+def test_step_payload_has_no_id_or_rev(tmp_path, scenario):
+    ctx, x_client = _make_ctx(tmp_path)
     _step(ctx, scenario)
+    payload = _saved_payload(x_client)
+    assert "_id" not in payload
+    assert "_rev" not in payload
 
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    row = doc["samplesheet_csv"][0]
+
+# ---------------------------------------------------------------------------
+# Payload content
+# ---------------------------------------------------------------------------
+
+
+def test_step_payload_has_required_fields(tmp_path, scenario):
+    ctx, x_client = _make_ctx(tmp_path)
+    _step(ctx, scenario)
+    payload = _saved_payload(x_client)
+    assert payload["name"] == "20260312_ASC2177698-SC3"
+    assert "RunInfo" in payload
+    assert "RunParameters" in payload
+    assert isinstance(payload["samplesheet_csv"], list)
+    assert len(payload["samplesheet_csv"]) == 1
+
+
+def test_step_run_info_flowcell_is_canonical_fcid(tmp_path, scenario):
+    ctx, x_client = _make_ctx(tmp_path)
+    _step(ctx, scenario)
+    # RunInfo.xml <Flowcell> is chip lot number (BXA66715-2010); step must override
+    # it with canonical_flowcell_id so the document holds the NGI flowcell ID.
+    assert _saved_payload(x_client)["RunInfo"]["Flowcell"] == "SC2177698-SC3"
+
+
+def test_step_samplesheet_csv_row_fields(tmp_path, scenario):
+    ctx, x_client = _make_ctx(tmp_path)
+    _step(ctx, scenario)
+    row = _saved_payload(x_client)["samplesheet_csv"][0]
     assert row["Sample_ID"] == "P12345_1001"
     assert row["index"] == "ACGTACGTAA"
     assert row["index2"] == "TGCATGCATT"
     assert row["Sample_Project"] == "G__Example_26_03"
 
 
-def test_step_run_info_flowcell_is_canonical_fcid(tmp_path, scenario):
-    ctx, _ = _make_ctx(tmp_path)
-    _step(ctx, scenario)
-
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    # RunInfo.xml <Flowcell> is chip lot number (BXA66715-2010); step must override
-    # it with canonical_flowcell_id so the document holds the NGI flowcell ID.
-    assert doc["RunInfo"]["Flowcell"] == "SC2177698-SC3"
-
-
 def test_step_samplesheet_csv_has_fcid(tmp_path, scenario):
-    ctx, _ = _make_ctx(tmp_path)
+    ctx, x_client = _make_ctx(tmp_path)
     _step(ctx, scenario)
-
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    assert doc["samplesheet_csv"][0]["FCID"] == "SC2177698-SC3"
+    assert _saved_payload(x_client)["samplesheet_csv"][0]["FCID"] == "SC2177698-SC3"
 
 
 def test_step_samplesheet_csv_has_lims_fields(tmp_path, scenario):
-    ctx, _ = _make_ctx(tmp_path)
+    ctx, x_client = _make_ctx(tmp_path)
     _step(ctx, scenario)
-
-    row = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())[
-        "samplesheet_csv"
-    ][0]
+    row = _saved_payload(x_client)["samplesheet_csv"][0]
     assert row["Sample_Ref"] == "Human (GRCh38)"
     assert row["Description"] == "G__Example_26_03"
     assert row["Control"] == "N"
@@ -187,92 +192,32 @@ def test_step_samplesheet_csv_has_lims_fields(tmp_path, scenario):
 
 def test_step_samplesheet_csv_no_lims_when_not_provided(tmp_path, scenario):
     scenario["uploaded_lims_info"] = []
-    ctx, _ = _make_ctx(tmp_path)
+    ctx, x_client = _make_ctx(tmp_path)
     _step(ctx, scenario)
-
-    row = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())[
-        "samplesheet_csv"
-    ][0]
+    row = _saved_payload(x_client)["samplesheet_csv"][0]
     assert "Description" not in row
     assert "Operator" not in row
 
 
 # ---------------------------------------------------------------------------
-# Update path (existing doc present)
+# StepResult metrics
 # ---------------------------------------------------------------------------
 
 
-def test_step_update_action_reported(tmp_path, scenario):
-    existing = {
-        "_id": "abc123",
-        "_rev": "3-xyz",
-        "name": "20260312_ASC2177698-SC3",
-        "RunInfo": {"Id": "old"},
-    }
-    ctx, _ = _make_ctx(tmp_path, existing_doc=existing)
-
+def test_step_metrics_on_create(tmp_path, scenario):
+    ctx, _ = _make_ctx(tmp_path, save_status="created", save_doc_id="new-id-001")
     result = _step(ctx, scenario)
-    assert result.metrics["action"] == "update"
+    assert result.metrics["x_flowcell_name"] == "20260312_ASC2177698-SC3"
+    assert result.metrics["samplesheet_row_count"] == 1
+    assert result.metrics["write_status"] == "created"
+    assert result.metrics["doc_id"] == "new-id-001"
 
 
-def test_step_update_preserves_id_and_rev(tmp_path, scenario):
-    existing = {
-        "_id": "abc123",
-        "_rev": "3-xyz",
-        "name": "20260312_ASC2177698-SC3",
-        "RunInfo": {"Id": "old"},
-    }
-    ctx, _ = _make_ctx(tmp_path, existing_doc=existing)
-    _step(ctx, scenario)
-
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    assert doc["_id"] == "abc123"
-    assert doc["_rev"] == "3-xyz"
-
-
-def test_step_update_overrides_owned_fields(tmp_path, scenario):
-    existing = {
-        "_id": "abc123",
-        "_rev": "3-xyz",
-        "name": "20260312_ASC2177698-SC3",
-        "RunInfo": {"Id": "old-id", "stale": True},
-    }
-    ctx, _ = _make_ctx(tmp_path, existing_doc=existing)
-    _step(ctx, scenario)
-
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    assert doc["RunInfo"]["Id"] == "20260312_SH01140_0005_ASC2177698-SC3"
-    assert "stale" not in doc["RunInfo"]
-
-
-def test_step_update_preserves_unrelated_fields(tmp_path, scenario):
-    existing = {
-        "_id": "abc123",
-        "_rev": "3-xyz",
-        "name": "20260312_ASC2177698-SC3",
-        "RunInfo": {"Id": "old"},
-        "Json_Stats": {"post": "demux data"},
-        "Undetermined": 1234,
-    }
-    ctx, _ = _make_ctx(tmp_path, existing_doc=existing)
-    _step(ctx, scenario)
-
-    doc = json.loads((ctx.workdir / "x_flowcell_pre_demux.json").read_text())
-    assert doc["Json_Stats"] == {"post": "demux data"}
-    assert doc["Undetermined"] == 1234
-
-
-# ---------------------------------------------------------------------------
-# CouchDB lookup key
-# ---------------------------------------------------------------------------
-
-
-def test_step_queries_by_name(tmp_path, scenario):
-    ctx, x_client = _make_ctx(tmp_path)
-    _step(ctx, scenario)
-    x_client.find_one_blocking.assert_called_once_with(
-        {"name": "20260312_ASC2177698-SC3"}
-    )
+def test_step_metrics_on_update(tmp_path, scenario):
+    ctx, _ = _make_ctx(tmp_path, save_status="updated", save_doc_id="existing-id-999")
+    result = _step(ctx, scenario)
+    assert result.metrics["write_status"] == "updated"
+    assert result.metrics["doc_id"] == "existing-id-999"
 
 
 # ---------------------------------------------------------------------------
