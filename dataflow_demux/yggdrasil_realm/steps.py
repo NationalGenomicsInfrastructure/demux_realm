@@ -1,4 +1,3 @@
-import json
 import logging
 from pathlib import Path
 
@@ -38,12 +37,17 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
-    """Builds the pre-demux x_flowcells document and writes it as a JSON artifact.
+    """Builds the pre-demux x_flowcells document and persists it to CouchDB.
 
     Reads RunInfo.xml and RunParameters.xml from hpc_runfolder_path, flattens
-    demux_sample_info samplesheets into samplesheet_csv, and merges with any
-    existing x_flowcells document (preserving unrelated fields, _id, _rev).
-    CouchDB write is deferred until Yggdrasil exposes write access via DataAccess.
+    demux_sample_info samplesheets into samplesheet_csv (enriched with LIMS
+    fields), and upserts the result into the x_flowcells database via the
+    Yggdrasil DataAccess write API.
+
+    The document is identified by its `name` field (Mango selector). If no
+    matching document exists it is created; if exactly one exists it is updated
+    in place, preserving unrelated fields managed by CouchDB (e.g. _id, _rev,
+    post-demux Json_Stats).
     """
     runfolder_path = Path(scenario["hpc_runfolder_path"])
     runfolder_id = scenario["runfolder_id"]
@@ -77,29 +81,26 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     )
     payload = build_x_flowcell_payload(name, run_info, run_params, samplesheet_csv)
 
-    read_client = ctx.data.couchdb("x_flowcells_db")  # type: ignore[union-attr]
-    existing_doc = read_client.find_one_blocking({"name": name})
-    if existing_doc:
-        # payload overrides pre-demux owned fields; existing _id/_rev and any
-        # unrelated fields (e.g. post-demux Json_Stats) survive via **existing_doc.
-        doc_out = {**existing_doc, **payload}
-        action = "update"
-    else:
-        doc_out = payload
-        action = "create"
-
-    out_file = ctx.workdir / "x_flowcell_pre_demux.json"
-    out_file.write_text(json.dumps(doc_out, indent=2))
-    ctx.record_artifact(
-        SimpleArtifactRef("x_flowcell_pre_demux", "x_flowcells"), path=out_file
+    assert ctx.data is not None, "StepContext.data (DataAccess) was not injected."
+    client = ctx.data.connection("x_flowcells_db")
+    write_result = client.save(
+        payload,
+        selector={"name": {"$eq": name}},
+        mode="upsert",
     )
 
-    logger.info("x_flowcell document (%s) written to artifact: %s", action, out_file)
+    logger.info(
+        "x_flowcell document '%s' %s (doc_id=%s)",
+        name,
+        write_result.status,
+        write_result.doc_id,
+    )
     return StepResult(
         metrics={
             "x_flowcell_name": name,
-            "samplesheet_rows": len(samplesheet_csv),
-            "action": action,
+            "samplesheet_row_count": len(samplesheet_csv),
+            "write_status": write_result.status,
+            "doc_id": write_result.doc_id,
         }
     )
 
