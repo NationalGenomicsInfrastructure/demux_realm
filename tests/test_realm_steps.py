@@ -251,3 +251,10 @@ def test_step_samplesheet_missing_bcl_data_raises(tmp_path, scenario):
     scenario["samplesheets"] = [{"lane": 1}]  # no BCLConvert_Data
     with pytest.raises(ValueError, match="BCLConvert_Data"):
         _step(ctx, scenario)
+
+
+def test_step_raises_when_data_not_injected(tmp_path, scenario):
+    ctx, _ = _make_ctx(tmp_path)
+    ctx.data = None
+    with pytest.raises(RuntimeError, match="DataAccess.*not injected"):
+        _step(ctx, scenario)

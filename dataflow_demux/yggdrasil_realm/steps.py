@@ -81,7 +81,8 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     )
     payload = build_x_flowcell_payload(name, run_info, run_params, samplesheet_csv)
 
-    assert ctx.data is not None, "StepContext.data (DataAccess) was not injected."
+    if ctx.data is None:
+        raise RuntimeError("StepContext.data (DataAccess) was not injected.")
     client = ctx.data.connection("x_flowcells_db")
     write_result = client.save(
         payload,
