@@ -78,7 +78,8 @@ async def test_canonical_matching_scope():
 
 
 @pytest.mark.asyncio
-async def test_identical_plan_reconstruction(mock_ctx):
+async def test_identical_plan_reconstruction(mock_ctx, monkeypatch):
+    monkeypatch.delenv("DMX_HPC_BASE_PATH", raising=False)
     handler = DemuxHandler()
     handler.realm_id = "dmx_realm"
 
@@ -107,7 +108,7 @@ async def test_identical_plan_reconstruction(mock_ctx):
     assert len(plan1) == 2
     assert len(plan2) == 2
 
-    # plan[0] = common plan: 2 steps (validate_runfolder + upload_stats)
+    # plan[0] = common plan: 2 steps (validate_runfolder + upsert_x_flowcell_pre_demux)
     assert plan1[0].auto_run is True
     assert len(plan1[0].plan.steps) == 2
     assert plan1[0].plan.plan_id == "dmx_realm:SC123:init"
