@@ -1,7 +1,7 @@
 [project]
-name = "dmx"
+name = "demux-realm"
 version = "0.0.1"
-description = "Helper script for pre- and post-processing of demultiplexing"
+description = "Yggdrasil realm for demultiplexing planning and pre-demux metadata preparation"
 authors = [
     { name = "Sara Sjunnebo", email = "sara.sjunnebo@scilifelab.se" },
     { name = "Anastasios Glaros", email = "anastasios.glaros@scilifelab.se" }
@@ -25,11 +25,8 @@ dev = [
     "pytest",
 ]
 
-[project.scripts]
-# dataflow-dmx = "dataflow_demux.cli:cli" # Disabled until migrated
-
 [project.entry-points."ygg.realm"]
-dmx_realm = "dataflow_demux.yggdrasil_realm.descriptor:get_realm_descriptor"
+dmx_realm = "demux_realm.descriptor:get_realm_descriptor"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -37,6 +34,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["demux_realm*"]
 
 [tool.pyright]
 extraPaths = ["../Yggdrasil"]
