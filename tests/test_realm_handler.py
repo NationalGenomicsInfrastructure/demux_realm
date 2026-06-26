@@ -2,11 +2,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from dataflow_demux.yggdrasil_realm.descriptor import (
+from demux_realm.descriptor import (
     _build_demux_sample_info_scope,
     _build_flowcell_status_scope,
 )
-from dataflow_demux.yggdrasil_realm.handler import DemuxHandler
+from demux_realm.handler import DemuxHandler
 
 # Minimal valid samplesheet entry reused across tests.
 _VALID_LANE_ENTRY = {

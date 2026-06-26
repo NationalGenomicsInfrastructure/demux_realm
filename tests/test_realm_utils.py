@@ -2,7 +2,7 @@ import textwrap
 
 import pytest
 
-from dataflow_demux.yggdrasil_realm.utils import (
+from demux_realm.utils import (
     build_lims_lookup,
     build_x_flowcell_payload,
     derive_xflowcell_name,

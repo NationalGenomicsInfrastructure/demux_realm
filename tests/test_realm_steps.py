@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from dataflow_demux.yggdrasil_realm.steps import upsert_x_flowcell_pre_demux
+from demux_realm.steps import upsert_x_flowcell_pre_demux
 
 # The @step decorator changes the calling convention; the original function is
 # accessible via __wrapped__ for direct unit testing.

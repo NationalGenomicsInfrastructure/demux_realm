@@ -1,6 +1,6 @@
 from yggdrasil.flow.model import StepSpec
 
-_PREFIX = "dataflow_demux.yggdrasil_realm.steps"
+_PREFIX = "demux_realm.steps"
 
 
 def initial_steps(scenario: dict) -> list[StepSpec]:
