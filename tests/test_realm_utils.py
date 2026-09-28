@@ -1,14 +1,19 @@
 import textwrap
 
 import pytest
+from realm_support import lane_entry
 
 from demux_realm.utils import (
     build_lims_lookup,
     build_x_flowcell_payload,
     derive_xflowcell_name,
     flatten_samplesheets,
+    group_samplesheet_branches,
+    normalize_lane_id,
+    normalize_settings_index,
     parse_run_info_xml,
     parse_run_parameters_xml,
+    validate_lane_payload,
 )
 
 # ---------------------------------------------------------------------------
@@ -598,3 +603,121 @@ def test_flatten_samplesheets_no_lims_lookup_unchanged():
     rows = flatten_samplesheets(samplesheets)
     assert "Description" not in rows[0]
     assert "Operator" not in rows[0]
+
+
+# ---------------------------------------------------------------------------
+# Lane/settings identity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(1, "1"), ("1", "1"), ("01", "1"), (8, "8"), ("10", "10")]
+)
+def test_normalize_lane_id_accepts_equivalent_numbers(value, expected):
+    assert normalize_lane_id(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, "0", -1, True, None, 1.0, "1.0", " 1", "", "a", "\u0661", [1], {"lane": 1}],
+)
+def test_normalize_lane_id_rejects_other_values(value):
+    with pytest.raises(ValueError, match="lane"):
+        normalize_lane_id(value)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(0, "0"), ("00", "0"), (2, "2")])
+def test_normalize_settings_index_accepts_equivalent_numbers(value, expected):
+    assert normalize_settings_index(value) == expected
+
+
+@pytest.mark.parametrize("value", [-1, False, None, "fast", 0.0, ["0"]])
+def test_normalize_settings_index_rejects_other_values(value):
+    with pytest.raises(ValueError, match="settings_index"):
+        normalize_settings_index(value)
+
+
+def test_validate_lane_payload_requires_mapping_header():
+    payload = {**lane_entry(1), "Header": ["FileFormatVersion", "2"]}
+    with pytest.raises(ValueError, match="'Header' must be a mapping"):
+        validate_lane_payload(payload)
+
+
+def test_validate_lane_payload_requires_mapping_settings():
+    payload = {**lane_entry(1), "raw_samplesheet_settings": "x,1"}
+    with pytest.raises(ValueError, match="'raw_samplesheet_settings' must be"):
+        validate_lane_payload(payload)
+
+
+def test_validate_lane_payload_checks_row_lane_only_when_expected():
+    payload = lane_entry(2, row_lane="1")
+    validate_lane_payload(payload)
+    with pytest.raises(ValueError, match="row 0 has Lane '1'.*lane 2"):
+        validate_lane_payload(payload, expected_lane="2")
+
+
+def test_validate_lane_payload_rejects_unreadable_row_lane():
+    with pytest.raises(ValueError, match="row 0: lane must be"):
+        validate_lane_payload(lane_entry(1, row_lane="L1"), expected_lane="1")
+
+
+def test_group_single_entry_without_settings_defaults_to_zero():
+    entry = lane_entry(1)
+    branches, issues = group_samplesheet_branches([entry])
+    assert issues == []
+    assert [(b.lane_id, b.settings_index, b.source_index) for b in branches] == [
+        ("1", "0", 0)
+    ]
+    assert branches[0].payload is entry
+
+
+def test_group_sorts_numerically_and_keeps_payload_association():
+    entries = [
+        lane_entry(10),
+        lane_entry(2, settings_index=1),
+        lane_entry("2", settings_index="0"),
+    ]
+    branches, issues = group_samplesheet_branches(entries)
+    assert issues == []
+    assert [(b.lane_id, b.settings_index, b.source_index) for b in branches] == [
+        ("2", "0", 2),
+        ("2", "1", 1),
+        ("10", "0", 0),
+    ]
+    assert [b.payload for b in branches] == [entries[2], entries[1], entries[0]]
+
+
+def test_group_reports_every_issue_and_returns_no_branches():
+    entries = [
+        lane_entry(1),
+        "not an entry",
+        {**lane_entry(3), "lane": None},
+        lane_entry(4, row_lane="5"),
+    ]
+    branches, issues = group_samplesheet_branches(entries)
+    assert branches == []
+    assert [issue["entry_index"] for issue in issues] == [1, 2, 3]
+    assert issues[2]["lane"] == "4"
+
+
+def test_group_rejects_ambiguous_and_duplicate_settings():
+    entries = [
+        lane_entry(1, settings_index=0),
+        lane_entry(1, settings_index="00"),
+        lane_entry(2),
+        lane_entry(2, samples=["X"]),
+    ]
+    branches, issues = group_samplesheet_branches(entries)
+    assert branches == []
+    reasons = {issue["entry_index"]: issue["reason"] for issue in issues}
+    assert "also used by entries [1]" in reasons[0]
+    assert "also used by entries [0]" in reasons[1]
+    assert "explicit settings_index" in reasons[2]
+    assert "explicit settings_index" in reasons[3]
+
+
+@pytest.mark.parametrize("samplesheets", [{"lane": 1}, [], None])
+def test_group_rejects_non_list_or_empty_collections(samplesheets):
+    branches, issues = group_samplesheet_branches(samplesheets)
+    assert branches == []
+    assert [issue["entry_index"] for issue in issues] == [None]

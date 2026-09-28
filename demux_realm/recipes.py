@@ -1,73 +1,93 @@
+from pathlib import Path
+
 from yggdrasil.flow.model import StepSpec
+
+from .utils import (
+    DEMUX_CONFIG_FILENAME,
+    RUN_INFO_XML,
+    RUN_PARAMETERS_XML,
+    SAMPLESHEET_FILENAME,
+)
 
 _PREFIX = "demux_realm.steps"
 
+VALIDATE_RUNFOLDER = "validate_runfolder"
+UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
 
-def initial_steps(scenario: dict) -> list[StepSpec]:
-    """Per-flowcell common plan: validate_runfolder → upsert_x_flowcell_pre_demux."""
+# (stage, step name, step function, required outputs) of every branch, in order.
+# Relative outputs resolve inside each producer's own work directory.
+_BRANCH_STAGES: tuple[tuple[str, str, str, dict[str, str]], ...] = (
+    (
+        "materialize_config",
+        "Materialize Demux Config",
+        "materialize_extra_config",
+        {"demux_config": DEMUX_CONFIG_FILENAME},
+    ),
+    (
+        "generate_samplesheet",
+        "Generate SampleSheet.csv",
+        "generate_samplesheet",
+        {"samplesheet": SAMPLESHEET_FILENAME},
+    ),
+    ("execute_demux", "Simulate Execute Demux (Nextflow)", "execute_demux", {}),
+    ("collect_results", "Collect Results and Artifacts", "collect_results", {}),
+    ("upload_results", "Upload/Simulate Upload Results", "upload_results", {}),
+)
+
+
+def branch_namespace(lane_id: str, settings_index: str) -> str:
+    """Return the step-ID prefix of one lane/settings branch, e.g. lane_2_settings_0."""
+    return f"lane_{lane_id}_settings_{settings_index}"
+
+
+def initial_steps(validation_scenario: dict, metadata_scenario: dict) -> list[StepSpec]:
+    """Shared flowcell steps: validate_runfolder → upsert_x_flowcell_pre_demux."""
+    runfolder = Path(metadata_scenario["hpc_runfolder_path"])
     return [
         StepSpec(
-            step_id="validate_runfolder",
+            step_id=VALIDATE_RUNFOLDER,
             name="Validate Runfolder in HPC",
             fn_ref=f"{_PREFIX}.validate_runfolder",
-            params={"scenario": scenario},
+            params={"scenario": validation_scenario},
         ),
         StepSpec(
-            step_id="upsert_x_flowcell_pre_demux",
+            step_id=UPSERT_X_FLOWCELL,
             name="Upsert x_flowcells Pre-Demux Document",
             fn_ref=f"{_PREFIX}.upsert_x_flowcell_pre_demux",
-            params={"scenario": scenario},
-            deps=["validate_runfolder"],
+            params={"scenario": metadata_scenario},
+            deps=[VALIDATE_RUNFOLDER],
+            inputs={
+                "run_info_xml": str(runfolder / RUN_INFO_XML),
+                "run_parameters_xml": str(runfolder / RUN_PARAMETERS_XML),
+            },
         ),
     ]
 
 
-def demux_pipeline(scenario: dict) -> list[StepSpec]:
+def demux_pipeline(
+    namespace: str, scenario: dict, first_deps: list[str], label: str
+) -> list[StepSpec]:
+    """One lane/settings branch: five steps, each depending on the one before.
+
+    Args:
+        namespace: Step-ID prefix unique to the branch (see branch_namespace).
+        scenario: Parameters of the branch's steps.
+        first_deps: Shared steps that must succeed before the branch starts.
+        label: Branch description used in step names, e.g. "lane 2, settings 0".
     """
-    Per-lane/settings demux steps.
-    validate_runfolder is included here as well as in the common plan — lane plans
-    are independent and cannot rely on the common plan having already executed.
-    """
-    return [
-        StepSpec(
-            step_id="validate_runfolder",
-            name="Validate Runfolder in HPC",
-            fn_ref=f"{_PREFIX}.validate_runfolder",
-            params={"scenario": scenario},
-        ),
-        StepSpec(
-            step_id="materialize_config",
-            name="Materialize Demux Config",
-            fn_ref=f"{_PREFIX}.materialize_extra_config",
-            params={"scenario": scenario},
-            deps=["validate_runfolder"],
-        ),
-        StepSpec(
-            step_id="generate_samplesheet",
-            name="Generate SampleSheet.csv",
-            fn_ref=f"{_PREFIX}.generate_samplesheet",
-            params={"scenario": scenario},
-            deps=["materialize_config"],
-        ),
-        StepSpec(
-            step_id="execute_demux",
-            name="Simulate Execute Demux (Nextflow)",
-            fn_ref=f"{_PREFIX}.execute_demux",
-            params={"scenario": scenario},
-            deps=["generate_samplesheet"],
-        ),
-        StepSpec(
-            step_id="collect_results",
-            name="Collect Results and Artifacts",
-            fn_ref=f"{_PREFIX}.collect_results",
-            params={"scenario": scenario},
-            deps=["execute_demux"],
-        ),
-        StepSpec(
-            step_id="upload_results",
-            name="Upload/Simulate Upload Results",
-            fn_ref=f"{_PREFIX}.upload_results",
-            params={"scenario": scenario},
-            deps=["collect_results"],
-        ),
-    ]
+    steps: list[StepSpec] = []
+    deps = list(first_deps)
+    for stage, name, fn_name, outputs in _BRANCH_STAGES:
+        step_id = f"{namespace}__{stage}"
+        steps.append(
+            StepSpec(
+                step_id=step_id,
+                name=f"{name} ({label})",
+                fn_ref=f"{_PREFIX}.{fn_name}",
+                params={"scenario": scenario},
+                deps=deps,
+                outputs=dict(outputs),
+            )
+        )
+        deps = [step_id]
+    return steps
