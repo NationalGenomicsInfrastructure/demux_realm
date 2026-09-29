@@ -4,15 +4,14 @@ from typing import Any, ClassVar
 
 from lib.core_utils.event_types import EventType
 from yggdrasil.flow.base_handler import BaseHandler
-from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan
+from yggdrasil.flow.model import Plan
 from yggdrasil.flow.planner import PlanDraft, PlanningContext
 
 from .recipes import (
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
     branch_namespace,
-    demux_pipeline,
-    initial_steps,
+    build_demux_plan,
 )
 from .utils import group_samplesheet_branches, normalize_flowcell_id
 
@@ -278,52 +277,31 @@ class DemuxHandler(BaseHandler):
                 )
             ]
 
-        # Execution parameters only: provenance stays in the preview so that
-        # revision or trigger changes do not invalidate reuse.
-        common = {
-            "canonical_flowcell_id": canonical_fcid,
-            "runfolder_id": runfolder_id,
-            "hpc_runfolder_path": hpc_runfolder_path,
-        }
-        metadata_scenario = {
-            **common,
-            "samplesheets": samplesheets,
-            "uploaded_lims_info": demux_doc.get("uploaded_lims_info", []),
-        }
-        steps = initial_steps(dict(common), metadata_scenario)
-
+        plan = build_demux_plan(
+            plan_id=self._plan_id(canonical_fcid),
+            realm=self._require_realm_id(),
+            canonical_fcid=canonical_fcid,
+            runfolder_id=runfolder_id,
+            hpc_runfolder_path=hpc_runfolder_path,
+            samplesheets=samplesheets,
+            uploaded_lims_info=demux_doc.get("uploaded_lims_info", []),
+            metadata=demux_doc.get("metadata", {}),
+            branches=branches,
+            branch_prerequisites=self.branch_prerequisites,
+        )
         branch_summaries = []
         for branch in branches:
-            branch_scenario = {
-                **common,
-                "lane_id": branch.lane_id,
-                "settings_index": branch.settings_index,
-                "samplesheet_payload": branch.payload,
-                "demux_sample_info_doc": {"metadata": demux_doc.get("metadata", {})},
-            }
-            branch_steps = demux_pipeline(
-                branch_namespace(branch.lane_id, branch.settings_index),
-                branch_scenario,
-                list(self.branch_prerequisites),
-                label=f"lane {branch.lane_id}, settings {branch.settings_index}",
-            )
-            steps.extend(branch_steps)
+            prefix = f"{branch_namespace(branch.lane_id, branch.settings_index)}__"
             branch_summaries.append(
                 {
                     "lane_id": branch.lane_id,
                     "settings_index": branch.settings_index,
                     "source_index": branch.source_index,
-                    "step_ids": [spec.step_id for spec in branch_steps],
+                    "step_ids": [
+                        s.step_id for s in plan.steps if s.step_id.startswith(prefix)
+                    ],
                 }
             )
-
-        plan = Plan(
-            plan_id=self._plan_id(canonical_fcid),
-            realm=self._require_realm_id(),
-            scope={"kind": "flowcell", "id": canonical_fcid},
-            steps=steps,
-            failure_policy=CONTINUE_INDEPENDENT_POLICY,
-        )
         logger.info(
             "Planned %s with %d lane/settings branch(es).",
             plan.plan_id,
@@ -344,12 +322,12 @@ class DemuxHandler(BaseHandler):
                     **provenance,
                     "runfolder_id": runfolder_id,
                     "hpc_runfolder_path": hpc_runfolder_path,
-                    "failure_policy": CONTINUE_INDEPENDENT_POLICY,
+                    "failure_policy": plan.failure_policy,
                     "shared_step_ids": [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL],
                     "branch_prerequisites": list(self.branch_prerequisites),
                     "metadata_required": UPSERT_X_FLOWCELL in self.branch_prerequisites,
                     "branches": branch_summaries,
-                    "step_count": len(steps),
+                    "step_count": len(plan.steps),
                 },
             )
         ]
