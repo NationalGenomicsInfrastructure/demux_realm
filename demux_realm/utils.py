@@ -28,35 +28,31 @@ _BCL_DATA_REQUIRED_ROW_FIELDS: tuple[str, ...] = (
 _BCL_DATA_CONSISTENCY_CHECKED_FIELDS: tuple[str, ...] = ("index2", "OverrideCycles")
 
 
-def _normalize_index(value: object, *, minimum: int, label: str) -> str:
+def _normalize_index(value: object, *, label: str) -> str:
     """Return the decimal string of a non-negative integer identifier.
 
     Accepts an int (not a bool) or a string of ASCII digits, so 1, "1" and
     "01" all normalize to "1".
 
     Raises:
-        ValueError: If value is any other type or form, or below minimum.
+        ValueError: If value is any other type or form, or negative.
     """
-    if isinstance(value, int) and not isinstance(value, bool):
-        number = value
-    elif isinstance(value, str) and value.isascii() and value.isdigit():
-        number = int(value)
-    else:
-        raise ValueError(
-            f"{label} must be an integer or a string of digits, got {value!r}."
-        )
-    if number < minimum:
-        raise ValueError(f"{label} must be at least {minimum}, got {value!r}.")
-    return str(number)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value)
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return str(int(value))
+    raise ValueError(
+        f"{label} must be a non-negative integer or a string of digits, got {value!r}."
+    )
 
 
 def normalize_lane_id(value: object) -> str:
-    """Return the canonical lane ID, a positive integer as a decimal string.
+    """Return the canonical lane ID, a non-negative integer as a string.
 
     Raises:
-        ValueError: If value is not a positive integer or a string of digits.
+        ValueError: If value is not a non-negative integer or a string of digits.
     """
-    return _normalize_index(value, minimum=1, label="lane")
+    return _normalize_index(value, label="lane")
 
 
 def normalize_settings_index(value: object) -> str:
@@ -65,7 +61,7 @@ def normalize_settings_index(value: object) -> str:
     Raises:
         ValueError: If value is not a non-negative integer or a string of digits.
     """
-    return _normalize_index(value, minimum=0, label="settings_index")
+    return _normalize_index(value, label="settings_index")
 
 
 @dataclass(frozen=True)

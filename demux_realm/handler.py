@@ -248,6 +248,17 @@ class DemuxHandler(BaseHandler):
             )
         else:
             hpc_runfolder_path = os.path.join(destination_path, runfolder_id)
+        # A relative path would resolve against the executing process's cwd.
+        if not os.path.isabs(hpc_runfolder_path):
+            return [
+                self._flowcell_diagnostic(
+                    canonical_fcid,
+                    "rejected",
+                    f"runfolder path '{hpc_runfolder_path}' is not absolute; "
+                    "DMX_HPC_BASE_PATH or destination_path must be absolute.",
+                    provenance,
+                )
+            ]
 
         branches, issues = group_samplesheet_branches(samplesheets)
         if issues:

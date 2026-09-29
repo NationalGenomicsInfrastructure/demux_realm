@@ -77,6 +77,8 @@ the counterpart document, matching `SC...` and `ASC...` flowcell IDs, and checks
 that the flowcell has been transferred (`transferred_to_hpc` and
 `final_transfer_started` with a `destination_path`). The runfolder path is
 `<destination_path>/<runfolder_id>`, prefixed by `DMX_HPC_BASE_PATH` when set.
+The result must be absolute; a relative path would depend on the executing
+process's working directory, so the proposal is rejected instead.
 
 For a ready flowcell with `N` valid lane/settings combinations the handler
 returns one plan, run automatically, with `2 + 5N` steps:
@@ -109,7 +111,7 @@ add `upsert_x_flowcell_pre_demux` to `DemuxHandler.branch_prerequisites`: its
 failure then blocks every branch.
 
 **Branch identity.** Every samplesheet entry needs a top-level `lane`: a
-positive integer or a string of digits (`1`, `"1"` and `"01"` are the same
+non-negative integer or a string of digits (`1`, `"1"` and `"01"` are the same
 lane). `settings_index` is a non-negative integer or a string of digits. A
 lane's only entry may omit it and gets settings `0`; a lane with several entries
 needs an explicit, distinct `settings_index` on each. Every
@@ -120,8 +122,9 @@ by lane, then settings index, whatever the order of the source entries.
 one draft with no steps and `auto_run=False`, under the combined plan ID once
 the flowcell is known. A proposal is deferred (`Deferred: ...`) while a
 prerequisite is missing, such as the counterpart document, a transfer event, or
-the samplesheets. It is rejected (`Rejected: ...`) when any samplesheet entry is
-invalid. The draft's `preview["issues"]` lists every problem with its entry
+the samplesheets. It is rejected (`Rejected: ...`) when the runfolder path is
+not absolute or any samplesheet entry is invalid; for samplesheet problems, the
+draft's `preview["issues"]` lists every one with its entry
 index. No shared step or valid branch runs for a rejected proposal.
 
 Yggdrasil stores every draft under its plan ID, so a deferred or rejected draft

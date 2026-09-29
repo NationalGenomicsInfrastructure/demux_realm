@@ -407,14 +407,58 @@ async def test_metadata_can_be_made_a_branch_prerequisite(handler, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_hpc_base_path_prefixes_the_runfolder(handler, monkeypatch):
-    monkeypatch.setenv("DMX_HPC_BASE_PATH", "/proj/hpc")
-    draft = await plan_for(handler, [lane_entry(1)])
-
-    assert (
-        draft.plan.steps[0].params["scenario"]["hpc_runfolder_path"]
-        == "/proj/hpc/incoming/path/230314_A00000_0000_AXXXXX"
+@pytest.mark.parametrize(
+    ("base", "destination", "expected"),
+    [
+        ("/proj/hpc", "/incoming/path", "/proj/hpc/incoming/path"),
+        ("/proj/hpc", "incoming/path", "/proj/hpc/incoming/path"),
+    ],
+)
+async def test_hpc_base_path_prefixes_the_runfolder(
+    handler, monkeypatch, base, destination, expected
+):
+    monkeypatch.setenv("DMX_HPC_BASE_PATH", base)
+    (draft,), _ = await plan_from_flowcell_change(
+        handler,
+        demux_sample_info_doc([lane_entry(1)]),
+        flowcell_status_doc(destination_path=destination),
     )
+
+    runfolder = f"{expected}/230314_A00000_0000_AXXXXX"
+    assert draft.plan.steps[0].params["scenario"]["hpc_runfolder_path"] == runfolder
+    assert draft.plan.steps[1].inputs["run_info_xml"] == f"{runfolder}/RunInfo.xml"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("base", "destination"),
+    [("relative-hpc", "/incoming/path"), (None, "incoming/path")],
+    ids=["relative base", "relative destination without base"],
+)
+async def test_relative_runfolder_path_is_rejected(
+    handler, monkeypatch, base, destination
+):
+    if base:
+        monkeypatch.setenv("DMX_HPC_BASE_PATH", base)
+    (draft,), _ = await plan_from_flowcell_change(
+        handler,
+        demux_sample_info_doc([lane_entry(1)]),
+        flowcell_status_doc(destination_path=destination),
+    )
+
+    assert draft.auto_run is False
+    assert draft.plan.steps == []
+    assert draft.plan.plan_id == PLAN_ID
+    assert draft.notes.startswith("Rejected: runfolder path")
+    assert "is not absolute" in draft.notes
+
+
+@pytest.mark.asyncio
+async def test_lane_zero_is_an_ordinary_branch(handler):
+    draft = await plan_for(handler, [lane_entry(1), lane_entry(0)])
+
+    assert draft.auto_run is True
+    assert [s.step_id for s in draft.plan.steps[2:7]] == branch_ids("lane_0_settings_0")
 
 
 @pytest.mark.asyncio

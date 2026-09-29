@@ -611,7 +611,8 @@ def test_flatten_samplesheets_no_lims_lookup_unchanged():
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"), [(1, "1"), ("1", "1"), ("01", "1"), (8, "8"), ("10", "10")]
+    ("value", "expected"),
+    [(0, "0"), ("00", "0"), (1, "1"), ("1", "1"), ("01", "1"), ("10", "10")],
 )
 def test_normalize_lane_id_accepts_equivalent_numbers(value, expected):
     assert normalize_lane_id(value) == expected
@@ -619,7 +620,7 @@ def test_normalize_lane_id_accepts_equivalent_numbers(value, expected):
 
 @pytest.mark.parametrize(
     "value",
-    [0, "0", -1, True, None, 1.0, "1.0", " 1", "", "a", "\u0661", [1], {"lane": 1}],
+    [-1, True, None, 1.0, "1.0", " 1", "", "-1", "a", "\u0661", [1], {"lane": 1}],
 )
 def test_normalize_lane_id_rejects_other_values(value):
     with pytest.raises(ValueError, match="lane"):
