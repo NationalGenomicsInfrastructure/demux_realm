@@ -20,7 +20,8 @@ from demux_realm.utils import (
 # Minimal XML fixtures
 # ---------------------------------------------------------------------------
 
-_RUN_INFO_ISO_DATE = textwrap.dedent("""\
+_RUN_INFO_ISO_DATE = textwrap.dedent(
+    """\
     <?xml version="1.0"?>
     <RunInfo Version="7">
       <Run Id="20260312_SH01140_0005_ASC2177698-SC3" Number="5">
@@ -34,9 +35,11 @@ _RUN_INFO_ISO_DATE = textwrap.dedent("""\
         <FlowcellLayout LaneCount="1" SurfaceCount="1" SwathCount="9" TileCount="2"/>
       </Run>
     </RunInfo>
-""")
+"""
+)
 
-_RUN_INFO_SHORT_DATE = textwrap.dedent("""\
+_RUN_INFO_SHORT_DATE = textwrap.dedent(
+    """\
     <?xml version="1.0"?>
     <RunInfo Version="2">
       <Run Id="260312_A00000_0001_ASC123" Number="1">
@@ -49,9 +52,11 @@ _RUN_INFO_SHORT_DATE = textwrap.dedent("""\
         <FlowcellLayout LaneCount="4" SurfaceCount="2" SwathCount="1" TileCount="0"/>
       </Run>
     </RunInfo>
-""")
+"""
+)
 
-_RUN_PARAMS = textwrap.dedent("""\
+_RUN_PARAMS = textwrap.dedent(
+    """\
     <?xml version="1.0"?>
     <RunParameters>
       <InstrumentType>MiSeqi100Plus</InstrumentType>
@@ -59,9 +64,11 @@ _RUN_PARAMS = textwrap.dedent("""\
       <RunId>20260312_SH01140_0005_ASC2177698-SC3</RunId>
       <RunCounter>5</RunCounter>
     </RunParameters>
-""")
+"""
+)
 
-_RUN_PARAMS_FULL = textwrap.dedent("""\
+_RUN_PARAMS_FULL = textwrap.dedent(
+    """\
     <?xml version="1.0"?>
     <RunParameters>
       <Application>MiSeqi100Series Control Software</Application>
@@ -94,7 +101,8 @@ _RUN_PARAMS_FULL = textwrap.dedent("""\
       <RunCounter>5</RunCounter>
       <RecipeName>5M/600_B_Recipe</RecipeName>
     </RunParameters>
-""")
+"""
+)
 
 
 @pytest.fixture
