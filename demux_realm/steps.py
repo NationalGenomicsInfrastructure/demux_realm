@@ -6,6 +6,10 @@ from yggdrasil.flow.model import StepResult
 from yggdrasil.flow.step import StepContext, step
 
 from .utils import (
+    DEMUX_CONFIG_FILENAME,
+    RUN_INFO_XML,
+    RUN_PARAMETERS_XML,
+    SAMPLESHEET_FILENAME,
     build_lims_lookup,
     build_x_flowcell_payload,
     derive_xflowcell_name,
@@ -45,16 +49,16 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     Yggdrasil DataAccess write API.
 
     The document is identified by its `name` field (Mango selector). If no
-    matching document exists it is created; if exactly one exists it is updated
-    in place, preserving unrelated fields managed by CouchDB (e.g. _id, _rev,
-    post-demux Json_Stats).
+    matching document exists it is created; if exactly one exists its whole body
+    is replaced by this payload, keeping only its _id and _rev. Fields written by
+    other processes, such as post-demux Json_Stats, are not preserved.
     """
     runfolder_path = Path(scenario["hpc_runfolder_path"])
     runfolder_id = scenario["runfolder_id"]
     samplesheets = scenario["samplesheets"]
 
-    run_info_path = runfolder_path / "RunInfo.xml"
-    run_params_path = runfolder_path / "RunParameters.xml"
+    run_info_path = runfolder_path / RUN_INFO_XML
+    run_params_path = runfolder_path / RUN_PARAMETERS_XML
     for p in (run_info_path, run_params_path):
         if not p.exists():
             raise FileNotFoundError(f"Required file missing: {p}")
@@ -109,7 +113,7 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
 @step
 def materialize_extra_config(ctx: StepContext, scenario: dict) -> StepResult:
     """Materializes the extra demultiplex config file."""
-    config_file = ctx.workdir / "extra_config_demultiplex.config"
+    config_file = ctx.workdir / DEMUX_CONFIG_FILENAME
     logger.info(f"Materializing config to {config_file}")
 
     # Writing a mock standard config
@@ -124,10 +128,10 @@ def generate_samplesheet(ctx: StepContext, scenario: dict) -> StepResult:
     """Generates and writes SampleSheet.csv from the lane-specific samplesheet payload."""
     ss_payload = scenario["samplesheet_payload"]
 
-    validate_lane_payload(ss_payload)
+    validate_lane_payload(ss_payload, expected_lane=scenario.get("lane_id"))
     ss_text = render_bcl_convert_samplesheet(ss_payload)
 
-    ss_file = ctx.workdir / "SampleSheet.csv"
+    ss_file = ctx.workdir / SAMPLESHEET_FILENAME
     ss_file.write_text(ss_text)
 
     logger.info(

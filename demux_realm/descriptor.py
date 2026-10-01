@@ -9,9 +9,8 @@ from .utils import normalize_flowcell_id
 
 
 def _build_demux_sample_info_scope(raw_event: Any) -> dict[str, str]:
-    # CouchDB 3.x ignores include_docs when sent via POST body (IBM Cloudant SDK),
-    # so raw_event.doc is always None. Fall back to the raw change event's _id (UUID)
-    # so the handler can fetch the full document itself.
+    # Without a document, fall back to the change's _id (a UUID); the handler
+    # fetches the document and plans under the canonical flowcell scope.
     doc = getattr(raw_event, "doc", None) or {}
     fcid = doc.get("flowcell_id", "")
     if fcid:

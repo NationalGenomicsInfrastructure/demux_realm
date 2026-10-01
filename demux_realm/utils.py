@@ -1,6 +1,19 @@
 import io
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+# Runfolder files read by the metadata step, and files written by branch steps
+# into their own work directories.
+RUN_INFO_XML = "RunInfo.xml"
+RUN_PARAMETERS_XML = "RunParameters.xml"
+DEMUX_CONFIG_FILENAME = "extra_config_demultiplex.config"
+SAMPLESHEET_FILENAME = "SampleSheet.csv"
+
+# Settings index of a lane's only entry when it does not name one.
+DEFAULT_SETTINGS_INDEX = "0"
 
 # Required fields on every BCLConvert_Data row.
 _BCL_DATA_REQUIRED_ROW_FIELDS: tuple[str, ...] = (
@@ -15,30 +28,172 @@ _BCL_DATA_REQUIRED_ROW_FIELDS: tuple[str, ...] = (
 _BCL_DATA_CONSISTENCY_CHECKED_FIELDS: tuple[str, ...] = ("index2", "OverrideCycles")
 
 
-def resolve_settings_index(entries: list[dict]) -> list[tuple[str, dict]]:
-    """Resolve (settings_idx_str, entry) pairs for samplesheet entries sharing a lane.
+def _normalize_index(value: object, *, label: str) -> str:
+    """Return the decimal string of a non-negative integer identifier.
 
-    Rules:
-      1. Single entry with settings_index    → [(str(settings_index), entry)]
-      2. Single entry without settings_index → [("0", entry)]
-      3. Multiple entries, ANY missing settings_index → raise ValueError (ambiguous)
-      4. Multiple entries, ALL have settings_index   → [(str(si), entry), ...]
+    Accepts an int (not a bool) or a string of ASCII digits, so 1, "1" and
+    "01" all normalize to "1".
 
     Raises:
-        ValueError: if multiple entries are present and any lack settings_index.
+        ValueError: If value is any other type or form, or negative.
     """
-    if len(entries) == 1:
-        raw = entries[0].get("settings_index")
-        return [(str(raw) if raw is not None else "0", entries[0])]
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value)
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return str(int(value))
+    raise ValueError(
+        f"{label} must be a non-negative integer or a string of digits, got {value!r}."
+    )
 
-    missing_count = sum(1 for e in entries if e.get("settings_index") is None)
-    if missing_count:
-        raise ValueError(
-            f"{missing_count} of {len(entries)} entries lack settings_index "
-            f"(ambiguous; all entries for this lane are skipped)."
+
+def normalize_lane_id(value: object) -> str:
+    """Return the canonical lane ID, a non-negative integer as a string.
+
+    Raises:
+        ValueError: If value is not a non-negative integer or a string of digits.
+    """
+    return _normalize_index(value, label="lane")
+
+
+def normalize_settings_index(value: object) -> str:
+    """Return the canonical settings index, a non-negative integer as a string.
+
+    Raises:
+        ValueError: If value is not a non-negative integer or a string of digits.
+    """
+    return _normalize_index(value, label="settings_index")
+
+
+@dataclass(frozen=True)
+class SamplesheetBranch:
+    """One validated lane/settings combination and the entry it came from.
+
+    Attributes:
+        lane_id: Canonical lane ID.
+        settings_index: Canonical settings index.
+        source_index: Position of the entry in demux_sample_info samplesheets.
+        payload: The samplesheet entry, unmodified.
+    """
+
+    lane_id: str
+    settings_index: str
+    source_index: int
+    payload: Mapping[str, Any]
+
+
+def group_samplesheet_branches(
+    samplesheets: object,
+) -> tuple[list[SamplesheetBranch], list[dict[str, Any]]]:
+    """Validate every samplesheet entry and resolve its lane/settings branch.
+
+    Rules:
+      - Every entry must be a mapping with a top-level ``lane`` and a payload
+        that passes validate_lane_payload for that lane.
+      - A lane's only entry without ``settings_index`` gets settings "0".
+      - A lane with several entries needs an explicit ``settings_index`` on each.
+      - No two entries may resolve to the same lane/settings pair.
+
+    Args:
+        samplesheets: demux_sample_info ``samplesheets``.
+
+    Returns:
+        The branches sorted by lane then settings index, and every issue found,
+        each a dict with ``entry_index``, ``lane``, ``settings_index`` and
+        ``reason``. Branches are returned only when there are no issues: any
+        issue makes the whole collection unusable.
+    """
+    issues: list[dict[str, Any]] = []
+
+    def report(
+        index: int | None,
+        reason: str,
+        lane: object = None,
+        settings_index: object = None,
+    ) -> None:
+        issues.append(
+            {
+                "entry_index": index,
+                "lane": lane,
+                "settings_index": settings_index,
+                "reason": reason,
+            }
         )
 
-    return [(str(e["settings_index"]), e) for e in entries]
+    if not isinstance(samplesheets, list):
+        report(None, f"samplesheets must be a list, got {type(samplesheets).__name__}.")
+        return [], issues
+    if not samplesheets:
+        report(None, "samplesheets is empty.")
+        return [], issues
+
+    # lane_id -> [(source_index, settings_index or None, entry)]
+    by_lane: dict[str, list[tuple[int, str | None, Mapping[str, Any]]]] = {}
+    for index, entry in enumerate(samplesheets):
+        if not isinstance(entry, Mapping):
+            report(index, f"entry must be a mapping, got {type(entry).__name__}.")
+            continue
+        if "lane" not in entry:
+            report(index, "entry has no top-level 'lane'.")
+            continue
+        try:
+            lane_id = normalize_lane_id(entry["lane"])
+        except ValueError as exc:
+            report(index, str(exc), lane=entry["lane"])
+            continue
+
+        raw_settings = entry.get("settings_index")
+        settings_index: str | None = None
+        if raw_settings is not None:
+            try:
+                settings_index = normalize_settings_index(raw_settings)
+            except ValueError as exc:
+                report(index, str(exc), lane=lane_id, settings_index=raw_settings)
+                continue
+
+        try:
+            validate_lane_payload(entry, expected_lane=lane_id)
+        except ValueError as exc:
+            report(index, str(exc), lane=lane_id, settings_index=settings_index)
+        by_lane.setdefault(lane_id, []).append((index, settings_index, entry))
+
+    sources: dict[tuple[str, str], list[int]] = {}
+    for lane_id, group in by_lane.items():
+        for index, settings_index, _ in group:
+            if settings_index is None:
+                if len(group) > 1:
+                    report(
+                        index,
+                        f"lane {lane_id} has {len(group)} entries, so each needs "
+                        f"an explicit settings_index.",
+                        lane=lane_id,
+                    )
+                    continue
+                settings_index = DEFAULT_SETTINGS_INDEX
+            sources.setdefault((lane_id, settings_index), []).append(index)
+
+    for (lane_id, settings_index), indices in sources.items():
+        if len(indices) > 1:
+            for index in indices:
+                others = [i for i in indices if i != index]
+                report(
+                    index,
+                    f"lane {lane_id} / settings {settings_index} is also used by "
+                    f"entries {others}.",
+                    lane=lane_id,
+                    settings_index=settings_index,
+                )
+
+    if issues:
+        issues.sort(key=lambda i: -1 if i["entry_index"] is None else i["entry_index"])
+        return [], issues
+
+    entries = {index: entry for group in by_lane.values() for index, _, entry in group}
+    branches = [
+        SamplesheetBranch(lane_id, settings_index, index, entries[index])
+        for (lane_id, settings_index), (index,) in sources.items()
+    ]
+    branches.sort(key=lambda b: (int(b.lane_id), int(b.settings_index)))
+    return branches, []
 
 
 def normalize_flowcell_id(fcid: str) -> str:
@@ -49,22 +204,35 @@ def normalize_flowcell_id(fcid: str) -> str:
     return fcid
 
 
-def validate_lane_payload(lane_payload: dict) -> None:
+def validate_lane_payload(
+    lane_payload: Mapping[str, Any], expected_lane: str | None = None
+) -> None:
     """Validate a single lane samplesheet payload before rendering.
 
     Checks:
-    - Top-level required keys are present.
+    - Top-level required keys are present; Header and raw_samplesheet_settings
+      are mappings.
     - BCLConvert_Data is a non-empty list of dicts.
     - Every row contains the required row fields.
     - Optional fields (index2, OverrideCycles) are consistent: present in all
       rows or absent from all rows.
+    - When expected_lane is given, every row's Lane normalizes to it.
 
     Raises:
         ValueError: on any structural or content problem.
     """
+    if not isinstance(lane_payload, Mapping):
+        raise ValueError(
+            f"Lane payload must be a mapping, got {type(lane_payload).__name__}."
+        )
     for key in ("Header", "raw_samplesheet_settings", "BCLConvert_Data"):
         if key not in lane_payload:
             raise ValueError(f"Lane payload missing required key '{key}'.")
+    for key in ("Header", "raw_samplesheet_settings"):
+        if not isinstance(lane_payload[key], Mapping):
+            raise ValueError(
+                f"'{key}' must be a mapping, got {type(lane_payload[key]).__name__}."
+            )
 
     data = lane_payload["BCLConvert_Data"]
     if not isinstance(data, list):
@@ -80,6 +248,16 @@ def validate_lane_payload(lane_payload: dict) -> None:
             raise ValueError(
                 f"BCLConvert_Data row {i} missing required field(s): {missing}."
             )
+        if expected_lane is not None:
+            try:
+                row_lane = normalize_lane_id(row["Lane"])
+            except ValueError as exc:
+                raise ValueError(f"BCLConvert_Data row {i}: {exc}") from exc
+            if row_lane != expected_lane:
+                raise ValueError(
+                    f"BCLConvert_Data row {i} has Lane {row['Lane']!r}, but the "
+                    f"entry is for lane {expected_lane}."
+                )
 
     # Consistency check: optional fields must be uniformly present or absent.
     for field in _BCL_DATA_CONSISTENCY_CHECKED_FIELDS:
