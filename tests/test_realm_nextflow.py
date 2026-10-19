@@ -173,9 +173,10 @@ def test_run_nextflow_streams_output_to_log():
             [sys.executable, "-c", "print('line one'); print('line two', file=__import__('sys').stderr)"],
             log_path,
         )
+        log_text = log_path.read_text()
     assert proc.returncode == 0
     assert proc.stdout == "line one\nline two\n"
-    assert log_path.read_text() == "line one\nline two\n"
+    assert log_text == "line one\nline two\n"
 
 
 def test_command_has_no_stable_run_name():
