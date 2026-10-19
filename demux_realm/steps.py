@@ -14,7 +14,6 @@ from .utils import (
     build_x_flowcell_payload,
     derive_xflowcell_name,
     flatten_samplesheets,
-    normalize_flowcell_id,
     parse_run_info_xml,
     parse_run_parameters_xml,
     render_bcl_convert_samplesheet,
@@ -26,13 +25,7 @@ logger = logging.getLogger(__name__)
 
 @step
 def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
-    """Validate that the runfolder is present and matches the canonical FCID.
-
-    The FCID is derived from the last '_'-separated part of RunInfo.xml's
-    <Run Id> field (e.g. ASC2177698-SC3 → SC2177698-SC3) and must match the
-    scenario's canonical flowcell ID. This catches mismatched runfolders before
-    demultiplexing proceeds.
-    """
+    """Validate that the runfolder is present."""
     hpc_path = Path(scenario["hpc_runfolder_path"])
     if not hpc_path.exists():
         raise FileNotFoundError(f"HPC runfolder not found: {hpc_path}")
@@ -43,33 +36,13 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
     if not canonical_fcid:
         raise ValueError("scenario['canonical_flowcell_id'] is required.")
 
-    run_info_path = hpc_path / RUN_INFO_XML
-    if not run_info_path.exists():
-        raise FileNotFoundError(f"Required file missing: {run_info_path}")
-
-    run_info = parse_run_info_xml(run_info_path)
-    run_id = str(run_info.get("Id", "")).strip()
-    if not run_id or "_" not in run_id:
-        raise ValueError(f"RunInfo.xml <Run Id> is malformed: {run_id!r}")
-
-    derived_fcid = normalize_flowcell_id(run_id.rsplit("_", 1)[-1])
-    expected_fcid = normalize_flowcell_id(canonical_fcid)
-    if derived_fcid != expected_fcid:
-        raise ValueError(
-            "FCID mismatch: RunInfo.xml derived FCID "
-            f"'{derived_fcid}' from '{run_id}' does not match canonical flowcell ID "
-            f"'{expected_fcid}'."
-        )
-
     logger.info(
-        "Validated HPC runfolder %s against canonical flowcell ID %s",
+        "Validated HPC runfolder %s.",
         hpc_path,
-        expected_fcid,
     )
     return StepResult(
         metrics={
             "path_validated": str(hpc_path),
-            "flowcell_id_validated": expected_fcid,
         }
     )
 

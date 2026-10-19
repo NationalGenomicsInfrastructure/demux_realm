@@ -4,11 +4,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from demux_realm.steps import upsert_x_flowcell_pre_demux
+from demux_realm.steps import upsert_x_flowcell_pre_demux, validate_runfolder
 
 # The @step decorator changes the calling convention; the original function is
 # accessible via __wrapped__ for direct unit testing.
 _step = upsert_x_flowcell_pre_demux.__wrapped__  # type: ignore[attr-defined]
+_validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -223,6 +224,19 @@ def test_step_metrics_on_update(tmp_path, scenario):
 # ---------------------------------------------------------------------------
 # Validation errors
 # ---------------------------------------------------------------------------
+
+
+def test_validate_runfolder_exists(runfolder, scenario):
+    ctx = MagicMock()
+    result = _validate_runfolder(ctx, scenario)
+    assert result.metrics["path_validated"] == str(runfolder)
+
+
+def test_validate_runfolder_raises_on_missing_path(runfolder, scenario):
+    ctx = MagicMock()
+    scenario["hpc_runfolder_path"] = str(runfolder / "nonexistent")
+    with pytest.raises(FileNotFoundError, match="HPC runfolder not found"):
+        _validate_runfolder(ctx, scenario)
 
 
 def test_step_missing_run_info_raises(tmp_path, scenario):
