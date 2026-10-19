@@ -237,6 +237,13 @@ def test_validate_runfolder_raises_on_missing_path(runfolder, scenario):
     scenario["hpc_runfolder_path"] = str(runfolder / "nonexistent")
     with pytest.raises(FileNotFoundError, match="HPC runfolder not found"):
         _validate_runfolder(ctx, scenario)
+        
+def test_validate_runfolder_raises_on_not_a_directory(runfolder, scenario):
+    ctx = MagicMock()
+    scenario["hpc_runfolder_path"] = str(runfolder / "not_a_directory")
+    (runfolder / "not_a_directory").touch()
+    with pytest.raises(NotADirectoryError, match="HPC runfolder path is not a directory"):
+        _validate_runfolder(ctx, scenario)
 
 
 def test_step_missing_run_info_raises(tmp_path, scenario):
