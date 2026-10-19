@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shlex
 import subprocess
 from collections.abc import Mapping
@@ -98,21 +97,6 @@ def branch_run_tag(
     return f"{canonical_flowcell_id}/lane_{lane_id}_settings_{settings_index}"
 
 
-def sanitize_run_name(raw: str) -> str:
-    """Sanitize a string into a valid Nextflow run name.
-
-    Nextflow requires ^[a-z](?:[a-z\\d]|[-_](?=[a-z\\d])){0,79}$: lowercase,
-    starting with a letter, at most 80 characters, and no leading/trailing or
-    consecutive separators. Flowcell ids are typically upper-case and start
-    with digits, so they never pass through unchanged.
-    """
-    name = re.sub(r"[^a-z0-9_-]", "_", raw.lower())
-    name = re.sub(r"[_-]+", "_", name).strip("_-")
-    if not name or not name[0].isalpha():
-        name = f"run_{name}"
-    return name[:80].rstrip("_-")
-
-
 def branch_work_dir(settings: NextflowSettings, tag: str) -> Path:
     """Return the branch's Nextflow work directory (unique per branch)."""
     return settings.work_base / tag
@@ -169,8 +153,10 @@ def build_nextflow_command(
         str(branch_work_dir(settings, tag)),
         "--outdir",
         str(branch_outdir(settings, tag)),
-        "-name",
-        sanitize_run_name(tag.replace("/", "_")),
+        # Deliberately no -name: Nextflow indexes run names per user home
+        # (HOME/.nextflow), so a stable name would collide every time a
+        # branch re-runs (e.g. after a failure). -resume is keyed on the
+        # work dir, not the run name.
         "-resume",
     ]
     cmd += list(settings.extra_args)
