@@ -164,22 +164,30 @@ def build_nextflow_command(
 
 
 def run_nextflow(cmd: list[str], log_path: Path) -> subprocess.CompletedProcess:
-    """Run a Nextflow command, teeing its combined output to log_path.
+    """Run a Nextflow command, streaming its combined output to log_path.
+
+    The log is written line-by-line while the run is in progress (so it can
+    be tailed live), and the combined output is also returned in
+    CompletedProcess.stdout for the caller's error reporting.
 
     Args:
         cmd: The argv from build_nextflow_command.
         log_path: Where to write the combined stdout/stderr (created).
 
     Returns:
-        The CompletedProcess (caller inspects returncode).
+        The CompletedProcess (caller inspects returncode/stdout).
     """
     logger.info("Running: %s", " ".join(shlex.quote(part) for part in cmd))
+    chunks: list[str] = []
     with open(log_path, "w") as log:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        log.write(proc.stdout or "")
-    return proc
+        with subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        ) as proc:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                chunks.append(line)
+                log.write(line)
+                log.flush()
+                logger.debug("nextflow: %s", line.rstrip("\n"))
+            returncode = proc.wait()
+    return subprocess.CompletedProcess(cmd, returncode, stdout="".join(chunks))

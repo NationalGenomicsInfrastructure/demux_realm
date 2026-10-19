@@ -18,6 +18,7 @@ from demux_realm.nextflow import (
     branch_run_tag,
     branch_work_dir,
     build_nextflow_command,
+    run_nextflow,
     settings_from_env,
 )
 
@@ -158,6 +159,23 @@ def test_branch_directories_never_shared():
     )
     dirs = {branch_work_dir(s, t) for t in tags} | {branch_outdir(s, t) for t in tags}
     assert len(dirs) == 6
+
+
+def test_run_nextflow_streams_output_to_log():
+    # The log is written while the process runs (live-tailable), and the
+    # combined output is returned for error reporting.
+    import sys
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "nextflow_run.log"
+        proc = run_nextflow(
+            [sys.executable, "-c", "print('line one'); print('line two', file=__import__('sys').stderr)"],
+            log_path,
+        )
+    assert proc.returncode == 0
+    assert proc.stdout == "line one\nline two\n"
+    assert log_path.read_text() == "line one\nline two\n"
 
 
 def test_command_has_no_stable_run_name():
