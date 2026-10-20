@@ -32,10 +32,6 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
     if not hpc_path.is_dir():
         raise NotADirectoryError(f"HPC runfolder path is not a directory: {hpc_path}")
 
-    canonical_fcid = scenario.get("canonical_flowcell_id")
-    if not canonical_fcid:
-        raise ValueError("scenario['canonical_flowcell_id'] is required.")
-
     logger.info(
         "Validated HPC runfolder %s.",
         hpc_path,
