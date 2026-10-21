@@ -141,7 +141,7 @@ source are recorded in the draft's preview only, so they never invalidate reuse.
 
 | Step | What it does now |
 |---|---|
-| `validate_runfolder` | Placeholder that always succeeds |
+| `validate_runfolder` | Validates that the run folder exists on the HPC |
 | `upsert_x_flowcell_pre_demux` | Reads `RunInfo.xml` and `RunParameters.xml`, then writes the `x_flowcells` document through DataAccess |
 | `materialize_config` | Writes `extra_config_demultiplex.config` |
 | `generate_samplesheet` | Validates the entry again and writes `SampleSheet.csv` |

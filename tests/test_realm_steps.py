@@ -1,13 +1,15 @@
 import textwrap
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 
 from demux_realm.steps import (
     collect_results,
-    upsert_x_flowcell_pre_demux,
     upload_results,
+    upsert_x_flowcell_pre_demux,
+    validate_runfolder,
 )
 
 # The @step decorator changes the calling convention; the original function is
@@ -15,6 +17,7 @@ from demux_realm.steps import (
 _step = upsert_x_flowcell_pre_demux.__wrapped__  # type: ignore[attr-defined]
 _collect_results = collect_results.__wrapped__  # type: ignore[attr-defined]
 _upload_results = upload_results.__wrapped__  # type: ignore[attr-defined]
+_validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -231,6 +234,29 @@ def test_step_metrics_on_update(tmp_path, scenario):
 # ---------------------------------------------------------------------------
 
 
+def test_validate_runfolder_exists(runfolder, scenario):
+    ctx = MagicMock()
+    result = _validate_runfolder(ctx, scenario)
+    assert result.metrics["path_validated"] == str(runfolder)
+
+
+def test_validate_runfolder_raises_on_missing_path(runfolder, scenario):
+    ctx = MagicMock()
+    scenario["hpc_runfolder_path"] = str(runfolder / "nonexistent")
+    with pytest.raises(FileNotFoundError, match="HPC runfolder not found"):
+        _validate_runfolder(ctx, scenario)
+
+
+def test_validate_runfolder_raises_on_not_a_directory(runfolder, scenario):
+    ctx = MagicMock()
+    scenario["hpc_runfolder_path"] = str(runfolder / "not_a_directory")
+    (runfolder / "not_a_directory").touch()
+    with pytest.raises(
+        NotADirectoryError, match="HPC runfolder path is not a directory"
+    ):
+        _validate_runfolder(ctx, scenario)
+
+
 def test_step_missing_run_info_raises(tmp_path, scenario):
     ctx, _ = _make_ctx(tmp_path)
     (Path(scenario["hpc_runfolder_path"]) / "RunInfo.xml").unlink()
@@ -261,7 +287,7 @@ def test_step_samplesheet_missing_bcl_data_raises(tmp_path, scenario):
 
 def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeypatch):
     monkeypatch.setenv("DMX_NF_OUTDIR_BASE", str(tmp_path / "results"))
-    scenario = {
+    scenario: dict[str, Any] = {
         "canonical_flowcell_id": "SC2177698-SC3",
         "lane_id": "1",
         "settings_index": "0",
@@ -281,10 +307,11 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
 
     ctx = MagicMock()
     result = _collect_results(ctx, scenario)
-    assert (
-        scenario["demultiplexing_metadata"]["Demultiplex_Stats"][0]["Sample"]
-        == "P12345_1001"
+    metadata = cast(
+        dict[str, list[dict[str, str]]],
+        scenario["demultiplexing_metadata"],
     )
+    assert metadata["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
     assert result.metrics["fastq_count"] == 0
 
     client = MagicMock()
