@@ -298,7 +298,15 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
-    """Fetch the current x_flowcells doc, merge in the demux CSV metadata, and save it back."""
+    """Fetch the current x_flowcells doc, add this branch's demux CSV metadata
+    under its own field, and save it back.
+
+    Each lane/settings branch publishes its Demultiplex_Stats.csv,
+    Quality_Metrics.csv and Top_Unknown_Barcodes.csv rows under a dedicated
+    top-level field named Demultiplex_lane_<lane_id>_settings_<settings_index>.
+    Since the field is unique per branch, branches never collide and a
+    branch can be re-run without touching any other branch's results.
+    """
     logger.info("Uploading metrics to remote API...")
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
@@ -326,34 +334,11 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
     elif not isinstance(existing, dict):
         raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
 
+    branch_field = (
+        f"Demultiplex_lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
+    )
     updated_doc = dict(existing)
-    lane_id = scenario["lane_id"]
-    settings_index = scenario["settings_index"]
-    for filename, rows in metadata.items():
-        # Each lane/settings branch contributes its own rows to a shared
-        # document; overwriting the key outright would discard rows another
-        # branch already saved. Tag rows with their branch and drop any
-        # stale rows from this same branch before merging in the fresh ones,
-        # so other branches' data survives and reruns don't duplicate.
-        tagged_rows = [
-            {**row, "lane_id": lane_id, "settings_index": settings_index}
-            for row in rows
-        ]
-        previous_entries = existing.get(filename, [])
-        if not isinstance(previous_entries, list):
-            raise TypeError(
-                f"x_flowcells field '{filename}' is not a list: {previous_entries!r}"
-            )
-        previous_rows = [
-            row
-            for row in previous_entries
-            if not (
-                isinstance(row, dict)
-                and row.get("lane_id") == lane_id
-                and row.get("settings_index") == settings_index
-            )
-        ]
-        updated_doc[filename] = previous_rows + tagged_rows
+    updated_doc[branch_field] = metadata
 
     write_result = client.save(
         updated_doc,
@@ -370,6 +355,7 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
         metrics={
             "upload_status": "simulated_success",
             "x_flowcell_name": name,
+            "demultiplex_field": branch_field,
             "demultiplexing_metadata_files": list(metadata),
             "doc_id": getattr(write_result, "doc_id", None),
         }

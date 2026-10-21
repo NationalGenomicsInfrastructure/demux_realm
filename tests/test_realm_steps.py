@@ -326,10 +326,12 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
 
     upload_result = _upload_results(ctx, scenario)
     saved_doc = client.save.call_args.args[0]
-    assert saved_doc["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
-    assert saved_doc["Quality_Metrics"][0]["Mean_Q30"] == "92.1"
-    assert saved_doc["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
+    branch_field = "Demultiplex_lane_1_settings_0"
+    assert saved_doc[branch_field]["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
+    assert saved_doc[branch_field]["Quality_Metrics"][0]["Mean_Q30"] == "92.1"
+    assert saved_doc[branch_field]["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
     assert upload_result.metrics["upload_status"] == "simulated_success"
+    assert upload_result.metrics["demultiplex_field"] == branch_field
 
 
 def test_step_raises_when_data_not_injected(tmp_path, scenario):
