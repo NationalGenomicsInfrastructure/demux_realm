@@ -4,11 +4,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from demux_realm.steps import upsert_x_flowcell_pre_demux
+from demux_realm.steps import (
+    collect_results,
+    upsert_x_flowcell_pre_demux,
+    upload_results,
+)
 
 # The @step decorator changes the calling convention; the original function is
 # accessible via __wrapped__ for direct unit testing.
 _step = upsert_x_flowcell_pre_demux.__wrapped__  # type: ignore[attr-defined]
+_collect_results = collect_results.__wrapped__  # type: ignore[attr-defined]
+_upload_results = upload_results.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -251,6 +257,52 @@ def test_step_samplesheet_missing_bcl_data_raises(tmp_path, scenario):
     scenario["samplesheets"] = [{"lane": 1}]  # no BCLConvert_Data
     with pytest.raises(ValueError, match="BCLConvert_Data"):
         _step(ctx, scenario)
+
+
+def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeypatch):
+    monkeypatch.setenv("DMX_NF_OUTDIR_BASE", str(tmp_path / "results"))
+    scenario = {
+        "canonical_flowcell_id": "SC2177698-SC3",
+        "lane_id": "1",
+        "settings_index": "0",
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+    }
+    outdir = tmp_path / "results" / "SC2177698-SC3" / "lane_1_settings_0"
+    stats_dir = outdir / "Stats"
+    stats_dir.mkdir(parents=True)
+
+    (stats_dir / "Demultiplex_Stats.csv").write_text(
+        "Sample,Reads,Percent_Aligned\nP12345_1001,12345,98.2\n"
+    )
+    (stats_dir / "Quality_Metrics.csv").write_text(
+        "Sample,Mean_Q30\nP12345_1001,92.1\n"
+    )
+    (stats_dir / "Top_Unknown_Barcodes.csv").write_text("Barcode,Count\nACGT,14\n")
+
+    ctx = MagicMock()
+    result = _collect_results(ctx, scenario)
+    assert (
+        scenario["demultiplexing_metadata"]["Demultiplex_Stats"][0]["Sample"]
+        == "P12345_1001"
+    )
+    assert result.metrics["fastq_count"] == 0
+
+    client = MagicMock()
+    client.find_one.return_value = {
+        "_id": "doc-123",
+        "_rev": "2-abc",
+        "name": "20260312_ASC2177698-SC3",
+        "RunInfo": {"Id": "20260312_SH01140_0005_ASC2177698-SC3"},
+    }
+    client.save.return_value = MagicMock(status="updated", doc_id="doc-123")
+    ctx.data.connection.return_value = client
+
+    upload_result = _upload_results(ctx, scenario)
+    saved_doc = client.save.call_args.args[0]
+    assert saved_doc["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
+    assert saved_doc["Quality_Metrics"][0]["Mean_Q30"] == "92.1"
+    assert saved_doc["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
+    assert upload_result.metrics["upload_status"] == "simulated_success"
 
 
 def test_step_raises_when_data_not_injected(tmp_path, scenario):

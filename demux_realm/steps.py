@@ -1,5 +1,7 @@
+import csv
 import logging
 from pathlib import Path
+from typing import Any
 
 from yggdrasil.flow.artifacts import SimpleArtifactRef
 from yggdrasil.flow.errors import PermanentStepError
@@ -30,6 +32,30 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
+    """Read a CSV file into a list of row dicts."""
+    if not csv_path.is_file():
+        return []
+    with csv_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        return [dict(row) for row in reader]
+
+
+def _load_demux_metadata(outdir: Path) -> dict[str, list[dict[str, str]]]:
+    """Return the parsed Demultiplex_Stats.csv / Quality_Metrics.csv / Top_Unknown_Barcodes.csv rows."""
+    stats_dir = outdir / "Stats"
+    metadata: dict[str, list[dict[str, str]]] = {}
+    for filename in (
+        "Demultiplex_Stats.csv",
+        "Quality_Metrics.csv",
+        "Top_Unknown_Barcodes.csv",
+    ):
+        rows = _read_csv_rows(stats_dir / filename)
+        if rows:
+            metadata[filename.removesuffix(".csv")] = rows
+    return metadata
 
 
 @step
@@ -224,7 +250,9 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
         str(scenario["lane_id"]),
         str(scenario["settings_index"]),
     )
-    outdir = branch_outdir(settings, tag)
+    outdir = branch_outdir(
+        settings, tag
+    )  # Should be FCID/Demultiplex_lane_<n>_settings_<i>
     if not outdir.is_dir():
         raise PermanentStepError(
             f"Results directory missing: {outdir}",
@@ -232,29 +260,113 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
         )
 
     fastqs = sorted(outdir.rglob("*.fastq.gz"))
-    multiqc_reports = sorted(outdir.rglob("multiqc_report.html"))
-    for report in multiqc_reports:
-        ctx.record_artifact(SimpleArtifactRef("multiqc_report", "reports"), path=report)
 
-    logger.info(
-        "Collected %d fastq file(s) from %s", len(fastqs), outdir
-    )
+    stats_dir = outdir / "Stats"
+    if not stats_dir.is_dir():
+        logger.warning("Stats directory missing: %s", stats_dir)
+    demultiplex_stats = stats_dir / "Demultiplex_Stats.csv"
+    quality_metrics = stats_dir / "Quality_Metrics.csv"
+    top_unknown_barcodes = stats_dir / "Top_Unknown_Barcodes.csv"
+
+    if demultiplex_stats.is_file():
+        ctx.record_artifact(
+            SimpleArtifactRef("demultiplex_stats", "reports"), path=demultiplex_stats
+        )
+    if quality_metrics.is_file():
+        ctx.record_artifact(
+            SimpleArtifactRef("quality_metrics", "reports"), path=quality_metrics
+        )
+    if top_unknown_barcodes.is_file():
+        ctx.record_artifact(
+            SimpleArtifactRef("top_unknown_barcodes", "reports"),
+            path=top_unknown_barcodes,
+        )
+
+    scenario["demultiplexing_metadata"] = _load_demux_metadata(outdir)
     return StepResult(
         metrics={
             "outdir": str(outdir),
             "fastq_count": len(fastqs),
-            "multiqc_report_count": len(multiqc_reports),
+            "demultiplexing_metadata_files": list(scenario["demultiplexing_metadata"]),
         }
     )
 
 
 @step
 def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
-    """Uploads metrics and artifacts to appropriate endpoints (simulated)."""
+    """Fetch the current x_flowcells doc, merge in the demux CSV metadata, and save it back."""
     logger.info("Uploading metrics to remote API...")
-    scenario_metadata = scenario.get("demux_sample_info_doc", {}).get("metadata", {})
-    logger.info(
-        f"Simulating upload for run {scenario['runfolder_id']} with metadata {scenario_metadata}"
-    )
+    if ctx.data is None:
+        raise RuntimeError("StepContext.data (DataAccess) was not injected.")
 
-    return StepResult(metrics={"upload_status": "simulated_success"})
+    runfolder_id = scenario["runfolder_id"]
+    name = derive_xflowcell_name(runfolder_id)
+    metadata = scenario.get("demultiplexing_metadata")
+    if metadata is None:
+        settings = settings_from_env()
+        tag = branch_run_tag(
+            scenario["canonical_flowcell_id"],
+            str(scenario["lane_id"]),
+            str(scenario["settings_index"]),
+        )
+        metadata = _load_demux_metadata(branch_outdir(settings, tag))
+
+    client = ctx.data.connection("x_flowcells_db")
+    existing: dict[str, Any] | None = None
+    if hasattr(client, "find_one"):
+        existing = client.find_one({"name": {"$eq": name}})
+    elif hasattr(client, "get"):
+        existing = client.get(name)
+    if existing is None:
+        existing = {"name": name}
+    elif not isinstance(existing, dict):
+        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+
+    updated_doc = dict(existing)
+    lane_id = scenario["lane_id"]
+    settings_index = scenario["settings_index"]
+    for filename, rows in metadata.items():
+        # Each lane/settings branch contributes its own rows to a shared
+        # document; overwriting the key outright would discard rows another
+        # branch already saved. Tag rows with their branch and drop any
+        # stale rows from this same branch before merging in the fresh ones,
+        # so other branches' data survives and reruns don't duplicate.
+        tagged_rows = [
+            {**row, "lane_id": lane_id, "settings_index": settings_index}
+            for row in rows
+        ]
+        previous_entries = existing.get(filename, [])
+        if not isinstance(previous_entries, list):
+            raise TypeError(
+                f"x_flowcells field '{filename}' is not a list: {previous_entries!r}"
+            )
+        previous_rows = [
+            row
+            for row in previous_entries
+            if not (
+                isinstance(row, dict)
+                and row.get("lane_id") == lane_id
+                and row.get("settings_index") == settings_index
+            )
+        ]
+        updated_doc[filename] = previous_rows + tagged_rows
+
+    write_result = client.save(
+        updated_doc,
+        selector={"name": {"$eq": name}},
+        mode="upsert",
+    )
+    logger.info(
+        "Updated x_flowcell document '%s' %s (doc_id=%s)",
+        name,
+        write_result.status,
+        write_result.doc_id,
+    )
+    return StepResult(
+        metrics={
+            "upload_status": "simulated_success",
+            "x_flowcell_name": name,
+            "demultiplexing_metadata_files": list(metadata),
+            "doc_id": getattr(write_result, "doc_id", None),
+        }
+    )
