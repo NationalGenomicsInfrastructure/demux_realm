@@ -321,11 +321,16 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
         "name": "20260312_ASC2177698-SC3",
         "RunInfo": {"Id": "20260312_SH01140_0005_ASC2177698-SC3"},
     }
+    client.clean_doc.side_effect = lambda doc: {
+        k: v for k, v in doc.items() if k not in ("_id", "_rev")
+    }
     client.save.return_value = MagicMock(status="updated", doc_id="doc-123")
     ctx.data.connection.return_value = client
 
     upload_result = _upload_results(ctx, scenario)
     saved_doc = client.save.call_args.args[0]
+    assert "_id" not in saved_doc
+    assert "_rev" not in saved_doc
     branch_field = "Demultiplex_lane_1_settings_0"
     assert saved_doc[branch_field]["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
     assert saved_doc[branch_field]["Quality_Metrics"][0]["Mean_Q30"] == "92.1"

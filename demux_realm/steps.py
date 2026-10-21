@@ -337,7 +337,14 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
     branch_field = (
         f"Demultiplex_lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
     )
-    updated_doc = dict(existing)
+    # existing may carry CouchDB's own _id/_rev; DataAccess.save() manages
+    # those internally via the selector (fetching the current _rev and
+    # retrying on a 409 conflict itself), so the caller's job is only to
+    # strip them before passing the body back in — never to resolve conflicts.
+    if hasattr(client, "clean_doc"):
+        updated_doc = client.clean_doc(existing)
+    else:
+        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
     updated_doc[branch_field] = metadata
 
     write_result = client.save(
