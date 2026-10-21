@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,20 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
     return StepResult(
         metrics={
             "path_validated": str(hpc_path),
+        }
+    )
+
+
+@step
+def setup_common_demux_dir(ctx: StepContext, scenario: dict) -> StepResult:
+    """Create the common demux directory for all branches."""
+    hpc_path = Path(scenario["hpc_runfolder_path"])
+    demux_dir = hpc_path / "Demultiplexing"
+    demux_dir.mkdir(exist_ok=True)
+    logger.info("Created common demux directory %s.", demux_dir)
+    return StepResult(
+        metrics={
+            "demux_dir": str(demux_dir),
         }
     )
 
@@ -270,8 +285,6 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
             f"Results directory missing: {outdir}",
             advice="Did the branch's execute_demux step succeed?",
         )
-    results_dir = outdir / scenario["canonical_flowcell_id"]
-    fastqs = sorted(results_dir.rglob("*.fastq.gz"))
 
     stats_dir = _branch_reports_dir(outdir, scenario["canonical_flowcell_id"])
     if not stats_dir.is_dir():
@@ -298,8 +311,41 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
     return StepResult(
         metrics={
             "outdir": str(outdir),
-            "fastq_count": len(fastqs),
             "demultiplexing_metadata_files": list(scenario["demultiplexing_metadata"]),
+        }
+    )
+
+
+@step
+def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
+    """Symlinks fastq files from the branch's results directory to the common demux directory."""
+    settings = settings_from_env()
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    outdir = branch_outdir(settings, tag)
+    if not outdir.is_dir():
+        raise PermanentStepError(
+            f"Results directory missing: {outdir}",
+            advice="Did the branch's execute_demux step succeed?",
+        )
+    results_dir = outdir / scenario["canonical_flowcell_id"]
+    fastqs = sorted(results_dir.rglob("*.fastq.gz"))
+    demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
+    for fq in fastqs:
+        symlink_path = demux_dir / fq.name # TODO: should be demux_dir / project / sample / fq.name
+        if not symlink_path.exists():
+            os.symlink(fq, symlink_path)
+            logger.info("Symlinked %s to %s", fq, symlink_path)
+        else:
+            logger.warning("Symlink already exists: %s", symlink_path)
+
+    return StepResult(
+        metrics={
+            "symlinked_fastq_count": len(fastqs),
+            "demux_dir": str(demux_dir),
         }
     )
 

@@ -15,6 +15,7 @@ from .utils import (
 _PREFIX = "demux_realm.steps"
 
 VALIDATE_RUNFOLDER = "validate_runfolder"
+SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
 
 
@@ -72,6 +73,12 @@ def build_demux_plan(
             step_id=VALIDATE_RUNFOLDER,
             name="Validate Runfolder in HPC",
             fn_ref=f"{_PREFIX}.validate_runfolder",
+            params={"scenario": dict(common)},
+        ),
+        StepSpec(
+            step_id=SETUP_COMMON_DEMUX_DIR,
+            name="Setup Common Demux Directory",
+            fn_ref=f"{_PREFIX}.setup_common_demux_dir",
             params={"scenario": dict(common)},
         ),
         StepSpec(
