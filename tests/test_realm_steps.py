@@ -294,7 +294,7 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
         "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
     }
     outdir = tmp_path / "results" / "SC2177698-SC3" / "lane_1_settings_0"
-    stats_dir = outdir / "Stats"
+    stats_dir = outdir / "SC2177698-SC3" / "Reports"
     stats_dir.mkdir(parents=True)
 
     (stats_dir / "Demultiplex_Stats.csv").write_text(

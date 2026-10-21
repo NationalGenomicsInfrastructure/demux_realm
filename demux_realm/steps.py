@@ -43,16 +43,24 @@ def _read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
         return [dict(row) for row in reader]
 
 
-def _load_demux_metadata(outdir: Path) -> dict[str, list[dict[str, str]]]:
-    """Return the parsed Demultiplex_Stats.csv / Quality_Metrics.csv / Top_Unknown_Barcodes.csv rows."""
-    stats_dir = outdir / "Reports"
+def _branch_reports_dir(outdir: Path, canonical_flowcell_id: str) -> Path:
+    """Return the branch's Reports directory: outdir/<FCID>/Reports."""
+    return outdir / canonical_flowcell_id / "Reports"
+
+
+def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
+    """Return the parsed Demultiplex_Stats.csv / Quality_Metrics.csv / Top_Unknown_Barcodes.csv rows.
+
+    `reports_dir` must already point at the branch's Reports directory (see
+    `_branch_reports_dir`); it is not appended here.
+    """
     metadata: dict[str, list[dict[str, str]]] = {}
     for filename in (
         "Demultiplex_Stats.csv",
         "Quality_Metrics.csv",
         "Top_Unknown_Barcodes.csv",
     ):
-        rows = _read_csv_rows(stats_dir / filename)
+        rows = _read_csv_rows(reports_dir / filename)
         if rows:
             metadata[filename.removesuffix(".csv")] = rows
     return metadata
@@ -265,7 +273,7 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
     results_dir = outdir / scenario["canonical_flowcell_id"]
     fastqs = sorted(results_dir.rglob("*.fastq.gz"))
 
-    stats_dir = results_dir / "Reports"
+    stats_dir = _branch_reports_dir(outdir, scenario["canonical_flowcell_id"])
     if not stats_dir.is_dir():
         logger.warning("Stats directory missing: %s", stats_dir)
     demultiplex_stats = stats_dir / "Demultiplex_Stats.csv"
@@ -321,7 +329,10 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
             str(scenario["lane_id"]),
             str(scenario["settings_index"]),
         )
-        metadata = _load_demux_metadata(branch_outdir(settings, tag))
+        outdir = branch_outdir(settings, tag)
+        metadata = _load_demux_metadata(
+            _branch_reports_dir(outdir, scenario["canonical_flowcell_id"])
+        )
 
     client = ctx.data.connection("x_flowcells_db")
     existing: dict[str, Any] | None = None
