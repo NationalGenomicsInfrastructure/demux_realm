@@ -25,18 +25,22 @@ logger = logging.getLogger(__name__)
 
 @step
 def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
-    """Validates that the runfolder exists in the HPC.
+    """Validate that the runfolder is present."""
+    hpc_path = Path(scenario["hpc_runfolder_path"])
+    if not hpc_path.exists():
+        raise FileNotFoundError(f"HPC runfolder not found: {hpc_path}")
+    if not hpc_path.is_dir():
+        raise NotADirectoryError(f"HPC runfolder path is not a directory: {hpc_path}")
 
-    TODO: verify that the FCID derived from RunInfo.xml (<Run Id> last '_'-separated
-    segment) matches scenario['canonical_flowcell_id'] (sourced from flowcell_status
-    and demux_sample_info) to catch runfolder/sample-sheet mismatches early.
-    """
-    hpc_path = scenario["hpc_runfolder_path"]
-    logger.info(f"Validating expected HPC runfolder path: {hpc_path}")
-
-    # Normally we would os.path.isdir(hpc_path) or ssh verify it
-    # We will pretend it exists successfully
-    return StepResult(metrics={"path_validated": hpc_path})
+    logger.info(
+        "Validated HPC runfolder %s.",
+        hpc_path,
+    )
+    return StepResult(
+        metrics={
+            "path_validated": str(hpc_path),
+        }
+    )
 
 
 @step
