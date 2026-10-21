@@ -143,6 +143,13 @@ def build_demux_plan(
                 deps=[f"{ns}__execute_demux"],
             ),
             StepSpec(
+                step_id=f"{ns}__symlink_fastqs",
+                name=f"Symlink Fastqs ({label})",
+                fn_ref=f"{_PREFIX}.symlink_fastqs",
+                params={"scenario": scenario},
+                deps=[f"{ns}__execute_demux"],
+            ),
+            StepSpec(
                 step_id=f"{ns}__upload_results",
                 name=f"Upload/Simulate Upload Results ({label})",
                 fn_ref=f"{_PREFIX}.upload_results",
