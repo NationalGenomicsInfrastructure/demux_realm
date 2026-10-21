@@ -45,7 +45,7 @@ def _read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
 
 def _load_demux_metadata(outdir: Path) -> dict[str, list[dict[str, str]]]:
     """Return the parsed Demultiplex_Stats.csv / Quality_Metrics.csv / Top_Unknown_Barcodes.csv rows."""
-    stats_dir = outdir / "Stats"
+    stats_dir = outdir / "Reports"
     metadata: dict[str, list[dict[str, str]]] = {}
     for filename in (
         "Demultiplex_Stats.csv",
@@ -262,10 +262,10 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
             f"Results directory missing: {outdir}",
             advice="Did the branch's execute_demux step succeed?",
         )
+    results_dir = outdir / scenario["canonical_flowcell_id"]
+    fastqs = sorted(results_dir.rglob("*.fastq.gz"))
 
-    fastqs = sorted(outdir.rglob("*.fastq.gz"))
-
-    stats_dir = outdir / "Stats"
+    stats_dir = results_dir / "Reports"
     if not stats_dir.is_dir():
         logger.warning("Stats directory missing: %s", stats_dir)
     demultiplex_stats = stats_dir / "Demultiplex_Stats.csv"
@@ -286,7 +286,7 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
             path=top_unknown_barcodes,
         )
 
-    scenario["demultiplexing_metadata"] = _load_demux_metadata(outdir)
+    scenario["demultiplexing_metadata"] = _load_demux_metadata(stats_dir)
     return StepResult(
         metrics={
             "outdir": str(outdir),
