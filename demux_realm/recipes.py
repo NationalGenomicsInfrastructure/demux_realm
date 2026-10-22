@@ -123,7 +123,7 @@ def build_demux_plan(
             ),
             StepSpec(
                 step_id=f"{ns}__execute_demux",
-                name=f"Simulate Execute Demux (Nextflow) ({label})",
+                name=f"Execute Demux (nf-core/demultiplex) ({label})",
                 fn_ref=f"{_PREFIX}.execute_demux",
                 params={"scenario": scenario},
                 deps=[f"{ns}__generate_samplesheet"],

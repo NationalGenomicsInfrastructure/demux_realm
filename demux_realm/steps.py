@@ -2,9 +2,18 @@ import logging
 from pathlib import Path
 
 from yggdrasil.flow.artifacts import SimpleArtifactRef
+from yggdrasil.flow.errors import PermanentStepError
 from yggdrasil.flow.model import StepResult
 from yggdrasil.flow.step import StepContext, step
 
+from .nextflow import (
+    branch_outdir,
+    branch_run_tag,
+    branch_work_dir,
+    build_nextflow_command,
+    run_nextflow,
+    settings_from_env,
+)
 from .utils import (
     DEMUX_CONFIG_FILENAME,
     RUN_INFO_XML,
@@ -147,20 +156,95 @@ def generate_samplesheet(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def execute_demux(ctx: StepContext, scenario: dict) -> StepResult:
-    """Simulates Nextflow pipeline execution."""
-    logger.info("Executing demux pipeline (Nextflow)...")
-    logger.info(f"Using runfolder: {scenario['hpc_runfolder_path']}")
-    logger.info("Simulation mode: Pipeline executed successfully.")
+    """Runs one Nextflow nf-core/demultiplex instance for this branch.
 
-    return StepResult(metrics={"execution_status": "simulated_success"})
+    There is one instance per lane/samplesheet branch: the branch's
+    samplesheet is re-rendered from the scenario payload into this step's
+    own workdir (runs are self-contained and never share files), and
+    Nextflow receives work and results directories derived from the branch
+    tag, so two branches never share work directories. Deployment settings
+    (pipeline, profile, common config, directory bases, skipped tools) come
+    from the DMX_NF_* environment; see demux_realm.nextflow.
+    """
+    runfolder_path = Path(scenario["hpc_runfolder_path"])
+
+    # Re-render the branch samplesheet here rather than reading the
+    # generate_samplesheet step's workdir: cross-step paths are engine
+    # internals, and rendering is a pure function of the scenario payload.
+    ss_file = ctx.workdir / SAMPLESHEET_FILENAME
+    ss_file.write_text(render_bcl_convert_samplesheet(scenario["samplesheet_payload"]))
+    ctx.record_artifact(
+        SimpleArtifactRef("pipeline_samplesheet", "samplesheets"), path=ss_file
+    )
+
+    settings = settings_from_env()
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    cmd = build_nextflow_command(
+        settings,
+        canonical_flowcell_id=scenario["canonical_flowcell_id"],
+        lane_id=str(scenario["lane_id"]),
+        settings_index=str(scenario["settings_index"]),
+        samplesheet=ss_file,
+        flowcell_path=runfolder_path,
+    )
+    log_path = ctx.workdir / "nextflow_run.log"
+    proc = run_nextflow(cmd, log_path)
+    ctx.record_artifact(SimpleArtifactRef("nextflow_log", "logs"), path=log_path)
+
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
+        raise PermanentStepError(
+            f"Nextflow exited with status {proc.returncode} (branch {tag}); "
+            f"last log lines:\n{tail}",
+            advice=f"Full log: {log_path}",
+        )
+
+    logger.info("Nextflow run finished (branch %s).", tag)
+    return StepResult(
+        metrics={
+            "branch": tag,
+            "exit_status": proc.returncode,
+            "work_dir": str(branch_work_dir(settings, tag)),
+            "outdir": str(branch_outdir(settings, tag)),
+        }
+    )
 
 
 @step
 def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
-    """Collects demultiplexing metrics, artifacts and logs."""
-    logger.info("Collecting metrics from demux result directory...")
+    """Collects demultiplexing artifacts and basic metrics from the branch's results directory."""
+    settings = settings_from_env()
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    outdir = branch_outdir(settings, tag)
+    if not outdir.is_dir():
+        raise PermanentStepError(
+            f"Results directory missing: {outdir}",
+            advice="Did the branch's execute_demux step succeed?",
+        )
 
-    return StepResult(metrics={"yield": 120000000, "q30_percentage": 98.4})
+    fastqs = sorted(outdir.rglob("*.fastq.gz"))
+    multiqc_reports = sorted(outdir.rglob("multiqc_report.html"))
+    for report in multiqc_reports:
+        ctx.record_artifact(SimpleArtifactRef("multiqc_report", "reports"), path=report)
+
+    logger.info(
+        "Collected %d fastq file(s) from %s", len(fastqs), outdir
+    )
+    return StepResult(
+        metrics={
+            "outdir": str(outdir),
+            "fastq_count": len(fastqs),
+            "multiqc_report_count": len(multiqc_reports),
+        }
+    )
 
 
 @step

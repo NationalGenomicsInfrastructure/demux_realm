@@ -295,15 +295,29 @@ def render_bcl_convert_samplesheet(lane_payload: dict) -> str:
         for k, v in mapping.items():
             buf.write(f"{k},{v}\n")
 
+    data_rows = lane_payload["BCLConvert_Data"]
     _write_kv_section("Header", lane_payload["Header"])
     buf.write("\n")
 
     # The field is currently named raw_samplesheet_settings; it will likely
     # be renamed to BCLConvert_Settings upstream.
-    _write_kv_section("BCLConvert_Settings", lane_payload["raw_samplesheet_settings"])
+    #
+    # bcl-convert hard-fails with "When no index is present,
+    # CreateFastqForIndexReads cannot be enabled" when the setting is true
+    # but no sample in the sheet carries an index. Upstream documents can be
+    # inconsistent (e.g. a NoIndex project with the setting still enabled),
+    # so coerce the setting to match the data.
+    settings = dict(lane_payload["raw_samplesheet_settings"])
+    if str(settings.get("CreateFastqForIndexReads", "")).strip().lower() in ("true", "1"):
+        has_index = any(
+            str(row.get("index", "")).strip() or str(row.get("index2", "")).strip()
+            for row in data_rows
+        )
+        if not has_index:
+            settings["CreateFastqForIndexReads"] = False
+    _write_kv_section("BCLConvert_Settings", settings)
     buf.write("\n")
 
-    data_rows = lane_payload["BCLConvert_Data"]
     # Build column order: required columns first, then extra columns in
     # first-row dict order (stable across Python 3.7+).
     extra_cols = [k for k in data_rows[0] if k not in _BCL_DATA_REQUIRED_ROW_FIELDS]
