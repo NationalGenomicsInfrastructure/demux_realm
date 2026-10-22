@@ -163,11 +163,6 @@ def execute_demux(ctx: StepContext, scenario: dict) -> StepResult:
     from the DMX_NF_* environment; see demux_realm.nextflow.
     """
     runfolder_path = Path(scenario["hpc_runfolder_path"])
-    if not runfolder_path.is_dir():
-        raise PermanentStepError(
-            f"Runfolder path does not exist: {runfolder_path}",
-            advice="Check hpc_runfolder_path / DMX_HPC_BASE_PATH.",
-        )
 
     # Re-render the branch samplesheet here rather than reading the
     # generate_samplesheet step's workdir: cross-step paths are engine
