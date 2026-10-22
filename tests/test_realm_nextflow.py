@@ -18,7 +18,7 @@ from demux_realm.nextflow import (
     branch_run_tag,
     branch_work_dir,
     build_nextflow_command,
-    sanitize_run_name,
+    run_nextflow,
     settings_from_env,
 )
 
@@ -129,8 +129,6 @@ def test_command_argv_and_branch_layout():
         "/work/nf-realm-work/SC2177698-SC3/lane_2_settings_0",
         "--outdir",
         "/work/nf-realm-results/SC2177698-SC3/lane_2_settings_0",
-        "-name",
-        "sc2177698_sc3_lane_2_settings_0",
         "-resume",
         "-c",
         "/opt/extra.config",
@@ -163,24 +161,40 @@ def test_branch_directories_never_shared():
     assert len(dirs) == 6
 
 
-def test_sanitize_run_name_meets_nextflow_pattern():
-    import re
+def test_run_nextflow_streams_output_to_log():
+    # The log is written while the process runs (live-tailable), and the
+    # combined output is returned for error reporting.
+    import sys
+    import tempfile
 
-    pattern = re.compile(r"^[a-z](?:[a-z\d]|[-_](?=[a-z\d])){0,79}$")
-    cases = [
-        ("SC2177698-SC3_lane_2_settings_0", "sc2177698_sc3_lane_2_settings_0"),
-        ("20260310_LM43896_0386_B98QWERTY6/lane_1_settings_0", None),
-        ("A--B__C", "a_b_c"),
-        ("X" * 200, None),
-    ]
-    for raw, expected in cases:
-        name = sanitize_run_name(raw.replace("/", "_"))
-        assert pattern.match(name), name
-        assert len(name) <= 80
-        if expected is not None:
-            assert name == expected, (raw, name)
-    # Digit-leading names get a prefix so they still start with a letter.
-    assert sanitize_run_name("2026_fc").startswith("run_")
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "nextflow_run.log"
+        proc = run_nextflow(
+            [sys.executable, "-c", "print('line one'); print('line two', file=__import__('sys').stderr)"],
+            log_path,
+        )
+        log_text = log_path.read_text()
+    assert proc.returncode == 0
+    assert proc.stdout == "line one\nline two\n"
+    assert log_text == "line one\nline two\n"
+
+
+def test_command_has_no_stable_run_name():
+    # A stable -name would make every re-run of a branch fail with
+    # "Run name has been already used" (Nextflow indexes run names per
+    # user home, not per work dir). Resume semantics come from -resume +
+    # the unique per-branch work dir instead.
+    s = make_settings()
+    cmd = build_nextflow_command(
+        s,
+        canonical_flowcell_id="FC",
+        lane_id="1",
+        settings_index="0",
+        samplesheet=Path("/step/SampleSheet.csv"),
+        flowcell_path=Path("/incoming/FC"),
+    )
+    assert "-name" not in cmd
+    assert "-resume" in cmd
 
 
 # ---------------------------------------------------------------------------
