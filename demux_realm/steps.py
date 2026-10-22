@@ -1,10 +1,22 @@
+import csv
 import logging
+import os
 from pathlib import Path
+from typing import Any
 
 from yggdrasil.flow.artifacts import SimpleArtifactRef
+from yggdrasil.flow.errors import PermanentStepError
 from yggdrasil.flow.model import StepResult
 from yggdrasil.flow.step import StepContext, step
 
+from .nextflow import (
+    branch_outdir,
+    branch_run_tag,
+    branch_work_dir,
+    build_nextflow_command,
+    run_nextflow,
+    settings_from_env,
+)
 from .utils import (
     DEMUX_CONFIG_FILENAME,
     RUN_INFO_XML,
@@ -23,6 +35,38 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
+    """Read a CSV file into a list of row dicts."""
+    if not csv_path.is_file():
+        return []
+    with csv_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        return [dict(row) for row in reader]
+
+
+def _branch_reports_dir(outdir: Path, canonical_flowcell_id: str) -> Path:
+    """Return the branch's Reports directory: outdir/<FCID>/Reports."""
+    return outdir / canonical_flowcell_id / "Reports"
+
+
+def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
+    """Return the parsed Demultiplex_Stats.csv / Quality_Metrics.csv / Top_Unknown_Barcodes.csv rows.
+
+    `reports_dir` must already point at the branch's Reports directory (see
+    `_branch_reports_dir`); it is not appended here.
+    """
+    metadata: dict[str, list[dict[str, str]]] = {}
+    for filename in (
+        "Demultiplex_Stats.csv",
+        "Quality_Metrics.csv",
+        "Top_Unknown_Barcodes.csv",
+    ):
+        rows = _read_csv_rows(reports_dir / filename)
+        if rows:
+            metadata[filename.removesuffix(".csv")] = rows
+    return metadata
+
+
 @step
 def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
     """Validate that the runfolder is present."""
@@ -39,6 +83,20 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
     return StepResult(
         metrics={
             "path_validated": str(hpc_path),
+        }
+    )
+
+
+@step
+def setup_common_demux_dir(ctx: StepContext, scenario: dict) -> StepResult:
+    """Create the common demux directory for all branches."""
+    hpc_path = Path(scenario["hpc_runfolder_path"])
+    demux_dir = hpc_path / "Demultiplexing"
+    demux_dir.mkdir(exist_ok=True)
+    logger.info("Created common demux directory %s.", demux_dir)
+    return StepResult(
+        metrics={
+            "demux_dir": str(demux_dir),
         }
     )
 
@@ -147,29 +205,227 @@ def generate_samplesheet(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def execute_demux(ctx: StepContext, scenario: dict) -> StepResult:
-    """Simulates Nextflow pipeline execution."""
-    logger.info("Executing demux pipeline (Nextflow)...")
-    logger.info(f"Using runfolder: {scenario['hpc_runfolder_path']}")
-    logger.info("Simulation mode: Pipeline executed successfully.")
+    """Runs one Nextflow nf-core/demultiplex instance for this branch.
 
-    return StepResult(metrics={"execution_status": "simulated_success"})
+    There is one instance per lane/samplesheet branch: the branch's
+    samplesheet is re-rendered from the scenario payload into this step's
+    own workdir (runs are self-contained and never share files), and
+    Nextflow receives work and results directories derived from the branch
+    tag, so two branches never share work directories. Deployment settings
+    (pipeline, profile, common config, directory bases, skipped tools) come
+    from the DMX_NF_* environment; see demux_realm.nextflow.
+    """
+    runfolder_path = Path(scenario["hpc_runfolder_path"])
+    if not runfolder_path.is_dir():
+        raise PermanentStepError(
+            f"Runfolder path does not exist: {runfolder_path}",
+            advice="Check hpc_runfolder_path / DMX_HPC_BASE_PATH.",
+        )
+
+    # Re-render the branch samplesheet here rather than reading the
+    # generate_samplesheet step's workdir: cross-step paths are engine
+    # internals, and rendering is a pure function of the scenario payload.
+    ss_file = ctx.workdir / SAMPLESHEET_FILENAME
+    ss_file.write_text(render_bcl_convert_samplesheet(scenario["samplesheet_payload"]))
+    ctx.record_artifact(
+        SimpleArtifactRef("pipeline_samplesheet", "samplesheets"), path=ss_file
+    )
+
+    settings = settings_from_env()
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    cmd = build_nextflow_command(
+        settings,
+        canonical_flowcell_id=scenario["canonical_flowcell_id"],
+        lane_id=str(scenario["lane_id"]),
+        settings_index=str(scenario["settings_index"]),
+        samplesheet=ss_file,
+        flowcell_path=runfolder_path,
+    )
+    log_path = ctx.workdir / "nextflow_run.log"
+    proc = run_nextflow(cmd, log_path)
+    ctx.record_artifact(SimpleArtifactRef("nextflow_log", "logs"), path=log_path)
+
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
+        raise PermanentStepError(
+            f"Nextflow exited with status {proc.returncode} (branch {tag}); "
+            f"last log lines:\n{tail}",
+            advice=f"Full log: {log_path}",
+        )
+
+    logger.info("Nextflow run finished (branch %s).", tag)
+    return StepResult(
+        metrics={
+            "branch": tag,
+            "exit_status": proc.returncode,
+            "work_dir": str(branch_work_dir(settings, tag)),
+            "outdir": str(branch_outdir(settings, tag)),
+        }
+    )
 
 
 @step
 def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
-    """Collects demultiplexing metrics, artifacts and logs."""
-    logger.info("Collecting metrics from demux result directory...")
+    """Collects demultiplexing artifacts and basic metrics from the branch's results directory."""
+    settings = settings_from_env()
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    outdir = branch_outdir(
+        settings, tag
+    )  # Should be FCID/Demultiplex_lane_<n>_settings_<i>
+    if not outdir.is_dir():
+        raise PermanentStepError(
+            f"Results directory missing: {outdir}",
+            advice="Did the branch's execute_demux step succeed?",
+        )
 
-    return StepResult(metrics={"yield": 120000000, "q30_percentage": 98.4})
+    stats_dir = _branch_reports_dir(outdir, scenario["canonical_flowcell_id"])
+    if not stats_dir.is_dir():
+        logger.warning("Stats directory missing: %s", stats_dir)
+    demultiplex_stats = stats_dir / "Demultiplex_Stats.csv"
+    quality_metrics = stats_dir / "Quality_Metrics.csv"
+    top_unknown_barcodes = stats_dir / "Top_Unknown_Barcodes.csv"
+
+    if demultiplex_stats.is_file():
+        ctx.record_artifact(
+            SimpleArtifactRef("demultiplex_stats", "reports"), path=demultiplex_stats
+        )
+    if quality_metrics.is_file():
+        ctx.record_artifact(
+            SimpleArtifactRef("quality_metrics", "reports"), path=quality_metrics
+        )
+    if top_unknown_barcodes.is_file():
+        ctx.record_artifact(
+            SimpleArtifactRef("top_unknown_barcodes", "reports"),
+            path=top_unknown_barcodes,
+        )
+
+    scenario["demultiplexing_metadata"] = _load_demux_metadata(stats_dir)
+    return StepResult(
+        metrics={
+            "outdir": str(outdir),
+            "demultiplexing_metadata_files": list(scenario["demultiplexing_metadata"]),
+        }
+    )
+
+
+# TODO: Add a step to aggregate demux stats for lanes with multiple demuxes
+
+
+@step
+def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
+    """Symlinks fastq files from the branch's results directory to the common demux directory."""
+    settings = settings_from_env()
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    outdir = branch_outdir(settings, tag)
+    if not outdir.is_dir():
+        raise PermanentStepError(
+            f"Results directory missing: {outdir}",
+            advice="Did the branch's execute_demux step succeed?",
+        )
+    results_dir = outdir / scenario["canonical_flowcell_id"]
+    fastqs = sorted(results_dir.rglob("*.fastq.gz"))
+    demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
+    for fq in fastqs:
+        symlink_path = (
+            demux_dir / fq.name
+        )  # TODO: should be demux_dir / project / sample / fq.name
+        if not symlink_path.exists():
+            os.symlink(fq, symlink_path)
+            logger.info("Symlinked %s to %s", fq, symlink_path)
+        else:
+            logger.warning("Symlink already exists: %s", symlink_path)
+
+    return StepResult(
+        metrics={
+            "symlinked_fastq_count": len(fastqs),
+            "demux_dir": str(demux_dir),
+        }
+    )
 
 
 @step
 def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
-    """Uploads metrics and artifacts to appropriate endpoints (simulated)."""
-    logger.info("Uploading metrics to remote API...")
-    scenario_metadata = scenario.get("demux_sample_info_doc", {}).get("metadata", {})
-    logger.info(
-        f"Simulating upload for run {scenario['runfolder_id']} with metadata {scenario_metadata}"
-    )
+    """Fetch the current x_flowcells doc, add this branch's demux CSV metadata
+    under its own field, and save it back.
 
-    return StepResult(metrics={"upload_status": "simulated_success"})
+    Each lane/settings branch publishes its Demultiplex_Stats.csv,
+    Quality_Metrics.csv and Top_Unknown_Barcodes.csv rows under a dedicated
+    top-level field named Demultiplex_lane_<lane_id>_settings_<settings_index>.
+    Since the field is unique per branch, branches never collide and a
+    branch can be re-run without touching any other branch's results.
+    """
+    logger.info("Uploading metrics to remote API...")
+    if ctx.data is None:
+        raise RuntimeError("StepContext.data (DataAccess) was not injected.")
+
+    runfolder_id = scenario["runfolder_id"]
+    name = derive_xflowcell_name(runfolder_id)
+    metadata = scenario.get("demultiplexing_metadata")
+    if metadata is None:
+        settings = settings_from_env()
+        tag = branch_run_tag(
+            scenario["canonical_flowcell_id"],
+            str(scenario["lane_id"]),
+            str(scenario["settings_index"]),
+        )
+        outdir = branch_outdir(settings, tag)
+        metadata = _load_demux_metadata(
+            _branch_reports_dir(outdir, scenario["canonical_flowcell_id"])
+        )
+
+    client = ctx.data.connection("x_flowcells_db")
+    existing: dict[str, Any] | None = None
+    if hasattr(client, "find_one"):
+        existing = client.find_one({"name": {"$eq": name}})
+    elif hasattr(client, "get"):
+        existing = client.get(name)
+    if existing is None:
+        existing = {"name": name}
+    elif not isinstance(existing, dict):
+        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+
+    branch_field = (
+        f"Demultiplex_lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
+    )
+    # existing may carry CouchDB's own _id/_rev; DataAccess.save() manages
+    # those internally via the selector (fetching the current _rev and
+    # retrying on a 409 conflict itself), so the caller's job is only to
+    # strip them before passing the body back in — never to resolve conflicts.
+    if hasattr(client, "clean_doc"):
+        updated_doc = client.clean_doc(existing)
+    else:
+        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    updated_doc[branch_field] = metadata
+
+    write_result = client.save(
+        updated_doc,
+        selector={"name": {"$eq": name}},
+        mode="upsert",
+    )
+    logger.info(
+        "Updated x_flowcell document '%s' %s (doc_id=%s)",
+        name,
+        write_result.status,
+        write_result.doc_id,
+    )
+    return StepResult(
+        metrics={
+            "upload_status": "simulated_success",
+            "x_flowcell_name": name,
+            "demultiplex_field": branch_field,
+            "demultiplexing_metadata_files": list(metadata),
+            "doc_id": getattr(write_result, "doc_id", None),
+        }
+    )

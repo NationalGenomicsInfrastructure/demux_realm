@@ -15,6 +15,7 @@ from .utils import (
 _PREFIX = "demux_realm.steps"
 
 VALIDATE_RUNFOLDER = "validate_runfolder"
+SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
 
 
@@ -75,6 +76,12 @@ def build_demux_plan(
             params={"scenario": dict(common)},
         ),
         StepSpec(
+            step_id=SETUP_COMMON_DEMUX_DIR,
+            name="Setup Common Demux Directory",
+            fn_ref=f"{_PREFIX}.setup_common_demux_dir",
+            params={"scenario": dict(common)},
+        ),
+        StepSpec(
             step_id=UPSERT_X_FLOWCELL,
             name="Upsert x_flowcells Pre-Demux Document",
             fn_ref=f"{_PREFIX}.upsert_x_flowcell_pre_demux",
@@ -123,7 +130,7 @@ def build_demux_plan(
             ),
             StepSpec(
                 step_id=f"{ns}__execute_demux",
-                name=f"Simulate Execute Demux (Nextflow) ({label})",
+                name=f"Execute Demux (nf-core/demultiplex) ({label})",
                 fn_ref=f"{_PREFIX}.execute_demux",
                 params={"scenario": scenario},
                 deps=[f"{ns}__generate_samplesheet"],
@@ -132,6 +139,13 @@ def build_demux_plan(
                 step_id=f"{ns}__collect_results",
                 name=f"Collect Results and Artifacts ({label})",
                 fn_ref=f"{_PREFIX}.collect_results",
+                params={"scenario": scenario},
+                deps=[f"{ns}__execute_demux"],
+            ),
+            StepSpec(
+                step_id=f"{ns}__symlink_fastqs",
+                name=f"Symlink Fastqs ({label})",
+                fn_ref=f"{_PREFIX}.symlink_fastqs",
                 params={"scenario": scenario},
                 deps=[f"{ns}__execute_demux"],
             ),
