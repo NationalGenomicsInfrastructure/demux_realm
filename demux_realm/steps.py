@@ -316,6 +316,9 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
     )
 
 
+# TODO: Add a step to aggregate demux stats for lanes with multiple demuxes
+
+
 @step
 def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
     """Symlinks fastq files from the branch's results directory to the common demux directory."""
@@ -335,7 +338,9 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
     fastqs = sorted(results_dir.rglob("*.fastq.gz"))
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
     for fq in fastqs:
-        symlink_path = demux_dir / fq.name # TODO: should be demux_dir / project / sample / fq.name
+        symlink_path = (
+            demux_dir / fq.name
+        )  # TODO: should be demux_dir / project / sample / fq.name
         if not symlink_path.exists():
             os.symlink(fq, symlink_path)
             logger.info("Symlinked %s to %s", fq, symlink_path)
