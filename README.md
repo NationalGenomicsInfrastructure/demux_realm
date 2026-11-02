@@ -70,13 +70,45 @@ The descriptor returns the `dmx_realm` realm with:
 * CouchDB watch specs for `demux_sample_info_db`
 * CouchDB watch specs for `flowcell_status_db`
 
+## Configuration
+
+Deployment settings live in a JSON file, `dmx_realm.json`, in Yggdrasil's
+`common/configurations/` directory (`dev_dmx_realm.json` takes precedence in dev
+mode). Credentials do not belong in it. Every key is optional and unknown keys
+are rejected:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `hpc_base_path` | `""` | Prefix for the flowcell's `destination_path` |
+| `nextflow.pipeline` | `nf-core/demultiplex` | Pipeline name or path |
+| `nextflow.profile` | `docker` | Nextflow `-profile` |
+| `nextflow.common_config` | none | Extra Nextflow config passed with `-c` |
+| `nextflow.work_base` | `/work/nf-realm-work` | Base for per-branch work directories |
+| `nextflow.outdir_base` | `/work/nf-realm-results` | Base for per-branch results |
+| `nextflow.extra_args` | `[]` | Extra command-line arguments |
+| `nextflow.skip_tools` | `[]` | Default tools to skip (`--skip_tools`) when a samplesheet does not say |
+
+Options that differ between samplesheets come from the `demux_sample_info`
+document instead: a `commandline_options.nextflow` section on an individual
+samplesheet entry,
+
+```json
+{"lane": 1, "commandline_options": {"nextflow": {"skip_tools": ["samshee"]}}, "...": "..."}
+```
+
+wins over the config default. Unknown tool sections or keys are rejected.
+`skip_tools` is passed as `--skip_tools`; when neither the entry nor the
+config names tools, nothing is skipped. Invalid values reject the proposal
+at planning time.
+
 ## Planning
 
 A change to either source document is planned the same way. The handler fetches
 the counterpart document, matching `SC...` and `ASC...` flowcell IDs, and checks
 that the flowcell has been transferred (`transferred_to_hpc` and
 `final_transfer_started` with a `destination_path`). The runfolder path is
-`<destination_path>/<runfolder_id>`, prefixed by `DMX_HPC_BASE_PATH` when set.
+`<destination_path>/<runfolder_id>`, prefixed by the realm config's
+`hpc_base_path` when set (see [Configuration](#configuration)).
 The result must be absolute; a relative path would depend on the executing
 process's working directory, so the proposal is rejected instead.
 
@@ -123,7 +155,7 @@ one draft with no steps and `auto_run=False`, under the combined plan ID once
 the flowcell is known. A proposal is deferred (`Deferred: ...`) while a
 prerequisite is missing, such as the counterpart document, a transfer event, or
 the samplesheets. It is rejected (`Rejected: ...`) when the runfolder path is
-not absolute or any samplesheet entry is invalid; for samplesheet problems, the
+not absolute, a samplesheet's `skip_tools` is invalid, or any samplesheet entry is invalid; for samplesheet problems, the
 draft's `preview["issues"]` lists every one with its entry
 index. No shared step or valid branch runs for a rejected proposal.
 
@@ -145,7 +177,13 @@ source are recorded in the draft's preview only, so they never invalidate reuse.
 | `upsert_x_flowcell_pre_demux` | Reads `RunInfo.xml` and `RunParameters.xml`, then writes the `x_flowcells` document through DataAccess |
 | `materialize_config` | Writes `extra_config_demultiplex.config` |
 | `generate_samplesheet` | Validates the entry again and writes `SampleSheet.csv` |
-| `execute_demux`, `collect_results`, `upload_results` | Simulations that only log |
+| `execute_demux` | Runs one `nf-core/demultiplex` Nextflow instance per branch on the sheet its `generate_samplesheet` step wrote |
+| `collect_results`, `upload_results` | `collect_results` counts the branch's FASTQ and MultiQC outputs; `upload_results` is a simulation that only logs |
+
+`execute_demux` finds its samplesheet through the scenario's `samplesheet_path`
+(workdir-relative to the sibling `generate_samplesheet` step, also declared in
+the step's `inputs`), anchored on the plan directory. The path may not leave the
+plan directory and the file must exist; otherwise the step fails permanently.
 
 `materialize_config` and `generate_samplesheet` declare their files as required
 outputs, relative to their own step work directories. The metadata update

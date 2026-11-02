@@ -13,6 +13,7 @@ from demux_realm.utils import (
     normalize_settings_index,
     parse_run_info_xml,
     parse_run_parameters_xml,
+    render_bcl_convert_samplesheet,
     validate_lane_payload,
 )
 
@@ -730,3 +731,42 @@ def test_group_rejects_non_list_or_empty_collections(samplesheets):
     branches, issues = group_samplesheet_branches(samplesheets)
     assert branches == []
     assert [issue["entry_index"] for issue in issues] == [None]
+
+
+# ---------------------------------------------------------------------------
+# render_bcl_convert_samplesheet
+# ---------------------------------------------------------------------------
+
+
+def _render_payload() -> dict:
+    # lane_entry defaults: index ACGTACGT, CreateFastqForIndexReads="1".
+    return lane_entry("1", samples=["S1"])
+
+
+def test_render_keeps_index_reads_setting_when_index_present():
+    text = render_bcl_convert_samplesheet(_render_payload())
+    assert "CreateFastqForIndexReads,1\n" in text
+
+
+def test_render_keeps_index_reads_setting_when_index2_present():
+    entry = _render_payload()
+    for row in entry["BCLConvert_Data"]:
+        row["index"] = ""
+        row["index2"] = "TTTTTTTT"
+    text = render_bcl_convert_samplesheet(entry)
+    assert "CreateFastqForIndexReads,1\n" in text
+
+
+@pytest.mark.parametrize("index", ["", "  "])
+def test_render_disables_index_reads_setting_for_unindexed_samples(index):
+    # bcl-convert hard-fails ("When no index is present,
+    # CreateFastqForIndexReads cannot be enabled") when the setting is on
+    # but no sample carries an index; the renderer must coerce it, because
+    # upstream docs can be inconsistent (e.g. a NoIndex project with the
+    # setting still enabled).
+    entry = _render_payload()
+    for row in entry["BCLConvert_Data"]:
+        row["index"] = index
+    text = render_bcl_convert_samplesheet(entry)
+    assert "CreateFastqForIndexReads,False\n" in text
+    assert "CreateFastqForIndexReads,1" not in text

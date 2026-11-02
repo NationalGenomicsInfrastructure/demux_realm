@@ -1,15 +1,25 @@
 import logging
 from pathlib import Path
+from typing import Annotated
 
 from yggdrasil.flow.artifacts import SimpleArtifactRef
+from yggdrasil.flow.errors import PermanentStepError
 from yggdrasil.flow.model import StepResult
-from yggdrasil.flow.step import StepContext, step
+from yggdrasil.flow.step import In, Out, StepContext, step
 
+from .config import load_realm_config
+from .nextflow import (
+    branch_outdir,
+    branch_run_tag,
+    branch_work_dir,
+    build_nextflow_command,
+    parse_run_options,
+    run_nextflow,
+)
 from .utils import (
     DEMUX_CONFIG_FILENAME,
     RUN_INFO_XML,
     RUN_PARAMETERS_XML,
-    SAMPLESHEET_FILENAME,
     build_lims_lookup,
     build_x_flowcell_payload,
     derive_xflowcell_name,
@@ -21,6 +31,12 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+SAMPLESHEET = SimpleArtifactRef(
+    key_name="samplesheet",
+    folder="samplesheets",
+    filename="SampleSheet.csv",
+)
 
 
 @step
@@ -128,39 +144,127 @@ def materialize_extra_config(ctx: StepContext, scenario: dict) -> StepResult:
 
 
 @step
-def generate_samplesheet(ctx: StepContext, scenario: dict) -> StepResult:
+def generate_samplesheet(ctx: StepContext, 
+                         scenario: dict,
+                         samplesheet: Annotated[Path, Out(SAMPLESHEET)]
+                         ) -> StepResult:
     """Generates and writes SampleSheet.csv from the lane-specific samplesheet payload."""
     ss_payload = scenario["samplesheet_payload"]
+    # The plan is stored as JSON, so a Path param arrives here as a str.
+    samplesheet = Path(samplesheet)
 
     validate_lane_payload(ss_payload, expected_lane=scenario.get("lane_id"))
     ss_text = render_bcl_convert_samplesheet(ss_payload)
 
-    ss_file = ctx.workdir / SAMPLESHEET_FILENAME
-    ss_file.write_text(ss_text)
+    # Write to the path supplied by the plan.
+    samplesheet.parent.mkdir(parents=True, exist_ok=True)
+    samplesheet.write_text(ss_text, encoding="utf-8")
 
     logger.info(
-        "Wrote SampleSheet.csv (%d bytes) to %s", ss_file.stat().st_size, ss_file
+        "Wrote SampleSheet.csv (%d bytes) to %s",
+        samplesheet.stat().st_size,
+        samplesheet,
     )
-    ctx.record_artifact(SimpleArtifactRef("samplesheet", "samplesheets"), path=ss_file)
-    return StepResult(metrics={"samplesheet_bytes": ss_file.stat().st_size})
+    ctx.record_artifact(SAMPLESHEET, path=samplesheet)
+    return StepResult(metrics={"samplesheet_bytes": samplesheet.stat().st_size})
 
 
 @step
-def execute_demux(ctx: StepContext, scenario: dict) -> StepResult:
-    """Simulates Nextflow pipeline execution."""
-    logger.info("Executing demux pipeline (Nextflow)...")
-    logger.info(f"Using runfolder: {scenario['hpc_runfolder_path']}")
-    logger.info("Simulation mode: Pipeline executed successfully.")
+def execute_demux(ctx: StepContext, scenario: dict, samplesheet: Annotated[Path, In(SAMPLESHEET)]) -> StepResult:
+    """Runs one Nextflow nf-core/demultiplex instance for this branch.
 
-    return StepResult(metrics={"execution_status": "simulated_success"})
+    There is one instance per lane/samplesheet branch: the branch's
+    samplesheet is the file this branch's generate_samplesheet step wrote
+    into its own work directory (see _branch_samplesheet), and Nextflow
+    receives work and results directories derived from the branch tag, so
+    two branches never share work directories.
+
+    Deployment settings (pipeline, profile, common config, directory bases)
+    come from the realm's JSON config; options that differ between runs
+    (skip_tools) come from the demux_sample_info document via the scenario's
+    ``nextflow`` entry. See demux_realm.config and demux_realm.nextflow.
+    """
+    runfolder_path = Path(scenario["hpc_runfolder_path"])
+    # The plan is stored as JSON, so a Path param arrives here as a str.
+    samplesheet = Path(samplesheet)
+
+    try:
+        run_options = parse_run_options(scenario.get("nextflow"))
+    except ValueError as exc:
+        raise PermanentStepError(
+            f"Invalid nextflow options in scenario: {exc}",
+            advice="Fix the 'nextflow' object of the demux_sample_info document.",
+        ) from exc
+
+    settings = load_realm_config().nextflow
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    cmd = build_nextflow_command(
+        settings,
+        canonical_flowcell_id=scenario["canonical_flowcell_id"],
+        lane_id=str(scenario["lane_id"]),
+        settings_index=str(scenario["settings_index"]),
+        samplesheet=samplesheet,
+        flowcell_path=runfolder_path,
+        run_options=run_options,
+    )
+    log_path = ctx.workdir / "nextflow_run.log"
+    proc = run_nextflow(cmd, log_path)
+    ctx.record_artifact(SimpleArtifactRef("nextflow_log", "logs"), path=log_path)
+
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
+        raise PermanentStepError(
+            f"Nextflow exited with status {proc.returncode} (branch {tag}); "
+            f"last log lines:\n{tail}",
+            advice=f"Full log: {log_path}",
+        )
+
+    logger.info("Nextflow run finished (branch %s).", tag)
+    return StepResult(
+        metrics={
+            "branch": tag,
+            "exit_status": proc.returncode,
+            "work_dir": str(branch_work_dir(settings, tag)),
+            "outdir": str(branch_outdir(settings, tag)),
+        }
+    )
 
 
 @step
 def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
-    """Collects demultiplexing metrics, artifacts and logs."""
-    logger.info("Collecting metrics from demux result directory...")
+    """Collects demultiplexing artifacts and basic metrics from the branch's results directory."""
+    settings = load_realm_config().nextflow
+    tag = branch_run_tag(
+        scenario["canonical_flowcell_id"],
+        str(scenario["lane_id"]),
+        str(scenario["settings_index"]),
+    )
+    outdir = branch_outdir(settings, tag)
+    if not outdir.is_dir():
+        raise PermanentStepError(
+            f"Results directory missing: {outdir}",
+            advice="Did the branch's execute_demux step succeed?",
+        )
 
-    return StepResult(metrics={"yield": 120000000, "q30_percentage": 98.4})
+    fastqs = sorted(outdir.rglob("*.fastq.gz"))
+    multiqc_reports = sorted(outdir.rglob("multiqc_report.html"))
+    for report in multiqc_reports:
+        ctx.record_artifact(SimpleArtifactRef("multiqc_report", "reports"), path=report)
+
+    logger.info(
+        "Collected %d fastq file(s) from %s", len(fastqs), outdir
+    )
+    return StepResult(
+        metrics={
+            "outdir": str(outdir),
+            "fastq_count": len(fastqs),
+            "multiqc_report_count": len(multiqc_reports),
+        }
+    )
 
 
 @step

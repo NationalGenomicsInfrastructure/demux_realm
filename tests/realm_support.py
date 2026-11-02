@@ -91,9 +91,10 @@ def demux_sample_info_doc(
     rev: str = "1-dsi",
     metadata: dict[str, Any] | None = None,
     uploaded_lims_info: list[dict[str, Any]] | None = None,
+    nextflow: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a demux_sample_info document holding samplesheets."""
-    return {
+    doc: dict[str, Any] = {
         "_id": "uuid-dsi-1",
         "_rev": rev,
         "flowcell_id": flowcell_id,
@@ -101,6 +102,9 @@ def demux_sample_info_doc(
         "metadata": metadata or {"run_mode": "standard"},
         "uploaded_lims_info": uploaded_lims_info or [],
     }
+    if nextflow is not None:
+        doc["nextflow"] = nextflow
+    return doc
 
 
 def planning_ctx(

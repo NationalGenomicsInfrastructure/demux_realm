@@ -11,6 +11,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from demux_realm.config import realm_config_from_mapping
+from demux_realm.handler import DemuxHandler
+from demux_realm.recipes import UPSERT_X_FLOWCELL, VALIDATE_RUNFOLDER
 from realm_support import (
     REALM_ID,
     RUN_INFO_XML_TEXT,
@@ -20,6 +23,9 @@ from realm_support import (
     lane_entry,
     planning_ctx,
 )
+
+from demux_realm import handler as handler_module
+from demux_realm import steps as realm_steps
 from yggdrasil.core import engine as engine_module
 from yggdrasil.core.engine import Engine
 from yggdrasil.daemon.plan_execution import (
@@ -28,15 +34,12 @@ from yggdrasil.daemon.plan_execution import (
     PlanExecutionCoordinator,
 )
 from yggdrasil.flow.events.emitter import FileSpoolEmitter
+from yggdrasil.flow.model import StepResult
 from yggdrasil.flow.outcomes import ExecutionOutcome, StepOutcome, TerminationReason
 from yggdrasil.flow.step import step
 from yggdrasil.storage import build_internal_storage
 from yggdrasil.storage.plan_eligibility import is_plan_eligible
 from yggdrasil.storage.sqlite import SQLiteInternalStore
-
-from demux_realm import steps as realm_steps
-from demux_realm.handler import DemuxHandler
-from demux_realm.recipes import UPSERT_X_FLOWCELL, VALIDATE_RUNFOLDER
 
 SUCCEEDED = StepOutcome.SUCCEEDED
 REUSED = StepOutcome.REUSED
@@ -91,7 +94,11 @@ def x_flowcells(monkeypatch):
 
 @pytest.fixture
 def ws(tmp_path, monkeypatch):
-    monkeypatch.delenv("DMX_HPC_BASE_PATH", raising=False)
+    monkeypatch.setattr(
+        handler_module,
+        "load_realm_config",
+        lambda: realm_config_from_mapping(None),
+    )
     monkeypatch.setenv("YGG_WORK_ROOT", str(tmp_path / "work"))
     monkeypatch.setenv("YGG_EVENT_SPOOL", str(tmp_path / "spool"))
     incoming = tmp_path / "incoming"
@@ -130,6 +137,31 @@ def plan_for(ws, samplesheets):
 
 def engine_for(ws) -> Engine:
     return Engine(work_root=ws.work, emitter=FileSpoolEmitter(spool_dir=ws.spool))
+
+
+def _no_op_step(name: str):
+    """Build a stand-in @step that does nothing but report success."""
+
+    @step(name=name)
+    def no_op(ctx, scenario):
+        return StepResult(metrics={f"{name}_stand_in": True})
+
+    return no_op
+
+
+@pytest.fixture(autouse=True)
+def no_external_side_effects(monkeypatch):
+    """Swap the externally-effecting realm steps for no-op stand-ins.
+
+    These tests drive the real engine against temporary directories; they
+    must never launch Nextflow or read deployment result directories.
+    ``instrument`` keeps working: it resolves the (already swapped) step
+    from the module and records its calls.
+    """
+    monkeypatch.setattr(realm_steps, "execute_demux", _no_op_step("execute_demux"))
+    monkeypatch.setattr(
+        realm_steps, "collect_results", _no_op_step("collect_results")
+    )
 
 
 def instrument(monkeypatch, name, calls, fail_when=None):

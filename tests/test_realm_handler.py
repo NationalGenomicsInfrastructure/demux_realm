@@ -12,12 +12,14 @@ from realm_support import (
 )
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan
 
+from demux_realm.config import realm_config_from_mapping
 from demux_realm.descriptor import (
     _build_demux_sample_info_payload,
     _build_demux_sample_info_scope,
     _build_flowcell_status_payload,
     _build_flowcell_status_scope,
 )
+from demux_realm import handler as handler_module
 from demux_realm.handler import DemuxHandler
 from demux_realm.recipes import UPSERT_X_FLOWCELL, VALIDATE_RUNFOLDER
 
@@ -38,7 +40,13 @@ def branch_ids(namespace: str) -> list[str]:
 
 @pytest.fixture(autouse=True)
 def _no_hpc_base_path(monkeypatch):
-    monkeypatch.delenv("DMX_HPC_BASE_PATH", raising=False)
+    set_realm_config(monkeypatch)
+
+
+def set_realm_config(monkeypatch, **raw) -> None:
+    """Plan against this realm config instead of the one on disk."""
+    config = realm_config_from_mapping(raw or None)
+    monkeypatch.setattr(handler_module, "load_realm_config", lambda: config)
 
 
 @pytest.fixture
@@ -417,7 +425,7 @@ async def test_metadata_can_be_made_a_branch_prerequisite(handler, monkeypatch):
 async def test_hpc_base_path_prefixes_the_runfolder(
     handler, monkeypatch, base, destination, expected
 ):
-    monkeypatch.setenv("DMX_HPC_BASE_PATH", base)
+    set_realm_config(monkeypatch, hpc_base_path=base)
     (draft,), _ = await plan_from_flowcell_change(
         handler,
         demux_sample_info_doc([lane_entry(1)]),
@@ -439,7 +447,7 @@ async def test_relative_runfolder_path_is_rejected(
     handler, monkeypatch, base, destination
 ):
     if base:
-        monkeypatch.setenv("DMX_HPC_BASE_PATH", base)
+        set_realm_config(monkeypatch, hpc_base_path=base)
     (draft,), _ = await plan_from_flowcell_change(
         handler,
         demux_sample_info_doc([lane_entry(1)]),
@@ -451,6 +459,122 @@ async def test_relative_runfolder_path_is_rejected(
     assert draft.plan.plan_id == PLAN_ID
     assert draft.notes.startswith("Rejected: runfolder path")
     assert "is not absolute" in draft.notes
+
+
+@pytest.mark.asyncio
+async def test_nextflow_options_reach_only_the_execute_demux_scenario(handler):
+    entry = lane_entry(1)
+    entry["Samplesheet_raw_settings"] = {"CreateFastqForIndexReads": "1"}
+    entry["commandline_options"] = {"nextflow": {"skip_tools": ["samshee"]}}
+    (draft,), _ = await plan_from_flowcell_change(
+        handler,
+        demux_sample_info_doc([entry]),
+        flowcell_status_doc(),
+    )
+
+    scenarios = {
+        s.step_id: s.params["scenario"] for s in draft.plan.steps if s.params
+    }
+    execute = scenarios["lane_1_settings_0__execute_demux"]
+    assert execute["nextflow"] == {"skip_tools": ["samshee"]}
+    assert [k for k, v in scenarios.items() if "nextflow" in v] == [
+        "lane_1_settings_0__execute_demux"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_nextflow_options_skip_nothing(handler):
+    draft = await plan_for(handler, [lane_entry(1)])
+
+    execute = step_dicts(draft.plan)["lane_1_settings_0__execute_demux"]
+    assert execute["params"]["scenario"]["nextflow"] == {"skip_tools": []}
+
+
+@pytest.mark.asyncio
+async def test_samplesheet_skip_tools_beats_config(handler, monkeypatch):
+    set_realm_config(monkeypatch, nextflow={"skip_tools": ["falco"]})
+    entry = lane_entry(1)
+    # The working tree validates Samplesheet_raw_settings; lane_entry still
+    # emits the old key. Remove one of them when the rename settles.
+    entry["Samplesheet_raw_settings"] = {"CreateFastqForIndexReads": "1"}
+    entry["commandline_options"] = {"nextflow": {"skip_tools": ["samshee"]}}
+    (draft,), _ = await plan_from_flowcell_change(
+        handler,
+        demux_sample_info_doc([entry]),
+        flowcell_status_doc(),
+    )
+
+    execute = next(
+        s for s in draft.plan.steps if s.step_id.endswith("__execute_demux")
+    )
+    assert execute.params["scenario"]["nextflow"] == {"skip_tools": ["samshee"]}
+
+
+@pytest.mark.asyncio
+async def test_skip_tools_can_differ_between_samplesheets(handler, monkeypatch):
+    set_realm_config(monkeypatch, nextflow={"skip_tools": ["fastp"]})
+    first = lane_entry(1, settings_index=0)
+    first["Samplesheet_raw_settings"] = {"CreateFastqForIndexReads": "1"}
+    first["commandline_options"] = {"nextflow": {"skip_tools": ["samshee"]}}
+    second = lane_entry(1, settings_index=1)
+    second["Samplesheet_raw_settings"] = {"CreateFastqForIndexReads": "1"}
+    (draft,), _ = await plan_from_flowcell_change(
+        handler,
+        demux_sample_info_doc([first, second]),
+        flowcell_status_doc(),
+    )
+
+    options = {
+        s.step_id: s.params["scenario"]["nextflow"]
+        for s in draft.plan.steps
+        if s.step_id.endswith("__execute_demux")
+    }
+    assert options == {
+        "lane_1_settings_0__execute_demux": {"skip_tools": ["samshee"]},
+        "lane_1_settings_1__execute_demux": {"skip_tools": ["fastp"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_config_skip_tools_default_applies_when_document_is_silent(
+    handler, monkeypatch
+):
+    set_realm_config(monkeypatch, nextflow={"skip_tools": ["falco", "multiqc"]})
+    entry = lane_entry(1)
+    entry["Samplesheet_raw_settings"] = {"CreateFastqForIndexReads": "1"}
+    draft = await plan_for(handler, [entry])
+
+    execute = next(
+        s for s in draft.plan.steps if s.step_id.endswith("__execute_demux")
+    )
+    assert execute.params["scenario"]["nextflow"] == {
+        "skip_tools": ["falco", "multiqc"]
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        "nextflow",
+        {"fastp": {}},
+        {"nextflow": "skip"},
+        {"nextflow": {"skip_toools": []}},
+        {"nextflow": {"skip_tools": "samshee"}},
+        {"nextflow": {"skip_tools": ["bad name"]}},
+    ],
+)
+async def test_invalid_samplesheet_skip_tools_are_rejected(handler, cmdline):
+    entry = lane_entry(1)
+    entry["Samplesheet_raw_settings"] = {"CreateFastqForIndexReads": "1"}
+    entry["commandline_options"] = cmdline
+    (draft,), _ = await plan_from_flowcell_change(
+        handler, demux_sample_info_doc([entry]), flowcell_status_doc()
+    )
+
+    assert draft.auto_run is False
+    assert draft.plan.steps == []
+    assert "invalid skip_tools" in draft.notes
 
 
 @pytest.mark.asyncio

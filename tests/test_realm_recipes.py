@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY
 
 from demux_realm.recipes import (
@@ -6,6 +8,7 @@ from demux_realm.recipes import (
     branch_namespace,
     build_demux_plan,
 )
+from demux_realm.nextflow import NextflowRunOptions
 from demux_realm.utils import SamplesheetBranch
 
 _RUNFOLDER = "/incoming/path/230314_A00000_0000_AXXXXX"
@@ -25,13 +28,47 @@ def _plan(branches=_BRANCHES, prerequisites=(VALIDATE_RUNFOLDER,)):
         samplesheets=[{"lane": 3}, {"lane": 1}],
         uploaded_lims_info=[],
         metadata={"m": 1},
+        branch_run_options={
+            ("1", "0"): NextflowRunOptions(skip_tools=("samshee",)),
+            ("3", "1"): NextflowRunOptions(skip_tools=("samshee",)),
+        },
         branches=branches,
         branch_prerequisites=prerequisites,
+        artifact_base=Path("/work/artifacts"),
     )
 
 
 def test_branch_namespace_is_flat_and_readable():
     assert branch_namespace("2", "0") == "lane_2_settings_0"
+
+
+def test_branch_run_options_are_carried_per_branch():
+    plan = build_demux_plan(
+        plan_id="dmx_realm:SC123:demux",
+        realm="dmx_realm",
+        canonical_fcid="SC123",
+        runfolder_id="230314_A00000_0000_AXXXXX",
+        hpc_runfolder_path=_RUNFOLDER,
+        samplesheets=[{"lane": 3}, {"lane": 1}],
+        uploaded_lims_info=[],
+        metadata={"m": 1},
+        branch_run_options={
+            ("1", "0"): NextflowRunOptions(skip_tools=("samshee",)),
+            ("3", "1"): NextflowRunOptions(),
+        },
+        branches=_BRANCHES,
+        branch_prerequisites=(VALIDATE_RUNFOLDER,),
+        artifact_base=Path("/work/artifacts"),
+    )
+    options = {
+        s.step_id: s.params["scenario"]["nextflow"]
+        for s in plan.steps
+        if s.step_id.endswith("__execute_demux")
+    }
+    assert options == {
+        "lane_1_settings_0__execute_demux": {"skip_tools": ["samshee"]},
+        "lane_3_settings_1__execute_demux": {"skip_tools": []},
+    }
 
 
 def test_shared_steps_declare_the_xml_the_metadata_step_reads():
@@ -92,7 +129,17 @@ def test_each_branch_is_a_chain_of_five_namespaced_steps():
     assert (scenario["lane_id"], scenario["settings_index"]) == ("3", "1")
     assert scenario["samplesheet_payload"] == {"lane": 3}
     assert scenario["demux_sample_info_doc"] == {"metadata": {"m": 1}}
-    assert all(s.params == {"scenario": scenario} for s in steps)
+    # Only execute_demux gets the sheet location and the per-run options.
+    execute = steps[2].params["scenario"]
+    assert execute == {
+        **scenario,
+        "samplesheet_path": "lane_3_settings_1__generate_samplesheet/SampleSheet.csv",
+        "nextflow": {"skip_tools": ["samshee"]},
+    }
+    assert steps[2].inputs == {
+        "samplesheet": "lane_3_settings_1__generate_samplesheet/SampleSheet.csv"
+    }
+    assert all(s.params == {"scenario": scenario} for i, s in enumerate(steps) if i != 2)
     assert all(s.name.endswith("(lane 3, settings 1)") for s in steps)
 
 

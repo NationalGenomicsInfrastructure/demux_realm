@@ -7,6 +7,8 @@ from yggdrasil.flow.model import Plan
 from yggdrasil.flow.planner import PlanDraft, PlanningContext
 from yggdrasil.watchers import EventType
 
+from .config import load_realm_config
+from .nextflow import resolve_run_options
 from .recipes import (
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
@@ -235,13 +237,14 @@ class DemuxHandler(BaseHandler):
         if samplesheets is None or samplesheets == []:
             return defer("demux_sample_info missing samplesheets.")
 
-        hpc_base = os.environ.get("DMX_HPC_BASE_PATH", "")
+        config = load_realm_config()
+        hpc_base = config.hpc_base_path
         if hpc_base:
             hpc_runfolder_path = os.path.join(
                 hpc_base, destination_path.lstrip("/"), runfolder_id
             )
             logger.debug(
-                "DMX_HPC_BASE_PATH='%s'; resolved runfolder path: %s",
+                "hpc_base_path='%s'; resolved runfolder path: %s",
                 hpc_base,
                 hpc_runfolder_path,
             )
@@ -254,7 +257,8 @@ class DemuxHandler(BaseHandler):
                     canonical_fcid,
                     "rejected",
                     f"runfolder path '{hpc_runfolder_path}' is not absolute; "
-                    "DMX_HPC_BASE_PATH or destination_path must be absolute.",
+                    "the realm config's hpc_base_path or destination_path must be "
+                    "absolute.",
                     provenance,
                 )
             ]
@@ -277,6 +281,25 @@ class DemuxHandler(BaseHandler):
                 )
             ]
 
+        # skip_tools may differ per samplesheet: the entry's own value, else
+        # the realm config default.
+        try:
+            branch_run_options = {
+                (branch.lane_id, branch.settings_index): resolve_run_options(
+                    branch.payload, config.nextflow
+                )
+                for branch in branches
+            }
+        except ValueError as exc:
+            return [
+                self._flowcell_diagnostic(
+                    canonical_fcid,
+                    "rejected",
+                    f"demux_sample_info has invalid skip_tools: {exc}",
+                    provenance,
+                )
+            ]
+
         plan = build_demux_plan(
             plan_id=self._plan_id(canonical_fcid),
             realm=self._require_realm_id(),
@@ -286,8 +309,10 @@ class DemuxHandler(BaseHandler):
             samplesheets=samplesheets,
             uploaded_lims_info=demux_doc.get("uploaded_lims_info", []),
             metadata=demux_doc.get("metadata", {}),
+            branch_run_options=branch_run_options,
             branches=branches,
             branch_prerequisites=self.branch_prerequisites,
+            artifact_base = ctx.scope_dir / "artifacts" / self._plan_id(canonical_fcid),
         )
         branch_summaries = []
         for branch in branches:
