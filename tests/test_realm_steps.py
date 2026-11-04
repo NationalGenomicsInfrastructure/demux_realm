@@ -5,7 +5,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from demux_realm.config import RealmConfig
+from demux_realm.nextflow import settings_from_mapping
 from demux_realm.steps import (
+    aggregate_illumina_stats,
     collect_results,
     upload_results,
     upsert_x_flowcell_pre_demux,
@@ -18,6 +21,7 @@ _step = upsert_x_flowcell_pre_demux.__wrapped__  # type: ignore[attr-defined]
 _collect_results = collect_results.__wrapped__  # type: ignore[attr-defined]
 _upload_results = upload_results.__wrapped__  # type: ignore[attr-defined]
 _validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-defined]
+_aggregate_illumina_stats = aggregate_illumina_stats.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -286,7 +290,11 @@ def test_step_samplesheet_missing_bcl_data_raises(tmp_path, scenario):
 
 
 def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeypatch):
-    monkeypatch.setenv("DMX_NF_OUTDIR_BASE", str(tmp_path / "results"))
+    realm_config = RealmConfig(
+        hpc_base_path="",
+        nextflow=settings_from_mapping({"outdir_base": str(tmp_path / "results")}),
+    )
+    monkeypatch.setattr("demux_realm.steps.load_realm_config", lambda: realm_config)
     scenario: dict[str, Any] = {
         "canonical_flowcell_id": "SC2177698-SC3",
         "lane_id": "1",
@@ -312,7 +320,11 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
         scenario["demultiplexing_metadata"],
     )
     assert metadata["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
-    assert result.metrics["fastq_count"] == 0
+    assert set(result.metrics["demultiplexing_metadata_files"]) == {
+        "Demultiplex_Stats",
+        "Quality_Metrics",
+        "Top_Unknown_Barcodes",
+    }
 
     client = MagicMock()
     client.find_one.return_value = {
@@ -337,6 +349,139 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
     assert saved_doc[branch_field]["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
     assert upload_result.metrics["upload_status"] == "simulated_success"
     assert upload_result.metrics["demultiplex_field"] == branch_field
+
+
+def _qm_row(lane, sample, read_number, yield_, yield_q30, quality_sum):
+    return {
+        "Lane": lane,
+        "SampleID": sample,
+        "ReadNumber": read_number,
+        "Yield": str(yield_),
+        "YieldQ30": str(yield_q30),
+        "QualityScoreSum": str(quality_sum),
+    }
+
+
+def test_aggregate_illumina_stats_combines_all_lanes():
+    existing = {
+        "_id": "doc-123",
+        "_rev": "2-abc",
+        "name": "20260312_ASC2177698-SC3",
+        "samplesheet_csv": [
+            {"Sample_ID": "P1_101", "Sample_Project": "A__Proj"},
+            {"Sample_ID": "P2_201", "Sample_Project": "B__Proj"},
+        ],
+        "Demultiplex_lane_1_settings_0": {
+            "Demultiplex_Stats": [
+                {
+                    "Lane": "1",
+                    "SampleID": "P1_101",
+                    "Index": "AAAA+TTTT",
+                    "# Reads": "1000",
+                    "# Perfect Index Reads": "900",
+                    "# One Mismatch Index Reads": "100",
+                    "% Reads": "50.00",
+                    "% Perfect Index Reads": "90.00",
+                    "% One Mismatch Index Reads": "10.00",
+                },
+                {
+                    "Lane": "1",
+                    "SampleID": "Undetermined",
+                    "Index": "",
+                    "# Reads": "1000",
+                    "# Perfect Index Reads": "1000",
+                    "# One Mismatch Index Reads": "0",
+                    "% Reads": "50.00",
+                    "% Perfect Index Reads": "100.00",
+                    "% One Mismatch Index Reads": "0.00",
+                },
+            ],
+            "Quality_Metrics": [
+                _qm_row("1", "P1_101", "1", 100_000_000, 90_000_000, 3_500_000_000),
+                _qm_row("1", "P1_101", "2", 100_000_000, 85_000_000, 3_400_000_000),
+                _qm_row("1", "P1_101", "I1", 999, 999, 999),
+                _qm_row(
+                    "1", "Undetermined", "1", 50_000_000, 20_000_000, 1_000_000_000
+                ),
+                _qm_row("1", "Undetermined", "2", 50_000_000, 19_000_000, 900_000_000),
+            ],
+        },
+        "Demultiplex_lane_2_settings_0": {
+            "Demultiplex_Stats": [
+                {
+                    "Lane": "2",
+                    "SampleID": "P2_201",
+                    "Index": "CCCC+GGGG",
+                    "# Reads": "500",
+                    "# Perfect Index Reads": "400",
+                    "# One Mismatch Index Reads": "50",
+                    "% Reads": "100.00",
+                    "% Perfect Index Reads": "80.00",
+                    "% One Mismatch Index Reads": "10.00",
+                }
+            ],
+            "Quality_Metrics": [
+                _qm_row("2", "P2_201", "1", 50_000_000, 40_000_000, 1_500_000_000),
+                _qm_row("2", "P2_201", "2", 50_000_000, 42_000_000, 1_600_000_000),
+            ],
+        },
+    }
+
+    client = MagicMock()
+    client.find_one.return_value = existing
+    client.clean_doc.side_effect = lambda doc: {
+        k: v for k, v in doc.items() if k not in ("_id", "_rev")
+    }
+    client.save.return_value = MagicMock(status="updated", doc_id="doc-123")
+    ctx = MagicMock()
+    ctx.data.connection.return_value = client
+
+    scenario = {"runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3"}
+    result = _aggregate_illumina_stats(ctx, scenario)
+
+    saved_doc = client.save.call_args.args[0]
+    assert "_id" not in saved_doc
+    assert "_rev" not in saved_doc
+    stats = saved_doc["illumina"]["Demultiplex_Stats"]
+    by_sample = {row["Sample"]: row for row in stats["Barcode_lane_statistics"]}
+
+    p1 = by_sample["P1_101"]
+    assert p1["Project"] == "A__Proj"
+    assert p1["PF Clusters"] == "1,000"
+    assert p1["% of thelane"] == "50.00"
+    assert p1["% PFClusters"] == "50.00"
+    assert p1["% Perfectbarcode"] == "90.00"
+    assert p1["% One mismatchbarcode"] == "10.00"
+    assert p1["Yield (Mbases)"] == "200"
+    assert p1["Mean QualityScore"] == "34.50"
+    assert p1["% >= Q30bases"] == "87.50"
+
+    undetermined = by_sample["Undetermined"]
+    assert undetermined["Project"] == "default"
+    assert undetermined["Barcode sequence"] == "unknown"
+    assert undetermined["Yield (Mbases)"] == "100"
+
+    lanes_by_id = {row["Lane"]: row for row in stats["Lanes_stats"]}
+    lane1 = lanes_by_id["1"]
+    assert lane1["PF Clusters"] == "2,000"
+    assert lane1["% Perfectbarcode"] == "95.00"
+    assert lane1["% One mismatchbarcode"] == "5.00"
+    assert lane1["Yield (Mbases)"] == "300"
+    assert lane1["% >= Q30bases"] == "71.33"
+    assert lane1["Mean QualityScore"] == "29.33"
+
+    lane2 = lanes_by_id["2"]
+    assert lane2["PF Clusters"] == "500"
+    assert lane2["% Perfectbarcode"] == "80.00"
+    assert lane2["Yield (Mbases)"] == "100"
+
+    flowcell = stats["Flowcell_stats"]
+    assert flowcell["Clusters (Raw)"] == "2,500"
+    assert flowcell["Clusters(PF)"] == "2,500"
+    assert flowcell["Yield (MBases)"] == "400"
+
+    assert result.metrics["lane_count"] == 2
+    assert result.metrics["sample_row_count"] == 3
 
 
 def test_step_raises_when_data_not_injected(tmp_path, scenario):

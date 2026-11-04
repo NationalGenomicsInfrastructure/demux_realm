@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -71,6 +72,175 @@ def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
         if rows:
             metadata[filename.removesuffix(".csv")] = rows
     return metadata
+
+
+# Matches branch fields written by upload_results, e.g. "Demultiplex_lane_1_settings_0".
+_BRANCH_FIELD_RE = re.compile(r"^Demultiplex_lane_.+_settings_.+$")
+
+
+def _parse_int(value: str | None) -> int:
+    """Parse a CSV integer cell, tolerating thousands separators and blanks."""
+    text = (value or "").replace(",", "").strip()
+    return int(text) if text else 0
+
+
+def _parse_float(value: str | None) -> float:
+    """Parse a CSV numeric cell, tolerating thousands separators and blanks."""
+    text = (value or "").replace(",", "").strip()
+    return float(text) if text else 0.0
+
+
+def _fmt_int(value: float) -> str:
+    """Format a count with thousands separators, e.g. 2101589 -> '2,101,589'."""
+    return f"{round(value):,}"
+
+
+def _fmt_pct(value: float) -> str:
+    """Format a percentage/score to 2 decimal places, e.g. 98.2 -> '98.20'."""
+    return f"{value:.2f}"
+
+
+def _combine_quality_metrics(
+    quality_rows: list[dict[str, str]],
+) -> dict[tuple[str, str], dict[str, float]]:
+    """Sum Quality_Metrics.csv rows per (Lane, SampleID), read 1 and 2 only.
+
+    Quality_Metrics.csv has up to one row per ReadNumber (1, I1, I2, 2); index
+    reads (I1/I2) are excluded so Yield/YieldQ30/QualityScoreSum reflect only
+    the actual sequencing reads.
+    """
+    combined: dict[tuple[str, str], dict[str, float]] = {}
+    for row in quality_rows:
+        if row.get("ReadNumber") not in ("1", "2"):
+            continue
+        key = (row.get("Lane", ""), row.get("SampleID", ""))
+        bucket = combined.setdefault(
+            key, {"yield": 0.0, "yield_q30": 0.0, "quality_sum": 0.0}
+        )
+        bucket["yield"] += _parse_float(row.get("Yield"))
+        bucket["yield_q30"] += _parse_float(row.get("YieldQ30"))
+        bucket["quality_sum"] += _parse_float(row.get("QualityScoreSum"))
+    return combined
+
+
+def _build_illumina_stats(
+    demux_stats_rows: list[dict[str, str]],
+    quality_rows: list[dict[str, str]],
+    sample_project: dict[str, str],
+) -> dict[str, Any]:
+    """Combine Demultiplex_Stats.csv and Quality_Metrics.csv rows (all lanes)
+    into the legacy 'illumina.Demultiplex_Stats' document shape.
+
+    Limitation: Demultiplex_Stats.csv/Quality_Metrics.csv only report reads
+    that already passed filter, so there is no pre-filter ("raw") cluster
+    count available from these two files. "% PFClusters" is reused from
+    "% Reads" at the sample level; at the lane/flowcell level, where no
+    equivalent column exists, raw is treated as equal to PF (both yield
+    100.00% / Clusters (Raw) == Clusters(PF)).
+    """
+    quality_by_sample = _combine_quality_metrics(quality_rows)
+
+    barcode_lane_statistics: list[dict[str, str]] = []
+    lane_totals: dict[str, dict[str, float]] = {}
+
+    for row in demux_stats_rows:
+        lane = row.get("Lane", "")
+        sample = row.get("SampleID", "")
+        reads = _parse_int(row.get("# Reads"))
+        perfect = _parse_int(row.get("# Perfect Index Reads"))
+        one_mismatch = _parse_int(row.get("# One Mismatch Index Reads"))
+        pct_reads = _parse_float(row.get("% Reads"))
+        pct_perfect = _parse_float(row.get("% Perfect Index Reads"))
+        pct_one_mismatch = _parse_float(row.get("% One Mismatch Index Reads"))
+
+        qm = quality_by_sample.get(
+            (lane, sample), {"yield": 0.0, "yield_q30": 0.0, "quality_sum": 0.0}
+        )
+        yield_bases = qm["yield"]
+        mean_quality = (qm["quality_sum"] / yield_bases) if yield_bases else 0.0
+        pct_q30 = (qm["yield_q30"] / yield_bases * 100) if yield_bases else 0.0
+
+        barcode_lane_statistics.append(
+            {
+                "Lane": lane,
+                "Sample": sample,
+                "Barcode sequence": row.get("Index") or "unknown",
+                "Project": sample_project.get(sample, "default"),
+                "PF Clusters": _fmt_int(reads),
+                "% of thelane": _fmt_pct(pct_reads),
+                "% PFClusters": _fmt_pct(pct_reads),
+                "% Perfectbarcode": _fmt_pct(pct_perfect),
+                "% One mismatchbarcode": _fmt_pct(pct_one_mismatch),
+                "Yield (Mbases)": _fmt_int(yield_bases / 1_000_000),
+                "Mean QualityScore": _fmt_pct(mean_quality),
+                "% >= Q30bases": _fmt_pct(pct_q30),
+            }
+        )
+
+        totals = lane_totals.setdefault(
+            lane,
+            {
+                "reads": 0.0,
+                "perfect": 0.0,
+                "one_mismatch": 0.0,
+                "yield": 0.0,
+                "yield_q30": 0.0,
+                "quality_sum": 0.0,
+            },
+        )
+        totals["reads"] += reads
+        totals["perfect"] += perfect
+        totals["one_mismatch"] += one_mismatch
+        totals["yield"] += yield_bases
+        totals["yield_q30"] += qm["yield_q30"]
+        totals["quality_sum"] += qm["quality_sum"]
+
+    lanes_stats: list[dict[str, str]] = []
+    total_reads = 0.0
+    total_yield = 0.0
+    for lane, totals in lane_totals.items():
+        reads = totals["reads"]
+        yield_bases = totals["yield"]
+        lanes_stats.append(
+            {
+                "Lane": lane,
+                "PF Clusters": _fmt_int(reads),
+                "% of thelane": _fmt_pct(100.0),
+                "% Perfectbarcode": _fmt_pct(
+                    (totals["perfect"] / reads * 100) if reads else 0.0
+                ),
+                "% One mismatchbarcode": _fmt_pct(
+                    (totals["one_mismatch"] / reads * 100) if reads else 0.0
+                ),
+                "Yield (Mbases)": _fmt_int(yield_bases / 1_000_000),
+                # No raw (pre-filter) cluster count is available from these CSVs; see
+                # the docstring above for the placeholder rationale.
+                "% PFClusters": _fmt_pct(100.0),
+                "% >= Q30bases": _fmt_pct(
+                    (totals["yield_q30"] / yield_bases * 100) if yield_bases else 0.0
+                ),
+                "Mean QualityScore": _fmt_pct(
+                    (totals["quality_sum"] / yield_bases) if yield_bases else 0.0
+                ),
+            }
+        )
+        total_reads += reads
+        total_yield += yield_bases
+
+    flowcell_stats = {
+        # Clusters (Raw) == Clusters(PF): see the docstring above.
+        "Clusters (Raw)": _fmt_int(total_reads),
+        "Clusters(PF)": _fmt_int(total_reads),
+        "Yield (MBases)": _fmt_int(total_yield / 1_000_000),
+    }
+
+    return {
+        "Demultiplex_Stats": {
+            "Barcode_lane_statistics": barcode_lane_statistics,
+            "Flowcell_stats": flowcell_stats,
+            "Lanes_stats": lanes_stats,
+        }
+    }
 
 
 @step
@@ -441,6 +611,87 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
             "x_flowcell_name": name,
             "demultiplex_field": branch_field,
             "demultiplexing_metadata_files": list(metadata),
+            "doc_id": getattr(write_result, "doc_id", None),
+        }
+    )
+
+
+@step
+def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
+    """Recompute the combined 'illumina' demux stats field from every branch
+    already stored on the x_flowcells document, and save it back.
+
+    This is a common step, run once after all lane/settings branches'
+    upload_results steps (not a per-branch step): it reads every
+    Demultiplex_lane_<lane>_settings_<idx> field already persisted on the
+    document - including branches from earlier runs that were not rerun this
+    time - and rebuilds illumina.Demultiplex_Stats from their union. That
+    makes a rerun of a single lane safe: the aggregate always reflects
+    whatever is currently stored for every lane, not just the lanes that ran
+    in this invocation. Running this per-branch instead would require
+    merging a shared array field from concurrently-completing branches,
+    which risks lost updates/duplicate rows under _rev conflicts.
+    """
+    if ctx.data is None:
+        raise RuntimeError("StepContext.data (DataAccess) was not injected.")
+
+    runfolder_id = scenario["runfolder_id"]
+    name = derive_xflowcell_name(runfolder_id)
+    client = ctx.data.connection("x_flowcells_db")
+
+    existing: dict[str, Any] | None = None
+    if hasattr(client, "find_one"):
+        existing = client.find_one({"name": {"$eq": name}})
+    elif hasattr(client, "get"):
+        existing = client.get(name)
+    if existing is None:
+        raise PermanentStepError(
+            f"x_flowcells document '{name}' not found.",
+            advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
+        )
+    if not isinstance(existing, dict):
+        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+
+    demux_stats_rows: list[dict[str, str]] = []
+    quality_rows: list[dict[str, str]] = []
+    for key, value in existing.items():
+        if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
+            continue
+        demux_stats_rows.extend(value.get("Demultiplex_Stats") or [])
+        quality_rows.extend(value.get("Quality_Metrics") or [])
+
+    sample_project = {
+        row["Sample_ID"]: row.get("Sample_Project", "default")
+        for row in existing.get("samplesheet_csv") or []
+        if row.get("Sample_ID")
+    }
+
+    illumina = _build_illumina_stats(demux_stats_rows, quality_rows, sample_project)
+
+    if hasattr(client, "clean_doc"):
+        updated_doc = client.clean_doc(existing)
+    else:
+        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    updated_doc["illumina"] = illumina
+
+    write_result = client.save(
+        updated_doc,
+        selector={"name": {"$eq": name}},
+        mode="upsert",
+    )
+    logger.info(
+        "Updated x_flowcell document '%s' illumina stats %s (doc_id=%s)",
+        name,
+        write_result.status,
+        write_result.doc_id,
+    )
+    return StepResult(
+        metrics={
+            "x_flowcell_name": name,
+            "lane_count": len(
+                {row["Lane"] for row in demux_stats_rows if row.get("Lane")}
+            ),
+            "sample_row_count": len(demux_stats_rows),
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )

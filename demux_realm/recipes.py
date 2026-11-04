@@ -17,6 +17,7 @@ _PREFIX = "demux_realm.steps"
 VALIDATE_RUNFOLDER = "validate_runfolder"
 SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
+AGGREGATE_ILLUMINA_STATS = "aggregate_illumina_stats"
 
 
 def branch_namespace(lane_id: str, settings_index: str) -> str:
@@ -116,7 +117,7 @@ def build_demux_plan(
             "demux_sample_info_doc": {"metadata": metadata},
         }
 
-        samplesheet_path = str( artifact_base / ns / 'SampleSheet.csv' )
+        samplesheet_path = str(artifact_base / ns / "SampleSheet.csv")
         run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
         # Relative outputs resolve inside each producer's own work directory.
         steps += [
@@ -173,6 +174,22 @@ def build_demux_plan(
                 deps=[f"{ns}__collect_results"],
             ),
         ]
+
+    steps.append(
+        StepSpec(
+            step_id=AGGREGATE_ILLUMINA_STATS,
+            name="Aggregate Illumina Demux Stats",
+            fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
+            params={"scenario": dict(common)},
+            # Common step: runs once after every branch's upload_results, and
+            # recomputes the combined 'illumina' field from whatever is
+            # currently stored for each lane (see aggregate_illumina_stats).
+            deps=[
+                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
+                for b in branches
+            ],
+        )
+    )
 
     return Plan(
         plan_id=plan_id,
