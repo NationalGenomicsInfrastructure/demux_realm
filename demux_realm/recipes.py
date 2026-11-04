@@ -2,8 +2,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan, StepSpec
+
 from .nextflow import NextflowRunOptions
 from .utils import (
     DEMUX_CONFIG_FILENAME,
