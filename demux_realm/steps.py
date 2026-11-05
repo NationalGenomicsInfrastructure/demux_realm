@@ -135,8 +135,8 @@ def _build_illumina_stats(
     that already passed filter, so there is no pre-filter ("raw") cluster
     count available from these two files. "% PFClusters" is reused from
     "% Reads" at the sample level; at the lane/flowcell level, where no
-    equivalent column exists, raw is treated as equal to PF (both yield
-    100.00% / Clusters (Raw) == Clusters(PF)).
+    equivalent column exists, raw is set to 0 as a placeholder until we
+    know if its used anywhere.
     """
     quality_by_sample = _combine_quality_metrics(quality_rows)
 
@@ -228,8 +228,8 @@ def _build_illumina_stats(
         total_yield += yield_bases
 
     flowcell_stats = {
-        # Clusters (Raw) == Clusters(PF): see the docstring above.
-        "Clusters (Raw)": _fmt_int(total_reads),
+        # Clusters (Raw) == 0: placeholder
+        "Clusters (Raw)": 0,
         "Clusters(PF)": _fmt_int(total_reads),
         "Yield (MBases)": _fmt_int(total_yield / 1_000_000),
     }
