@@ -18,6 +18,7 @@ VALIDATE_RUNFOLDER = "validate_runfolder"
 SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
 AGGREGATE_ILLUMINA_STATS = "aggregate_illumina_stats"
+AGGREGATE_UNDETERMINED_STATS = "aggregate_undetermined_stats"
 
 
 def branch_namespace(lane_id: str, settings_index: str) -> str:
@@ -184,6 +185,22 @@ def build_demux_plan(
             # Common step: runs once after every branch's upload_results, and
             # recomputes the combined 'illumina' field from whatever is
             # currently stored for each lane (see aggregate_illumina_stats).
+            deps=[
+                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
+                for b in branches
+            ],
+        )
+    )
+
+    steps.append(
+        StepSpec(
+            step_id=AGGREGATE_UNDETERMINED_STATS,
+            name="Aggregate Undetermined Barcode Stats",
+            fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
+            params={"scenario": dict(common)},
+            # Common step: runs once after every branch's upload_results, and
+            # recomputes the combined 'Undetermined' field from whatever is
+            # currently stored for each lane (see aggregate_undetermined_stats).
             deps=[
                 f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
                 for b in branches

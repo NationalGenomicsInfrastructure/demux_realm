@@ -243,6 +243,29 @@ def _build_illumina_stats(
     }
 
 
+def _build_undetermined_stats(
+    top_unknown_rows: list[dict[str, str]],
+) -> dict[str, dict[str, int]]:
+    """Group Top_Unknown_Barcodes.csv rows (all lanes) into the
+    {lane: {barcode: read_count}} shape expected under the document's
+    "Undetermined" field.
+
+    Barcode keys combine index/index2 as "<index>+<index2>" (or just
+    "<index>" when there is no index2). Duplicate (Lane, barcode) rows -
+    which should not normally occur within a single branch - are summed.
+    """
+    undetermined: dict[str, dict[str, int]] = {}
+    for row in top_unknown_rows:
+        lane = row.get("Lane", "")
+        index1 = row.get("index", "")
+        index2 = row.get("index2", "")
+        barcode = f"{index1}+{index2}" if index2 else index1
+        reads = _parse_int(row.get("# Reads"))
+        lane_bucket = undetermined.setdefault(lane, {})
+        lane_bucket[barcode] = lane_bucket.get(barcode, 0) + reads
+    return undetermined
+
+
 @step
 def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
     """Validate that the runfolder is present."""
@@ -692,6 +715,76 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
                 {row["Lane"] for row in demux_stats_rows if row.get("Lane")}
             ),
             "sample_row_count": len(demux_stats_rows),
+            "doc_id": getattr(write_result, "doc_id", None),
+        }
+    )
+
+
+@step
+def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult:
+    """Recompute the combined 'Undetermined' demux stats field from every
+    branch already stored on the x_flowcells document, and save it back.
+
+    This is a common step, run once after all lane/settings branches'
+    upload_results steps (same pattern as aggregate_illumina_stats): it reads
+    every Demultiplex_lane_<lane>_settings_<idx> field's Top_Unknown_Barcodes
+    rows already persisted on the document - including branches from earlier
+    runs that were not rerun this time - and rebuilds Undetermined from their
+    union, keyed by lane then by "<index>+<index2>" barcode with its read
+    count. That makes a rerun of a single lane safe: the aggregate always
+    reflects whatever is currently stored for every lane, not just the lanes
+    that ran in this invocation.
+    """
+    if ctx.data is None:
+        raise RuntimeError("StepContext.data (DataAccess) was not injected.")
+
+    runfolder_id = scenario["runfolder_id"]
+    name = derive_xflowcell_name(runfolder_id)
+    client = ctx.data.connection("x_flowcells_db")
+
+    existing: dict[str, Any] | None = None
+    if hasattr(client, "find_one"):
+        existing = client.find_one({"name": {"$eq": name}})
+    elif hasattr(client, "get"):
+        existing = client.get(name)
+    if existing is None:
+        raise PermanentStepError(
+            f"x_flowcells document '{name}' not found.",
+            advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
+        )
+    if not isinstance(existing, dict):
+        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+
+    top_unknown_rows: list[dict[str, str]] = []
+    for key, value in existing.items():
+        if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
+            continue
+        top_unknown_rows.extend(value.get("Top_Unknown_Barcodes") or [])
+
+    undetermined = _build_undetermined_stats(top_unknown_rows)
+
+    if hasattr(client, "clean_doc"):
+        updated_doc = client.clean_doc(existing)
+    else:
+        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    updated_doc["Undetermined"] = undetermined
+
+    write_result = client.save(
+        updated_doc,
+        selector={"name": {"$eq": name}},
+        mode="upsert",
+    )
+    logger.info(
+        "Updated x_flowcell document '%s' Undetermined stats %s (doc_id=%s)",
+        name,
+        write_result.status,
+        write_result.doc_id,
+    )
+    return StepResult(
+        metrics={
+            "x_flowcell_name": name,
+            "lane_count": len(undetermined),
+            "barcode_row_count": len(top_unknown_rows),
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )
