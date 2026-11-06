@@ -228,8 +228,8 @@ def _build_illumina_stats(
         total_yield += yield_bases
 
     flowcell_stats = {
-        # Clusters (Raw) == 0: placeholder
-        "Clusters (Raw)": 0,
+        # Clusters (Raw) == "0": placeholder
+        "Clusters (Raw)": "0",
         "Clusters(PF)": _fmt_int(total_reads),
         "Yield (MBases)": _fmt_int(total_yield / 1_000_000),
     }
