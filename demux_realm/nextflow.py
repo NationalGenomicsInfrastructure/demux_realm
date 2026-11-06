@@ -42,9 +42,22 @@ _SETTINGS_KEYS = frozenset(
         "outdir_base",
         "extra_args",
         "skip_tools",
+        "executor",
+        "sbatch_cpus",
+        "sbatch_mem",
+        "sbatch_time",
+        "sbatch_partition",
     }
 )
 _RUN_OPTION_KEYS = frozenset({"skip_tools"})
+
+#: Where the branch's Nextflow run is executed: locally inside the daemon
+#: process (default) or as an SLURM batch job on the cluster node.
+_EXECUTORS = frozenset({"local", "slurm"})
+
+#: SLURM job names are capped at 80 characters by the scheduler.
+_JOB_NAME_MAX = 80
+_JOB_NAME_BAD = re.compile(r"[^A-Za-z0-9._-]")
 
 #: Tool sections accepted in a samplesheet entry's commandline_options.
 _CMDLINE_TOOLS = frozenset({"nextflow"})
@@ -75,6 +88,18 @@ class NextflowSettings:
     #: specify skip_tools. Empty means skip nothing (see
     #: NextflowRunOptions and resolve_run_options).
     skip_tools: tuple[str, ...] = ()
+    #: Where the branch's Nextflow run executes: "local" (a subprocess of the
+    #: daemon process, the default) or "slurm" (an sbatch job on the cluster
+    #: node, like a production HPC deployment).
+    executor: str = "local"
+    #: sbatch --cpus-per-task for the SLURM executor.
+    sbatch_cpus: int = 4
+    #: sbatch --mem for the SLURM executor.
+    sbatch_mem: str = "4G"
+    #: sbatch --time for the SLURM executor.
+    sbatch_time: str = "240:00:00"
+    #: sbatch --partition for the SLURM executor.
+    sbatch_partition: str = "local"
 
 
 @dataclass(frozen=True)
@@ -121,6 +146,15 @@ def _text(raw: Mapping[str, Any], key: str, default: str, label: str) -> str:
     return value.strip()
 
 
+def _positive_int(
+    raw: Mapping[str, Any], key: str, default: int, label: str
+) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label}.{key} must be a positive integer.")
+    return value
+
+
 def _string_list(value: object, label: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ValueError(f"{label} must be a list of strings.")
@@ -164,6 +198,12 @@ def settings_from_mapping(raw: Mapping[str, Any] | None = None) -> NextflowSetti
     raw = as_mapping(raw, label)
     reject_unknown(raw, _SETTINGS_KEYS, label)
 
+    executor = _text(raw, "executor", "local", label)
+    if executor not in _EXECUTORS:
+        raise ValueError(
+            f"{label}.executor must be one of {sorted(_EXECUTORS)}, got {executor!r}."
+        )
+
     common_config = raw.get("common_config")
     return NextflowSettings(
         pipeline=_text(raw, "pipeline", "nf-core/demultiplex", label),
@@ -177,6 +217,11 @@ def settings_from_mapping(raw: Mapping[str, Any] | None = None) -> NextflowSetti
         outdir_base=Path(_text(raw, "outdir_base", "/work/nf-realm-results", label)),
         extra_args=_string_list(raw.get("extra_args", []), f"{label}.extra_args"),
         skip_tools=parse_skip_tools(raw.get("skip_tools", []), f"{label}.skip_tools"),
+        executor=executor,
+        sbatch_cpus=_positive_int(raw, "sbatch_cpus", 4, label),
+        sbatch_mem=_text(raw, "sbatch_mem", "4G", label),
+        sbatch_time=_text(raw, "sbatch_time", "240:00:00", label),
+        sbatch_partition=_text(raw, "sbatch_partition", "local", label),
     )
 
 
@@ -354,3 +399,62 @@ def run_nextflow(cmd: list[str], log_path: Path) -> subprocess.CompletedProcess:
                 logger.debug("nextflow: %s", line.rstrip("\n"))
             returncode = proc.wait()
     return subprocess.CompletedProcess(cmd, returncode, stdout="".join(chunks))
+
+
+def slurm_job_name(tag: str) -> str:
+    """Sanitize a branch tag into a valid SLURM job name.
+
+    SLURM job names allow [A-Za-z0-9._-] and are capped at 80 characters;
+    the branch tag carries the flowcell and branch identity so the job is
+    recognisable in squeue/sacct.
+    """
+    return ("dmx-" + _JOB_NAME_BAD.sub("-", tag))[:_JOB_NAME_MAX]
+
+
+def build_slurm_batch_script(
+    cmd: list[str],
+    *,
+    job_name: str,
+    log_path: Path,
+    cpus: int,
+    mem: str,
+    time: str,
+    partition: str,
+) -> str:
+    """Wrap a Nextflow argv in a bash batch script for sbatch.
+
+    The script runs on the SLURM node (see deploy/Dockerfile.slurmd, which
+    provides Nextflow and the docker CLI). The environment exports
+    re-establish the node-side settings - NXF_HOME on the shared work volume
+    (so the pipeline checkout is shared with the daemon), the DinD daemon
+    endpoint, and Nextflow on PATH - when the node environment does not
+    already provide them. All job output goes to log_path on the shared
+    volume, which the submitting step tails for diagnostics.
+    """
+    log = str(log_path)
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={job_name}",
+        f"#SBATCH --cpus-per-task={cpus}",
+        f"#SBATCH --mem={mem}",
+        f"#SBATCH --time={time}",
+        f"#SBATCH --partition={partition}",
+        f"#SBATCH --output={log}",
+        f"#SBATCH --error={log}",
+        "",
+        'export NXF_HOME="${NXF_HOME:-/work/nf-nxf}"',
+        'export DOCKER_HOST="${DOCKER_HOST:-tcp://dind:2375}"',
+        'export PATH="/opt/nextflow:${PATH}"',
+        "",
+        # The DinD daemon may still be starting when the job is submitted;
+        # a dead daemon would make Nextflow fail immediately.
+        "for _i in $(seq 1 30); do",
+        "    docker info >/dev/null 2>&1 && break",
+        '    echo "[batch] waiting for the dind daemon... (${_i}/30)"',
+        "    sleep 5",
+        "done",
+        "",
+        shlex.join(cmd),
+        "",
+    ]
+    return "\n".join(lines)

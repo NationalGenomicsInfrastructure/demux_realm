@@ -9,12 +9,15 @@ from yggdrasil.flow.step import In, Out, StepContext, step
 
 from .config import load_realm_config
 from .nextflow import (
+    NextflowSettings,
     branch_outdir,
     branch_run_tag,
     branch_work_dir,
     build_nextflow_command,
+    build_slurm_batch_script,
     parse_run_options,
     run_nextflow,
+    slurm_job_name,
 )
 from .utils import (
     DEMUX_CONFIG_FILENAME,
@@ -212,6 +215,8 @@ def execute_demux(ctx: StepContext, scenario: dict, samplesheet: Annotated[Path,
         run_options=run_options,
     )
     log_path = ctx.workdir / "nextflow_run.log"
+    if settings.executor == "slurm":
+        return _execute_on_slurm(ctx, cmd=cmd, log_path=log_path, settings=settings, tag=tag)
     proc = run_nextflow(cmd, log_path)
     ctx.record_artifact(SimpleArtifactRef("nextflow_log", "logs"), path=log_path)
 
@@ -227,7 +232,99 @@ def execute_demux(ctx: StepContext, scenario: dict, samplesheet: Annotated[Path,
     return StepResult(
         metrics={
             "branch": tag,
+            "executor": "local",
             "exit_status": proc.returncode,
+            "work_dir": str(branch_work_dir(settings, tag)),
+            "outdir": str(branch_outdir(settings, tag)),
+        }
+    )
+
+
+def _tail_lines(path: Path, n: int) -> str:
+    """Return up to the last n lines of a file ('' if it is missing)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(text.splitlines()[-n:])
+
+
+def _execute_on_slurm(
+    ctx: StepContext,
+    *,
+    cmd: list[str],
+    log_path: Path,
+    settings: NextflowSettings,
+    tag: str,
+) -> StepResult:
+    """Run the branch's Nextflow command as an SLURM batch job.
+
+    The batch script is written to the step's work directory (on the shared
+    work volume) and submitted with sbatch via the Yggdrasil toolkit's
+    SlurmJobManager; the job runs on the SLURM node (deploy/Dockerfile.slurmd
+    provides Nextflow there). The step blocks until the job reaches a
+    terminal state, so a failed run fails this step exactly like the local
+    path does.
+    """
+    import asyncio
+
+    from yggdrasil.config.session import YggSession
+    from yggdrasil.toolkit.sjob_manager import SlurmManagerFactory
+
+    script_path = ctx.workdir / "nextflow_slurm.sh"
+    script_path.write_text(
+        build_slurm_batch_script(
+            cmd,
+            job_name=slurm_job_name(tag),
+            log_path=log_path,
+            cpus=settings.sbatch_cpus,
+            mem=settings.sbatch_mem,
+            time=settings.sbatch_time,
+            partition=settings.sbatch_partition,
+        ),
+        encoding="utf-8",
+    )
+
+    manager = SlurmManagerFactory.get_manager(is_dev=YggSession.is_dev())
+
+    async def _submit_and_wait() -> tuple[str | None, str | None]:
+        job_id = await manager.submit_job(script_path)
+        if job_id is None:
+            return None, None
+        # One loop for submit + wait: the mock backend completes its jobs on
+        # the loop that submitted them (see step_slurm_job in test_realm).
+        # The explicit poll interval keeps this step snappy in the compose
+        # stack, where main.json sets job_monitor_poll_interval high.
+        final_state = await manager.wait_for_completion(job_id, poll_interval=5.0)
+        return job_id, final_state
+
+    job_id, final_state = asyncio.run(_submit_and_wait())
+
+    if job_id is None:
+        raise PermanentStepError(
+            f"sbatch submission failed for branch {tag}; the job script is at "
+            f"{script_path}.",
+            advice="Check the SLURM cluster (scontrol ping, squeue) and the "
+            "yggdrasil daemon log.",
+        )
+
+    ctx.record_artifact(SimpleArtifactRef("nextflow_log", "logs"), path=log_path)
+    if final_state != "COMPLETED":
+        tail = _tail_lines(log_path, 20)
+        raise PermanentStepError(
+            f"SLURM job {job_id} ended in state {final_state or 'UNKNOWN'} "
+            f"(branch {tag}); last log lines:\n{tail}",
+            advice=f"Full log: {log_path}",
+        )
+
+    logger.info("SLURM job %s finished (branch %s).", job_id, tag)
+    return StepResult(
+        metrics={
+            "branch": tag,
+            "executor": "slurm",
+            "job_id": job_id,
+            "final_state": final_state,
+            "script": str(script_path),
             "work_dir": str(branch_work_dir(settings, tag)),
             "outdir": str(branch_outdir(settings, tag)),
         }
