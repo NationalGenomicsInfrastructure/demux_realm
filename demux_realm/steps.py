@@ -100,6 +100,16 @@ def _fmt_pct(value: float) -> str:
     return f"{value:.2f}"
 
 
+def _format_barcode_sequence(index: str) -> str:
+    """Format a Demultiplex_Stats.csv "Index" value as "index1+index2" when
+    dual-indexed, or just the single index when only one side is present.
+
+    e.g. "ATCG-GCTA" -> "ATCG+GCTA", "ATCG-" -> "ATCG", "-GCTA" -> "GCTA".
+    """
+    parts = [part for part in index.split("-") if part]
+    return "+".join(parts)
+
+
 def _combine_quality_metrics(
     quality_rows: list[dict[str, str]],
 ) -> dict[tuple[str, str], dict[str, float]]:
@@ -164,7 +174,8 @@ def _build_illumina_stats(
             {
                 "Lane": lane,
                 "Sample": sample,
-                "Barcode sequence": row.get("Index") or "unknown",
+                "Barcode sequence": _format_barcode_sequence(row.get("Index") or "")
+                or "unknown",
                 "Project": sample_project.get(sample, "default"),
                 "PF Clusters": _fmt_int(reads),
                 "% of thelane": _fmt_pct(pct_reads),
