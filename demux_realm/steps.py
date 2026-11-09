@@ -1,6 +1,5 @@
 import csv
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Annotated, Any
@@ -557,7 +556,7 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
             demux_dir / fq.name
         )  # TODO: should be demux_dir / project / sample / fq.name
         if not symlink_path.exists():
-            os.symlink(fq, symlink_path)
+            symlink_path.symlink_to(fq)
             logger.info("Symlinked %s to %s", fq, symlink_path)
         else:
             logger.warning("Symlink already exists: %s", symlink_path)
