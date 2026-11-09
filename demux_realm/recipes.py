@@ -118,7 +118,7 @@ def build_demux_plan(
             "demux_sample_info_doc": {"metadata": metadata},
         }
 
-        samplesheet_path = str(artifact_base / ns / "SampleSheet.csv")
+        samplesheet_path = Path(artifact_base / ns / "SampleSheet.csv")
         run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
         # Relative outputs resolve inside each producer's own work directory.
         steps += [
@@ -136,7 +136,7 @@ def build_demux_plan(
                 fn_ref=f"{_PREFIX}.generate_samplesheet",
                 params={"scenario": scenario, "samplesheet": samplesheet_path},
                 deps=[f"{ns}__materialize_config"],
-                outputs={"samplesheet": samplesheet_path},
+                outputs={"samplesheet": str(samplesheet_path)},
             ),
             StepSpec(
                 step_id=f"{ns}__execute_demux",
@@ -151,7 +151,7 @@ def build_demux_plan(
                     "samplesheet": samplesheet_path,
                 },
                 deps=[f"{ns}__generate_samplesheet"],
-                inputs={"samplesheet": samplesheet_path},
+                inputs={"samplesheet": str(samplesheet_path)},
             ),
             StepSpec(
                 step_id=f"{ns}__collect_results",

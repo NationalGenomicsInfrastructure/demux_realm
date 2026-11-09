@@ -401,8 +401,6 @@ def generate_samplesheet(
 ) -> StepResult:
     """Generates and writes SampleSheet.csv from the lane-specific samplesheet payload."""
     ss_payload = scenario["samplesheet_payload"]
-    # The plan is stored as JSON, so a Path param arrives here as a str.
-    samplesheet = Path(samplesheet)
 
     validate_lane_payload(ss_payload, expected_lane=scenario.get("lane_id"))
     ss_text = render_bcl_convert_samplesheet(ss_payload)
@@ -438,8 +436,6 @@ def execute_demux(
     ``nextflow`` entry. See demux_realm.config and demux_realm.nextflow.
     """
     runfolder_path = Path(scenario["hpc_runfolder_path"])
-    # The plan is stored as JSON, so a Path param arrives here as a str.
-    samplesheet = Path(samplesheet)
 
     try:
         run_options = parse_run_options(scenario.get("nextflow"))
