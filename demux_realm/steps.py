@@ -502,7 +502,10 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 
     stats_dir = _branch_reports_dir(outdir, scenario["canonical_flowcell_id"])
     if not stats_dir.is_dir():
-        logger.warning("Stats directory missing: %s", stats_dir)
+        raise PermanentStepError(
+            f"Reports directory missing: {stats_dir}",
+            advice="Did the branch's execute_demux step succeed?",
+        )
     demultiplex_stats = stats_dir / "Demultiplex_Stats.csv"
     quality_metrics = stats_dir / "Quality_Metrics.csv"
     top_unknown_barcodes = stats_dir / "Top_Unknown_Barcodes.csv"
