@@ -654,8 +654,8 @@ def test_validate_lane_payload_requires_mapping_header():
 
 
 def test_validate_lane_payload_requires_mapping_settings():
-    payload = {**lane_entry(1), "raw_samplesheet_settings": "x,1"}
-    with pytest.raises(ValueError, match="'raw_samplesheet_settings' must be"):
+    payload = {**lane_entry(1), "BCLConvert_Settings": "x,1"}
+    with pytest.raises(ValueError, match="'BCLConvert_Settings' must be"):
         validate_lane_payload(payload)
 
 

@@ -305,7 +305,7 @@ REJECTED_PROPOSALS = {
         {1},
     ),
     "settings not a mapping": (
-        [lane_entry(1), {**lane_entry(2), "raw_samplesheet_settings": "x,1"}],
+        [lane_entry(1), {**lane_entry(2), "BCLConvert_Settings": "x,1"}],
         {1},
     ),
     "row lane differs": ([lane_entry(1), lane_entry(2, row_lane="1")], {1}),

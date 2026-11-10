@@ -18,8 +18,6 @@ from demux_realm.nextflow import (
     run_nextflow,
     settings_from_mapping,
 )
-from demux_realm.utils import SAMPLESHEET_FILENAME
-
 from demux_realm import steps
 from yggdrasil.flow.errors import PermanentStepError
 
@@ -311,7 +309,7 @@ SCENARIO = {
     "samplesheet_payload": {
         "lane": 1,
         "Header": {"FileFormatVersion": "2"},
-        "raw_samplesheet_settings": {"CreateFastqForIndexReads": "1"},
+        "BCLConvert_Settings": {"CreateFastqForIndexReads": "1"},
         "BCLConvert_Data": [
             {
                 "Lane": "1",
@@ -326,7 +324,7 @@ SCENARIO = {
 
 
 PLAN_ID = "dmx_realm:FC:demux"
-SHEET_REL = f"lane_1_settings_0__generate_samplesheet/{SAMPLESHEET_FILENAME}"
+SHEET_REL = "lane_1_settings_0__generate_samplesheet/SampleSheet.csv"
 
 
 def make_ctx(root: Path):

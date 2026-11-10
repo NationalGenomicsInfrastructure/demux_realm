@@ -44,7 +44,7 @@ def lane_entry(
     entry: dict[str, Any] = {
         "lane": lane,
         "Header": {"FileFormatVersion": "2"},
-        "raw_samplesheet_settings": {"CreateFastqForIndexReads": "1"},
+        "BCLConvert_Settings": {"CreateFastqForIndexReads": "1"},
         "BCLConvert_Data": [
             {
                 "Lane": str(lane) if row_lane is None else row_lane,

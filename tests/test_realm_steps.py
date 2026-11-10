@@ -56,7 +56,7 @@ _SAMPLESHEETS = [
     {
         "lane": 1,
         "Header": {"FileFormatVersion": "2"},
-        "raw_samplesheet_settings": {"CreateFastqForIndexReads": "1"},
+        "BCLConvert_Settings": {"CreateFastqForIndexReads": "1"},
         "BCLConvert_Data": [
             {
                 "Lane": "1",
