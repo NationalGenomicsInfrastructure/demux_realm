@@ -7,9 +7,8 @@ Two kinds of input shape a run:
 
 * NextflowSettings: deployment-level values (pipeline, profile, directory
   bases, ...) read from the realm's JSON config (see demux_realm.config).
-  The defaults target the local compose/DinD development stack; the HPC
-  deployment overrides them (e.g. a provisioned, offline pipeline path and
-  an HPC-sized resource config).
+  The profile and the work/results bases are deployment-specific and must
+  be set there; the rest have environment-neutral defaults.
 * NextflowRunOptions: values that may differ between samplesheets (e.g. the
   tools to skip). Resolved per branch by resolve_run_options: the
   samplesheet entry's own ``commandline_options.nextflow.skip_tools``,
@@ -42,9 +41,21 @@ _SETTINGS_KEYS = frozenset(
         "outdir_base",
         "extra_args",
         "skip_tools",
+        "executor",
+        "sbatch_cpus",
+        "sbatch_time",
+        "sbatch_partition",
     }
 )
 _RUN_OPTION_KEYS = frozenset({"skip_tools"})
+
+#: Where the branch's Nextflow run is executed: locally inside the daemon
+#: process (default) or as an SLURM batch job on the cluster node.
+_EXECUTORS = frozenset({"local", "slurm"})
+
+#: SLURM job names are capped at 80 characters by the scheduler.
+_JOB_NAME_MAX = 80
+_JOB_NAME_BAD = re.compile(r"[^A-Za-z0-9._-]")
 
 #: Tool sections accepted in a samplesheet entry's commandline_options.
 _CMDLINE_TOOLS = frozenset({"nextflow"})
@@ -59,15 +70,14 @@ class NextflowSettings:
     #: Pipeline to run: an nf-core name (resolved online, dev) or the path
     #: of a provisioned local repository (offline HPC).
     pipeline: str
-    #: Nextflow profile, e.g. "docker" (DinD dev) or a Slurm/singularity
-    #: profile on the HPC.
+    #: Nextflow profile, e.g. "docker" or "slurm,singularity". Required.
     profile: str
     #: Optional common config file passed with -c (e.g. HPC-sized resource
     #: requirements). None means none.
     common_config: Path | None
-    #: Base directory for per-branch Nextflow work directories.
+    #: Base directory for per-branch Nextflow work directories. Required.
     work_base: Path
-    #: Base directory for per-branch published results (--outdir).
+    #: Base directory for per-branch published results (--outdir). Required.
     outdir_base: Path
     #: Extra nextflow arguments appended verbatim (last, so they win).
     extra_args: tuple[str, ...]
@@ -75,6 +85,16 @@ class NextflowSettings:
     #: specify skip_tools. Empty means skip nothing (see
     #: NextflowRunOptions and resolve_run_options).
     skip_tools: tuple[str, ...] = ()
+    #: Where the branch's Nextflow run executes: "local" (a subprocess of the
+    #: daemon process, the default) or "slurm" (an sbatch job on the cluster
+    #: node, like a production HPC deployment).
+    executor: str = "local"
+    #: sbatch --cpus-per-task for the SLURM executor.
+    sbatch_cpus: int = 4
+    #: sbatch --time for the SLURM executor.
+    sbatch_time: str = "240:00:00"
+    #: sbatch --partition for the SLURM executor.
+    sbatch_partition: str = "local"
 
 
 @dataclass(frozen=True)
@@ -121,6 +141,21 @@ def _text(raw: Mapping[str, Any], key: str, default: str, label: str) -> str:
     return value.strip()
 
 
+def _required_text(raw: Mapping[str, Any], key: str, label: str) -> str:
+    if key not in raw:
+        raise ValueError(f"{label}.{key} is required.")
+    return _text(raw, key, "", label)
+
+
+def _positive_int(
+    raw: Mapping[str, Any], key: str, default: int, label: str
+) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label}.{key} must be a positive integer.")
+    return value
+
+
 def _string_list(value: object, label: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ValueError(f"{label} must be a list of strings.")
@@ -147,9 +182,8 @@ def parse_skip_tools(value: object, label: str) -> tuple[str, ...]:
 def settings_from_mapping(raw: Mapping[str, Any] | None = None) -> NextflowSettings:
     """Build NextflowSettings from the ``nextflow`` object of the realm config.
 
-    Every key is optional. Defaults target the local compose/DinD development
-    stack: nextflow resolves the pipeline online (cached under NXF_HOME) and
-    work and results live on the shared /work volume.
+    ``profile``, ``work_base`` and ``outdir_base`` are required: they depend
+    on the deployment. Every other key is optional.
 
     Args:
         raw: The config's ``nextflow`` object, or None for all defaults.
@@ -158,25 +192,36 @@ def settings_from_mapping(raw: Mapping[str, Any] | None = None) -> NextflowSetti
         The resolved settings.
 
     Raises:
-        ValueError: On an unknown key or a value of the wrong type.
+        ValueError: On a missing required key, an unknown key or a value of
+            the wrong type.
     """
     label = "nextflow"
     raw = as_mapping(raw, label)
     reject_unknown(raw, _SETTINGS_KEYS, label)
 
+    executor = _text(raw, "executor", "local", label)
+    if executor not in _EXECUTORS:
+        raise ValueError(
+            f"{label}.executor must be one of {sorted(_EXECUTORS)}, got {executor!r}."
+        )
+
     common_config = raw.get("common_config")
     return NextflowSettings(
         pipeline=_text(raw, "pipeline", "nf-core/demultiplex", label),
-        profile=_text(raw, "profile", "docker", label),
+        profile=_required_text(raw, "profile", label),
         common_config=(
             None
             if common_config is None
             else Path(_text(raw, "common_config", "", label))
         ),
-        work_base=Path(_text(raw, "work_base", "/work/nf-realm-work", label)),
-        outdir_base=Path(_text(raw, "outdir_base", "/work/nf-realm-results", label)),
+        work_base=Path(_required_text(raw, "work_base", label)),
+        outdir_base=Path(_required_text(raw, "outdir_base", label)),
         extra_args=_string_list(raw.get("extra_args", []), f"{label}.extra_args"),
         skip_tools=parse_skip_tools(raw.get("skip_tools", []), f"{label}.skip_tools"),
+        executor=executor,
+        sbatch_cpus=_positive_int(raw, "sbatch_cpus", 4, label),
+        sbatch_time=_text(raw, "sbatch_time", "240:00:00", label),
+        sbatch_partition=_text(raw, "sbatch_partition", "local", label),
     )
 
 
@@ -354,3 +399,46 @@ def run_nextflow(cmd: list[str], log_path: Path) -> subprocess.CompletedProcess:
                 logger.debug("nextflow: %s", line.rstrip("\n"))
             returncode = proc.wait()
     return subprocess.CompletedProcess(cmd, returncode, stdout="".join(chunks))
+
+
+def slurm_job_name(tag: str) -> str:
+    """Sanitize a branch tag into a valid SLURM job name.
+
+    SLURM job names allow [A-Za-z0-9._-] and are capped at 80 characters;
+    the branch tag carries the flowcell and branch identity so the job is
+    recognisable in squeue/sacct.
+    """
+    return ("dmx-" + _JOB_NAME_BAD.sub("-", tag))[:_JOB_NAME_MAX]
+
+
+def build_slurm_batch_script(
+    cmd: list[str],
+    *,
+    job_name: str,
+    log_path: Path,
+    cpus: int,
+    time: str,
+    partition: str,
+) -> str:
+    """Wrap a Nextflow argv in a bash batch script for sbatch.
+
+    The script runs on an SLURM node whose environment must provide
+    Nextflow (on PATH) and whatever the configured profile needs (e.g. a
+    container runtime); the script sets up nothing itself. All job output
+    goes to log_path, which must be on storage shared with the submitting
+    step, which tails it for diagnostics.
+    """
+    log = str(log_path)
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={job_name}",
+        f"#SBATCH --cpus-per-task={cpus}",
+        f"#SBATCH --time={time}",
+        f"#SBATCH --partition={partition}",
+        f"#SBATCH --output={log}",
+        f"#SBATCH --error={log}",
+        "",
+        shlex.join(cmd),
+        "",
+    ]
+    return "\n".join(lines)

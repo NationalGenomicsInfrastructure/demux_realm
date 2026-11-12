@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from realm_support import (
     REALM_ID,
+    REQUIRED_NEXTFLOW,
     demux_sample_info_doc,
     flowcell_status_doc,
     lane_entry,
@@ -78,7 +79,8 @@ def _no_hpc_base_path(monkeypatch):
 
 def set_realm_config(monkeypatch, **raw) -> None:
     """Plan against this realm config instead of the one on disk."""
-    config = realm_config_from_mapping(raw or None)
+    raw["nextflow"] = {**REQUIRED_NEXTFLOW, **raw.get("nextflow", {})}
+    config = realm_config_from_mapping(raw)
     monkeypatch.setattr(handler_module, "load_realm_config", lambda: config)
 
 

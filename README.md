@@ -74,17 +74,18 @@ The descriptor returns the `dmx_realm` realm with:
 
 Deployment settings live in a JSON file, `dmx_realm.json`, in Yggdrasil's
 `common/configurations/` directory (`dev_dmx_realm.json` takes precedence in dev
-mode). Credentials do not belong in it. Every key is optional and unknown keys
-are rejected:
+mode). Credentials do not belong in it. `nextflow.profile`, `nextflow.work_base`
+and `nextflow.outdir_base` are required (they depend on the deployment); every
+other key is optional. Unknown keys are rejected:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `hpc_base_path` | `""` | Prefix for the flowcell's `destination_path` |
 | `nextflow.pipeline` | `nf-core/demultiplex` | Pipeline name or path |
-| `nextflow.profile` | `docker` | Nextflow `-profile` |
+| `nextflow.profile` | required | Nextflow `-profile` |
 | `nextflow.common_config` | none | Extra Nextflow config passed with `-c` |
-| `nextflow.work_base` | `/work/nf-realm-work` | Base for per-branch work directories |
-| `nextflow.outdir_base` | `/work/nf-realm-results` | Base for per-branch results |
+| `nextflow.work_base` | required | Base for per-branch work directories |
+| `nextflow.outdir_base` | required | Base for per-branch results |
 | `nextflow.extra_args` | `[]` | Extra command-line arguments |
 | `nextflow.skip_tools` | `[]` | Default tools to skip (`--skip_tools`) when a samplesheet does not say |
 

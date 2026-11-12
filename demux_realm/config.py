@@ -19,8 +19,8 @@ Example::
       }
     }
 
-Every key is optional; the defaults target the local compose/DinD stack.
-``nextflow.skip_tools`` is the default for a branch whose samplesheet entry
+``nextflow.profile``, ``nextflow.work_base`` and ``nextflow.outdir_base`` are
+required; every other key is optional. ``nextflow.skip_tools`` is the default for a branch whose samplesheet entry
 does not specify one (see resolve_run_options).
 """
 
@@ -70,9 +70,9 @@ def realm_config_from_mapping(raw: Mapping[str, Any] | None = None) -> RealmConf
 
 
 def load_realm_config() -> RealmConfig:
-    """Load the realm's JSON config, falling back to defaults if it is absent.
+    """Load the realm's JSON config.
 
     Raises:
-        ValueError: If the file exists but is invalid.
+        ValueError: If the file is absent (required keys missing) or invalid.
     """
     return realm_config_from_mapping(ConfigLoader().load_config(CONFIG_FILENAME))

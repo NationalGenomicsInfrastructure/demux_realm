@@ -7,6 +7,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 REALM_ID = "dmx_realm"
 
+#: The required keys of the realm config's ``nextflow`` object.
+REQUIRED_NEXTFLOW = {
+    "profile": "docker",
+    "work_base": "/work/nf-realm-work",
+    "outdir_base": "/work/nf-realm-results",
+}
+
 RUN_INFO_XML_TEXT = textwrap.dedent("""\
     <?xml version="1.0"?>
     <RunInfo Version="7">
