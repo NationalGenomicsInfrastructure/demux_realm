@@ -112,7 +112,8 @@ def test_settings_reject_invalid_config(raw):
 
 
 def test_settings_reject_sbatch_mem():
-    # Not configurable: SLURM jobs always get the 4G default.
+    # No --mem in the batch script: the cluster's default (e.g. memory
+    # per requested CPU) applies.
     with pytest.raises(ValueError, match="unknown key"):
         settings_from_mapping({**REQUIRED_NEXTFLOW, "sbatch_mem": "16G"})
 
@@ -126,7 +127,6 @@ def test_settings_slurm_executor_defaults():
     s = settings_from_mapping({**REQUIRED_NEXTFLOW, "executor": "slurm"})
     assert s.executor == "slurm"
     assert s.sbatch_cpus == 4
-    assert s.sbatch_mem == "4G"
     assert s.sbatch_time == "240:00:00"
     assert s.sbatch_partition == "local"
 
@@ -143,10 +143,9 @@ def test_settings_slurm_executor_overrides():
     )
     assert (
         s.sbatch_cpus,
-        s.sbatch_mem,
         s.sbatch_time,
         s.sbatch_partition,
-    ) == (8, "4G", "8:00:00", "comp")
+    ) == (8, "8:00:00", "comp")
 
 
 def test_realm_config_defaults_and_hpc_base_path():
@@ -367,7 +366,6 @@ def test_batch_script_wraps_command_with_directives():
         job_name="dmx-test",
         log_path=Path("/work/plan/logs/run.log"),
         cpus=4,
-        mem="4G",
         time="240:00:00",
         partition="local",
     )
@@ -375,7 +373,7 @@ def test_batch_script_wraps_command_with_directives():
     assert lines[0] == "#!/bin/bash"
     assert "#SBATCH --job-name=dmx-test" in lines
     assert "#SBATCH --cpus-per-task=4" in lines
-    assert "#SBATCH --mem=4G" in lines
+    assert not any(line.startswith("#SBATCH --mem") for line in lines)
     assert "#SBATCH --time=240:00:00" in lines
     assert "#SBATCH --partition=local" in lines
     # All job output goes to the shared-volume log the step tails.

@@ -91,8 +91,6 @@ class NextflowSettings:
     executor: str = "local"
     #: sbatch --cpus-per-task for the SLURM executor.
     sbatch_cpus: int = 4
-    #: sbatch --mem for the SLURM executor.
-    sbatch_mem: str = "4G"
     #: sbatch --time for the SLURM executor.
     sbatch_time: str = "240:00:00"
     #: sbatch --partition for the SLURM executor.
@@ -222,7 +220,6 @@ def settings_from_mapping(raw: Mapping[str, Any] | None = None) -> NextflowSetti
         skip_tools=parse_skip_tools(raw.get("skip_tools", []), f"{label}.skip_tools"),
         executor=executor,
         sbatch_cpus=_positive_int(raw, "sbatch_cpus", 4, label),
-        sbatch_mem=_text(raw, "sbatch_mem", "4G", label),
         sbatch_time=_text(raw, "sbatch_time", "240:00:00", label),
         sbatch_partition=_text(raw, "sbatch_partition", "local", label),
     )
@@ -420,7 +417,6 @@ def build_slurm_batch_script(
     job_name: str,
     log_path: Path,
     cpus: int,
-    mem: str,
     time: str,
     partition: str,
 ) -> str:
@@ -437,7 +433,6 @@ def build_slurm_batch_script(
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name}",
         f"#SBATCH --cpus-per-task={cpus}",
-        f"#SBATCH --mem={mem}",
         f"#SBATCH --time={time}",
         f"#SBATCH --partition={partition}",
         f"#SBATCH --output={log}",

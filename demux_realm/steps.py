@@ -278,7 +278,6 @@ def _execute_on_slurm(
             job_name=slurm_job_name(tag),
             log_path=log_path,
             cpus=settings.sbatch_cpus,
-            mem=settings.sbatch_mem,
             time=settings.sbatch_time,
             partition=settings.sbatch_partition,
         ),
