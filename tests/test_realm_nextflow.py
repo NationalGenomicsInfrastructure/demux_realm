@@ -25,7 +25,6 @@ from demux_realm.nextflow import (
     settings_from_mapping,
     slurm_job_name,
 )
-from demux_realm.steps import SAMPLESHEET
 
 from realm_support import REQUIRED_NEXTFLOW
 
@@ -155,7 +154,10 @@ def test_realm_config_defaults_and_hpc_base_path():
     with pytest.raises(ValueError):
         realm_config_from_mapping(None)
     cfg = realm_config_from_mapping(
-        {"hpc_base_path": "/work", "nextflow": {**REQUIRED_NEXTFLOW, "profile": "slurm"}}
+        {
+            "hpc_base_path": "/work",
+            "nextflow": {**REQUIRED_NEXTFLOW, "profile": "slurm"},
+        }
     )
     assert cfg.hpc_base_path == "/work"
     assert cfg.nextflow.profile == "slurm"
@@ -332,7 +334,11 @@ def test_run_nextflow_streams_output_to_log():
     with tempfile.TemporaryDirectory() as td:
         log_path = Path(td) / "nextflow_run.log"
         proc = run_nextflow(
-            [sys.executable, "-c", "print('line one'); print('line two', file=__import__('sys').stderr)"],
+            [
+                sys.executable,
+                "-c",
+                "print('line one'); print('line two', file=__import__('sys').stderr)",
+            ],
             log_path,
         )
         log_text = log_path.read_text()
@@ -407,7 +413,7 @@ SCENARIO = {
     "samplesheet_payload": {
         "lane": 1,
         "Header": {"FileFormatVersion": "2"},
-        "raw_samplesheet_settings": {"CreateFastqForIndexReads": "1"},
+        "BCLConvert_Settings": {"CreateFastqForIndexReads": "1"},
         "BCLConvert_Data": [
             {
                 "Lane": "1",
@@ -422,7 +428,7 @@ SCENARIO = {
 
 
 PLAN_ID = "dmx_realm:FC:demux"
-SHEET_REL = f"lane_1_settings_0__generate_samplesheet/{SAMPLESHEET.filename}"
+SHEET_REL = "lane_1_settings_0__generate_samplesheet/SampleSheet.csv"
 
 
 def make_ctx(root: Path):
@@ -525,9 +531,7 @@ def test_execute_demux_without_options_skips_nothing(tmp_path, monkeypatch):
     scenario = step_scenario(runfolder)
     del scenario["nextflow"]
 
-    steps.execute_demux.__wrapped__(
-        ctx, scenario=scenario, samplesheet=sheet
-    )
+    steps.execute_demux.__wrapped__(ctx, scenario=scenario, samplesheet=sheet)
 
     assert "--skip_tools" not in captured["cmd"]
 
@@ -558,9 +562,7 @@ def test_execute_demux_invalid_options_fail_permanently(tmp_path, monkeypatch):
     with pytest.raises(PermanentStepError, match="nextflow options"):
         steps.execute_demux.__wrapped__(
             ctx,
-            scenario=step_scenario(
-                tmp_path / "fc", nextflow={"skip_tools": "samshee"}
-            ),
+            scenario=step_scenario(tmp_path / "fc", nextflow={"skip_tools": "samshee"}),
             samplesheet=sheet,
         )
 
@@ -619,9 +621,7 @@ def test_execute_demux_slurm_submits_and_waits(tmp_path, monkeypatch):
     sheet = write_sheet(tmp_path)
 
     stub = StubSlurmManager("42", "COMPLETED")
-    monkeypatch.setattr(
-        SlurmManagerFactory, "get_manager", lambda is_dev: stub
-    )
+    monkeypatch.setattr(SlurmManagerFactory, "get_manager", lambda is_dev: stub)
 
     result = steps.execute_demux.__wrapped__(
         ctx, scenario=step_scenario(runfolder), samplesheet=sheet
@@ -643,9 +643,7 @@ def test_execute_demux_slurm_submits_and_waits(tmp_path, monkeypatch):
     text = script.read_text()
     assert f"#SBATCH --job-name={slurm_job_name(tag)}" in text
     assert "#SBATCH --cpus-per-task=4" in text
-    assert (
-        f"--flowcell_samplesheet {shlex.quote(str(sheet.resolve()))}" in text
-    )
+    assert f"--flowcell_samplesheet {shlex.quote(str(sheet.resolve()))}" in text
     assert stub.submitted == [script]
     # One loop for submit + wait, with the explicit poll interval.
     assert stub.wait_args == ("42", 5.0)
@@ -663,7 +661,8 @@ def test_execute_demux_slurm_failed_state_fails_permanently(tmp_path, monkeypatc
     (ctx.workdir / "nextflow_run.log").write_text("ERROR: boom\n")
 
     monkeypatch.setattr(
-        SlurmManagerFactory, "get_manager",
+        SlurmManagerFactory,
+        "get_manager",
         lambda is_dev: StubSlurmManager("43", "FAILED"),
     )
     with pytest.raises(PermanentStepError, match="FAILED"):
@@ -682,7 +681,8 @@ def test_execute_demux_slurm_submission_failure_fails_permanently(
     sheet = write_sheet(tmp_path)
 
     monkeypatch.setattr(
-        SlurmManagerFactory, "get_manager",
+        SlurmManagerFactory,
+        "get_manager",
         lambda is_dev: StubSlurmManager(None, None),
     )
     with pytest.raises(PermanentStepError, match="sbatch submission failed"):

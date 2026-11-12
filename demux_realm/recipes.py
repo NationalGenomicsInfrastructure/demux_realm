@@ -2,8 +2,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan, StepSpec
+
 from .nextflow import NextflowRunOptions
 from .utils import (
     DEMUX_CONFIG_FILENAME,
@@ -15,7 +15,10 @@ from .utils import (
 _PREFIX = "demux_realm.steps"
 
 VALIDATE_RUNFOLDER = "validate_runfolder"
+SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
+AGGREGATE_ILLUMINA_STATS = "aggregate_illumina_stats"
+AGGREGATE_UNDETERMINED_STATS = "aggregate_undetermined_stats"
 
 
 def branch_namespace(lane_id: str, settings_index: str) -> str:
@@ -80,6 +83,12 @@ def build_demux_plan(
             params={"scenario": dict(common)},
         ),
         StepSpec(
+            step_id=SETUP_COMMON_DEMUX_DIR,
+            name="Setup Common Demux Directory",
+            fn_ref=f"{_PREFIX}.setup_common_demux_dir",
+            params={"scenario": dict(common)},
+        ),
+        StepSpec(
             step_id=UPSERT_X_FLOWCELL,
             name="Upsert x_flowcells Pre-Demux Document",
             fn_ref=f"{_PREFIX}.upsert_x_flowcell_pre_demux",
@@ -109,7 +118,7 @@ def build_demux_plan(
             "demux_sample_info_doc": {"metadata": metadata},
         }
 
-        samplesheet_path = str( artifact_base / ns / 'SampleSheet.csv' )
+        samplesheet_path = Path(artifact_base / ns / "SampleSheet.csv")
         run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
         # Relative outputs resolve inside each producer's own work directory.
         steps += [
@@ -127,7 +136,7 @@ def build_demux_plan(
                 fn_ref=f"{_PREFIX}.generate_samplesheet",
                 params={"scenario": scenario, "samplesheet": samplesheet_path},
                 deps=[f"{ns}__materialize_config"],
-                outputs={"samplesheet": samplesheet_path},
+                outputs={"samplesheet": str(samplesheet_path)},
             ),
             StepSpec(
                 step_id=f"{ns}__execute_demux",
@@ -142,12 +151,19 @@ def build_demux_plan(
                     "samplesheet": samplesheet_path,
                 },
                 deps=[f"{ns}__generate_samplesheet"],
-                inputs={"samplesheet": samplesheet_path},
+                inputs={"samplesheet": str(samplesheet_path)},
             ),
             StepSpec(
                 step_id=f"{ns}__collect_results",
                 name=f"Collect Results and Artifacts ({label})",
                 fn_ref=f"{_PREFIX}.collect_results",
+                params={"scenario": scenario},
+                deps=[f"{ns}__execute_demux"],
+            ),
+            StepSpec(
+                step_id=f"{ns}__symlink_fastqs",
+                name=f"Symlink Fastqs ({label})",
+                fn_ref=f"{_PREFIX}.symlink_fastqs",
                 params={"scenario": scenario},
                 deps=[f"{ns}__execute_demux"],
             ),
@@ -159,6 +175,38 @@ def build_demux_plan(
                 deps=[f"{ns}__collect_results"],
             ),
         ]
+
+    steps.append(
+        StepSpec(
+            step_id=AGGREGATE_ILLUMINA_STATS,
+            name="Aggregate Illumina Demux Stats",
+            fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
+            params={"scenario": dict(common)},
+            # Common step: runs once after every branch's upload_results, and
+            # recomputes the combined 'illumina' field from whatever is
+            # currently stored for each lane (see aggregate_illumina_stats).
+            deps=[
+                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
+                for b in branches
+            ],
+        )
+    )
+
+    steps.append(
+        StepSpec(
+            step_id=AGGREGATE_UNDETERMINED_STATS,
+            name="Aggregate Undetermined Barcode Stats",
+            fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
+            params={"scenario": dict(common)},
+            # Common step: runs once after every branch's upload_results, and
+            # recomputes the combined 'Undetermined' field from whatever is
+            # currently stored for each lane (see aggregate_undetermined_stats).
+            deps=[
+                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
+                for b in branches
+            ],
+        )
+    )
 
     return Plan(
         plan_id=plan_id,

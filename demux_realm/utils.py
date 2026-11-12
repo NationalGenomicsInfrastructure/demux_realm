@@ -209,7 +209,7 @@ def validate_lane_payload(
     """Validate a single lane samplesheet payload before rendering.
 
     Checks:
-    - Top-level required keys are present; Header and raw_samplesheet_settings
+    - Top-level required keys are present; Header and BCLConvert_Settings
       are mappings.
     - BCLConvert_Data is a non-empty list of dicts.
     - Every row contains the required row fields.
@@ -224,10 +224,10 @@ def validate_lane_payload(
         raise ValueError(
             f"Lane payload must be a mapping, got {type(lane_payload).__name__}."
         )
-    for key in ("Header", "raw_samplesheet_settings", "BCLConvert_Data"):
+    for key in ("Header", "BCLConvert_Settings", "BCLConvert_Data"):
         if key not in lane_payload:
             raise ValueError(f"Lane payload missing required key '{key}'.")
-    for key in ("Header", "raw_samplesheet_settings"):
+    for key in ("Header", "BCLConvert_Settings"):
         if not isinstance(lane_payload[key], Mapping):
             raise ValueError(
                 f"'{key}' must be a mapping, got {type(lane_payload[key]).__name__}."
@@ -273,7 +273,7 @@ def render_bcl_convert_samplesheet(lane_payload: dict) -> str:
 
     Sections emitted (in order):
       [Header]          — key/value pairs
-      [BCLConvert_Settings] — key/value pairs (source field: raw_samplesheet_settings)
+      [BCLConvert_Settings] — key/value pairs (source field: BCLConvert_Settings)
       [BCLConvert_Data] — CSV table
 
     Column order in [BCLConvert_Data]: required fields first (in canonical
@@ -298,15 +298,14 @@ def render_bcl_convert_samplesheet(lane_payload: dict) -> str:
     _write_kv_section("Header", lane_payload["Header"])
     buf.write("\n")
 
-    # The field is currently named raw_samplesheet_settings; it will likely
-    # be renamed to BCLConvert_Settings upstream.
-    #
+    # The settings live in the samplesheet entry's BCLConvert_Settings field
+    # (from the demux_sample_info samplesheets section).
     # bcl-convert hard-fails with "When no index is present,
     # CreateFastqForIndexReads cannot be enabled" when the setting is true
     # but no sample in the sheet carries an index. Upstream documents can be
     # inconsistent (e.g. a NoIndex project with the setting still enabled),
     # so coerce the setting to match the data.
-    settings = dict(lane_payload["raw_samplesheet_settings"])
+    settings = dict(lane_payload["BCLConvert_Settings"])
     if str(settings.get("CreateFastqForIndexReads", "")).strip().lower() in ("true", "1"):
         has_index = any(
             str(row.get("index", "")).strip() or str(row.get("index2", "")).strip()
