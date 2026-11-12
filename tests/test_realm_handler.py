@@ -216,6 +216,12 @@ async def test_lanes_and_settings_become_independent_branches(handler):
         for b in draft.preview["branches"]
     ] == [("1", "0", 1), ("2", "0", 2), ("2", "1", 0)]
     assert draft.preview["step_count"] == len(plan.steps)
+    assert [
+        (lane["lane_id"], lane["settings_indices"]) for lane in draft.preview["lanes"]
+    ] == [("1", ["0"]), ("2", ["0", "1"])]
+    assert draft.preview["lanes"][0]["lane_digest"] == step_dicts(plan)[
+        clean_lane_id("1")
+    ]["params"]["scenario"]["lane_digest"]
 
 
 @pytest.mark.asyncio
