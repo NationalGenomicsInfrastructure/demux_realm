@@ -115,6 +115,17 @@ process's working directory, so the proposal is rejected instead.
 For a ready flowcell with `L` lanes and `N` valid lane/settings combinations
 the handler returns one plan, run automatically, with `4 + 3L + 6N` steps:
 
+- 4 flowcell steps: `validate_runfolder`, `setup_common_demux_dir`,
+  `upsert_x_flowcell_pre_demux` and `prune_stale_lanes`;
+- 3 steps per lane: `clean_lane` and the two aggregate steps;
+- 6 steps per lane/settings branch: `materialize_config`,
+  `generate_samplesheet`, `execute_demux`, `collect_results`,
+  `symlink_fastqs` and `upload_results`.
+
+That counts the steps in the plan, not the steps that run: on a later run,
+steps whose fingerprint is unchanged (for example every step of an unchanged
+lane) are reused instead.
+
 | Field | Value |
 |---|---|
 | `plan_id` | `dmx_realm:<canonical_flowcell_id>:demux` |
