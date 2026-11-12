@@ -113,7 +113,7 @@ The result must be absolute; a relative path would depend on the executing
 process's working directory, so the proposal is rejected instead.
 
 For a ready flowcell with `L` lanes and `N` valid lane/settings combinations
-the handler returns one plan, run automatically, with `6 + L + 6N` steps:
+the handler returns one plan, run automatically, with `4 + 3L + 6N` steps:
 
 | Field | Value |
 |---|---|
@@ -138,30 +138,40 @@ validate_runfolder
 │   └── ...
 └── prune_stale_lanes
 
-aggregate_illumina_stats, aggregate_undetermined_stats
-    depend on prune_stale_lanes and every branch's upload_results
+lane_<n>__aggregate_illumina_stats, lane_<n>__aggregate_undetermined_stats
+    depend on every upload_results step of lane <n>
 ```
 
 **Lanes are re-demultiplexed whole.** A lane is the smallest unit that is
-re-demultiplexed, even when it holds several settings groups. Every step of a
-lane carries the same `lane_digest`, a hash of all of the lane's samplesheet
-entries, their Nextflow options and the `demux_sample_info` metadata. Changing
-any of the lane's samplesheets therefore changes the fingerprint of every step
-in the lane: `clean_lane` removes the lane's earlier results and all of its
-branches run again, while unchanged lanes are reused. `clean_lane` removes, for
-every settings index of the lane (including ones no longer planned), the
-Nextflow results and work directories, the links into those results in the
-runfolder's `Demultiplexing` directory, and the
-`Demultiplex_lane_<n>_settings_<i>` fields on the `x_flowcells` document.
-`prune_stale_lanes` does the same for lanes no longer in the samplesheets. The
-aggregate steps carry a digest of every lane digest, so they run again whenever
-any lane does. A retry after a failed branch re-runs only that branch: the
-lane's `clean_lane` step is reused, so successful siblings keep their results.
-To re-demultiplex a lane whose samplesheets did not change, remove its
-`lane_<n>__clean_lane` step directory under the plan's work root.
+re-demultiplexed, even when it holds several settings groups.
+`lane_<n>__clean_lane` carries a `lane_digest`, a hash of all of the lane's
+samplesheet entries, their Nextflow options and the `demux_sample_info`
+metadata, so changing any of the lane's samplesheets re-runs it. It removes,
+for every settings index of the lane (including ones no longer planned), the
+Nextflow results directories and the links into them in the runfolder's
+`Demultiplexing` directory. Each run then writes a new random token to
+`lane_<n>/cleanup.token` under the plan's artifact directory, and every later
+step of the lane declares that file as an input: whenever the cleanup has run,
+all of the lane's later steps run again. Unchanged lanes are reused.
 
-Both triggers produce the same plan for the same source data. Dependencies alone
-decide execution order; steps run one at a time.
+Two things are deliberately kept. The Nextflow work directories stay, so
+`-resume` reuses the tasks whose inputs did not change. The `x_flowcells`
+document is not cleaned either, so operators keep seeing the earlier results
+while a lane is re-demultiplexed. Each branch's `upload_results` overwrites
+its own `Demultiplex_lane_<n>_settings_<i>` field. Once all of a lane's
+branches have uploaded, the lane's aggregate steps drop the lane's fields for
+settings indices no longer planned and rebuild `illumina` and `Undetermined`
+from every branch field on the document.
+
+`prune_stale_lanes` removes the results directories and links of lanes no
+longer in the samplesheets. Their `x_flowcells` fields are not removed, and
+stay in the aggregated stats until removed by hand.
+
+A retry after a failed branch re-runs only that branch: the lane's
+`clean_lane` step is reused, so successful siblings keep their results. To
+re-demultiplex a lane whose samplesheets did not change, remove its
+`lane_<n>__clean_lane` step directory under the plan's work root; the whole
+lane then runs again.
 
 **Metadata relationship.** The metadata update and each lane's `clean_lane`
 step depend only on `validate_runfolder`. If the metadata update fails, the
