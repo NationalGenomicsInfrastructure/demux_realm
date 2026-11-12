@@ -10,6 +10,8 @@ from yggdrasil.watchers import EventType
 from .config import load_realm_config
 from .nextflow import resolve_run_options
 from .recipes import (
+    PRUNE_STALE_LANES,
+    SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
     branch_namespace,
@@ -350,7 +352,12 @@ class DemuxHandler(BaseHandler):
                     "runfolder_id": runfolder_id,
                     "hpc_runfolder_path": hpc_runfolder_path,
                     "failure_policy": plan.failure_policy,
-                    "shared_step_ids": [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL],
+                    "shared_step_ids": [
+                        VALIDATE_RUNFOLDER,
+                        SETUP_COMMON_DEMUX_DIR,
+                        UPSERT_X_FLOWCELL,
+                        PRUNE_STALE_LANES,
+                    ],
                     "branch_prerequisites": list(self.branch_prerequisites),
                     "metadata_required": UPSERT_X_FLOWCELL in self.branch_prerequisites,
                     "lanes": [

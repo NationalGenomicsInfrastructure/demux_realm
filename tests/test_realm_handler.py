@@ -218,6 +218,10 @@ async def test_lanes_and_settings_become_independent_branches(handler):
         for b in draft.preview["branches"]
     ] == [("1", "0", 1), ("2", "0", 2), ("2", "1", 0)]
     assert draft.preview["step_count"] == len(plan.steps)
+    assert draft.preview["shared_step_ids"] == [*SHARED_STEPS, PRUNE_STALE_LANES]
+    assert set(draft.preview["shared_step_ids"]) == {
+        s.step_id for s in plan.steps if not s.step_id.startswith("lane_")
+    }
     assert [
         (lane["lane_id"], lane["settings_indices"]) for lane in draft.preview["lanes"]
     ] == [("1", ["0"]), ("2", ["0", "1"])]
