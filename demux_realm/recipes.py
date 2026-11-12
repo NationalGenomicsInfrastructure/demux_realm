@@ -21,6 +21,7 @@ SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
 AGGREGATE_ILLUMINA_STATS = "aggregate_illumina_stats"
 AGGREGATE_UNDETERMINED_STATS = "aggregate_undetermined_stats"
+PRUNE_STALE_LANES = "prune_stale_lanes"
 
 
 def lane_namespace(lane_id: str) -> str:
@@ -144,6 +145,7 @@ def build_demux_plan(
         ),
     ]
 
+    lane_digests: dict[str, str] = {}
     for lane_id, lane_branches in _group_by_lane(branches).items():
         lane_digest = _digest(
             {
@@ -160,6 +162,7 @@ def build_demux_plan(
                 ],
             }
         )
+        lane_digests[lane_id] = lane_digest
         clean_lane = clean_lane_step_id(lane_id)
         steps.append(
             StepSpec(
@@ -248,17 +251,34 @@ def build_demux_plan(
 
     steps.append(
         StepSpec(
+            step_id=PRUNE_STALE_LANES,
+            name="Remove Demux Results of Unplanned Lanes",
+            fn_ref=f"{_PREFIX}.prune_stale_lanes",
+            params={"scenario": {**common, "lanes": list(lane_digests)}},
+            deps=list(branch_prerequisites),
+        )
+    )
+
+    # The aggregates read every lane's stored stats, so they re-run whenever
+    # any lane, or the set of lanes, changes.
+    aggregate_scenario = {**common, "plan_digest": _digest(lane_digests)}
+    aggregate_deps = [
+        PRUNE_STALE_LANES,
+        *(
+            f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
+            for b in branches
+        ),
+    ]
+    steps.append(
+        StepSpec(
             step_id=AGGREGATE_ILLUMINA_STATS,
             name="Aggregate Illumina Demux Stats",
             fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
-            params={"scenario": dict(common)},
+            params={"scenario": dict(aggregate_scenario)},
             # Common step: runs once after every branch's upload_results, and
             # recomputes the combined 'illumina' field from whatever is
             # currently stored for each lane (see aggregate_illumina_stats).
-            deps=[
-                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
-                for b in branches
-            ],
+            deps=list(aggregate_deps),
         )
     )
 
@@ -267,14 +287,11 @@ def build_demux_plan(
             step_id=AGGREGATE_UNDETERMINED_STATS,
             name="Aggregate Undetermined Barcode Stats",
             fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
-            params={"scenario": dict(common)},
+            params={"scenario": dict(aggregate_scenario)},
             # Common step: runs once after every branch's upload_results, and
             # recomputes the combined 'Undetermined' field from whatever is
             # currently stored for each lane (see aggregate_undetermined_stats).
-            deps=[
-                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
-                for b in branches
-            ],
+            deps=list(aggregate_deps),
         )
     )
 

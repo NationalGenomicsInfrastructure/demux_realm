@@ -16,6 +16,7 @@ from demux_realm.handler import DemuxHandler
 from demux_realm.recipes import (
     AGGREGATE_ILLUMINA_STATS,
     AGGREGATE_UNDETERMINED_STATS,
+    PRUNE_STALE_LANES,
     SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
@@ -246,7 +247,7 @@ def test_early_branch_failure_leaves_later_branch_running(ws, monkeypatch):
         VALIDATE_RUNFOLDER: SUCCEEDED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: SUCCEEDED,
-        **dict.fromkeys([CLEAN_1, CLEAN_2], SUCCEEDED),
+        **dict.fromkeys([CLEAN_1, CLEAN_2, PRUNE_STALE_LANES], SUCCEEDED),
         **failed_branch(LANE_1),
         **dict.fromkeys(LANE_2, SUCCEEDED),
         **dict.fromkeys(AGGREGATES, BLOCKED),
@@ -274,7 +275,10 @@ def test_validation_failure_blocks_metadata_and_every_branch(
         VALIDATE_RUNFOLDER: FAILED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: BLOCKED,
-        **dict.fromkeys([CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, *AGGREGATES], BLOCKED),
+        **dict.fromkeys(
+            [CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, PRUNE_STALE_LANES, *AGGREGATES],
+            BLOCKED,
+        ),
     }
     assert x_flowcells.saved == []
 
@@ -291,7 +295,9 @@ def test_metadata_failure_lets_independent_branches_finish(ws, x_flowcells):
         VALIDATE_RUNFOLDER: SUCCEEDED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: FAILED,
-        **dict.fromkeys([CLEAN_1, CLEAN_2, *LANE_1, *LANE_2], SUCCEEDED),
+        **dict.fromkeys(
+            [CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, PRUNE_STALE_LANES], SUCCEEDED
+        ),
         # The uploads write to the same unavailable database.
         LANE_1[5]: FAILED,
         LANE_2[5]: FAILED,
@@ -313,7 +319,10 @@ def test_required_metadata_failure_blocks_every_branch(ws, monkeypatch, x_flowce
         VALIDATE_RUNFOLDER: SUCCEEDED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: FAILED,
-        **dict.fromkeys([CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, *AGGREGATES], BLOCKED),
+        **dict.fromkeys(
+            [CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, PRUNE_STALE_LANES, *AGGREGATES],
+            BLOCKED,
+        ),
     }
     assert report.direct_blockers[CLEAN_1] == [UPSERT_X_FLOWCELL]
 
@@ -418,8 +427,10 @@ def test_settings_change_cleans_and_reruns_its_whole_lane_only(ws, monkeypatch):
     assert report.outcome is ExecutionOutcome.SUCCEEDED
     for step_id in [CLEAN_1, *LANE_1, *lane_1_s1]:
         assert report.step_outcomes[step_id] is SUCCEEDED, step_id
-    for step_id in [CLEAN_2, *LANE_2]:
+    for step_id in [CLEAN_2, *LANE_2, PRUNE_STALE_LANES]:
         assert report.step_outcomes[step_id] is REUSED, step_id
+    for step_id in AGGREGATES:
+        assert report.step_outcomes[step_id] is SUCCEEDED, step_id
     assert sorted(p.name for p in (results / "lane_1_settings_1").iterdir()) == [
         "KEEP.fastq.gz"
     ]
@@ -439,6 +450,20 @@ def test_removed_settings_group_leaves_no_results_behind(ws, monkeypatch):
 
     assert report.step_outcomes[CLEAN_1] is SUCCEEDED
     assert sorted(p.name for p in results.iterdir()) == ["lane_1_settings_0"]
+
+
+def test_removed_lane_leaves_no_results_behind(ws, monkeypatch):
+    monkeypatch.setattr(realm_steps, "execute_demux", _fastq_writing_demux(ws))
+    engine = engine_for(ws)
+    results = ws.root / "nf-results" / FCID
+    engine.run(plan_for(ws, [lane_entry(1), lane_entry(2)]))
+
+    report = engine.run(plan_for(ws, [lane_entry(1)]))
+
+    assert report.step_outcomes[PRUNE_STALE_LANES] is SUCCEEDED
+    assert report.step_outcomes[CLEAN_1] is REUSED
+    assert sorted(p.name for p in results.iterdir()) == ["lane_1_settings_0"]
+    assert all(report.step_outcomes[step_id] is SUCCEEDED for step_id in AGGREGATES)
 
 
 def test_runfolder_xml_change_reruns_only_the_metadata_update(ws, x_flowcells):
@@ -511,7 +536,7 @@ async def test_finished_failed_continuation_needs_a_new_run_request(ws, monkeypa
         VALIDATE_RUNFOLDER: REUSED,
         SETUP_COMMON_DEMUX_DIR: REUSED,
         UPSERT_X_FLOWCELL: REUSED,
-        **dict.fromkeys([CLEAN_1, CLEAN_2], REUSED),
+        **dict.fromkeys([CLEAN_1, CLEAN_2, PRUNE_STALE_LANES], REUSED),
         **failed_branch(LANE_1),
         LANE_1[0]: REUSED,
         LANE_1[1]: REUSED,

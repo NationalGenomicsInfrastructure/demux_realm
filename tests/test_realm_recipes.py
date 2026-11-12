@@ -3,6 +3,9 @@ from pathlib import Path
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY
 
 from demux_realm.recipes import (
+    AGGREGATE_ILLUMINA_STATS,
+    AGGREGATE_UNDETERMINED_STATS,
+    PRUNE_STALE_LANES,
     SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
@@ -213,3 +216,35 @@ def test_branches_never_share_mutable_step_state():
         assert not {id(getattr(s, attribute)) for s in first} & {
             id(getattr(s, attribute)) for s in second
         }
+
+
+def test_unplanned_lanes_are_pruned_before_aggregation():
+    plan = _plan()
+    prune = _step(plan, PRUNE_STALE_LANES)
+
+    assert prune.fn_ref == "demux_realm.steps.prune_stale_lanes"
+    assert prune.params["scenario"]["lanes"] == ["1", "3"]
+    assert prune.deps == [VALIDATE_RUNFOLDER]
+    for step_id in (AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS):
+        assert _step(plan, step_id).deps == [
+            PRUNE_STALE_LANES,
+            "lane_1_settings_0__upload_results",
+            "lane_3_settings_1__upload_results",
+        ]
+
+
+def test_aggregates_change_with_any_lane():
+    def aggregate_params(branches):
+        plan = _plan(branches=branches)
+        return [
+            _step(plan, step_id).params
+            for step_id in (AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS)
+        ]
+
+    before = aggregate_params(_BRANCHES)
+    after = aggregate_params(
+        [_BRANCHES[0], SamplesheetBranch("3", "1", 0, {"lane": 3, "x": 1})]
+    )
+
+    assert before == aggregate_params(_BRANCHES)
+    assert all(b != a for b, a in zip(before, after))

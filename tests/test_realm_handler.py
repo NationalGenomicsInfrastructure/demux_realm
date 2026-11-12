@@ -24,6 +24,7 @@ from demux_realm.handler import DemuxHandler
 from demux_realm.recipes import (
     AGGREGATE_ILLUMINA_STATS,
     AGGREGATE_UNDETERMINED_STATS,
+    PRUNE_STALE_LANES,
     SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
@@ -40,7 +41,11 @@ BRANCH_STAGES = (
     "upload_results",
 )
 SHARED_STEPS = [VALIDATE_RUNFOLDER, SETUP_COMMON_DEMUX_DIR, UPSERT_X_FLOWCELL]
-AGGREGATE_STEPS = [AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS]
+FLOWCELL_TAIL = [
+    PRUNE_STALE_LANES,
+    AGGREGATE_ILLUMINA_STATS,
+    AGGREGATE_UNDETERMINED_STATS,
+]
 
 
 def branch_ids(namespace: str) -> list[str]:
@@ -155,7 +160,7 @@ async def test_single_lane_yields_one_plan(handler):
         *SHARED_STEPS,
         clean_lane_id("1"),
         *lane_1,
-        *AGGREGATE_STEPS,
+        *FLOWCELL_TAIL,
     ]
     assert {s.step_id: s.deps for s in plan.steps} == {
         VALIDATE_RUNFOLDER: [],
@@ -163,8 +168,9 @@ async def test_single_lane_yields_one_plan(handler):
         UPSERT_X_FLOWCELL: [VALIDATE_RUNFOLDER],
         clean_lane_id("1"): [VALIDATE_RUNFOLDER],
         **branch_deps(lane_1, [clean_lane_id("1")]),
-        AGGREGATE_ILLUMINA_STATS: [lane_1[-1]],
-        AGGREGATE_UNDETERMINED_STATS: [lane_1[-1]],
+        PRUNE_STALE_LANES: [VALIDATE_RUNFOLDER],
+        AGGREGATE_ILLUMINA_STATS: [PRUNE_STALE_LANES, lane_1[-1]],
+        AGGREGATE_UNDETERMINED_STATS: [PRUNE_STALE_LANES, lane_1[-1]],
     }
     scenario = step_dicts(plan)[lane_1[0]]["params"]["scenario"]
     assert scenario["hpc_runfolder_path"] == "/incoming/path/230314_A00000_0000_AXXXXX"
@@ -190,7 +196,7 @@ async def test_lanes_and_settings_become_independent_branches(handler):
         clean_lane_id("2"),
         *branch_ids("lane_2_settings_0"),
         *branch_ids("lane_2_settings_1"),
-        *AGGREGATE_STEPS,
+        *FLOWCELL_TAIL,
     ]
     assert [s.fn_ref for s in plan.steps].count(
         "demux_realm.steps.validate_runfolder"
