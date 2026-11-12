@@ -13,6 +13,7 @@ from demux_realm.steps import (
     aggregate_illumina_stats,
     clean_lane,
     collect_results,
+    prune_stale_lanes,
     upload_results,
     upsert_x_flowcell_pre_demux,
     validate_runfolder,
@@ -26,6 +27,7 @@ _upload_results = upload_results.__wrapped__  # type: ignore[attr-defined]
 _validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-defined]
 _aggregate_illumina_stats = aggregate_illumina_stats.__wrapped__  # type: ignore[attr-defined]
 _clean_lane = clean_lane.__wrapped__  # type: ignore[attr-defined]
+_prune_stale_lanes = prune_stale_lanes.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -599,3 +601,33 @@ def test_clean_lane_refuses_a_flowcell_id_that_is_not_one_component(
 
     with pytest.raises(PermanentStepError, match="Refusing"):
         _clean_lane(earlier_run.ctx, scenario)
+
+
+def test_prune_stale_lanes_removes_lanes_outside_the_plan(earlier_run):
+    result = _prune_stale_lanes(
+        earlier_run.ctx, {**earlier_run.scenario, "lanes": ["1"]}
+    )
+
+    assert sorted(p.name for p in (earlier_run.results / _FCID).iterdir()) == [
+        "lane_1_settings_0",
+        "lane_1_settings_1",
+        "lane_1_settings_7",
+    ]
+    assert not (earlier_run.work / _FCID / "lane_2_settings_0").exists()
+    assert "lane_2_settings_0_R1.fastq.gz" not in {
+        p.name for p in earlier_run.demux_dir.iterdir()
+    }
+    assert result.metrics["removed_fields"] == ["Demultiplex_lane_2_settings_0"]
+
+
+def test_prune_stale_lanes_keeps_every_planned_lane(earlier_run):
+    result = _prune_stale_lanes(
+        earlier_run.ctx, {**earlier_run.scenario, "lanes": ["1", "2"]}
+    )
+
+    assert result.metrics == {
+        "removed_dirs": [],
+        "removed_symlinks": [],
+        "removed_fields": [],
+    }
+    earlier_run.client.save.assert_not_called()

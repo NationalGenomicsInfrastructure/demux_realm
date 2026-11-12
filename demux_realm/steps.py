@@ -466,6 +466,21 @@ def clean_lane(ctx: StepContext, scenario: dict) -> StepResult:
 
 
 @step
+def prune_stale_lanes(ctx: StepContext, scenario: dict) -> StepResult:
+    """Remove the earlier demultiplexing results of lanes no longer planned.
+
+    clean_lane covers only the lanes in the plan; this covers a lane removed
+    from the samplesheets altogether, whose results would otherwise stay on
+    disk and in the aggregated stats. Its params hold the planned lanes, so it
+    re-runs whenever that set changes.
+    """
+    planned = {str(lane) for lane in scenario["lanes"]}
+    metrics = _remove_branches(ctx, scenario, lambda lane: lane not in planned)
+    logger.info("Pruned lanes outside %s: %s", sorted(planned), metrics)
+    return StepResult(metrics=metrics)
+
+
+@step
 def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     """Builds the pre-demux x_flowcells document and persists it to CouchDB.
 
