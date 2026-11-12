@@ -1,14 +1,17 @@
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from yggdrasil.flow.errors import PermanentStepError
 
 from demux_realm.config import RealmConfig
 from demux_realm.nextflow import settings_from_mapping
 from demux_realm.steps import (
     aggregate_illumina_stats,
+    clean_lane,
     collect_results,
     upload_results,
     upsert_x_flowcell_pre_demux,
@@ -22,6 +25,7 @@ _collect_results = collect_results.__wrapped__  # type: ignore[attr-defined]
 _upload_results = upload_results.__wrapped__  # type: ignore[attr-defined]
 _validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-defined]
 _aggregate_illumina_stats = aggregate_illumina_stats.__wrapped__  # type: ignore[attr-defined]
+_clean_lane = clean_lane.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -489,3 +493,109 @@ def test_step_raises_when_data_not_injected(tmp_path, scenario):
     ctx.data = None
     with pytest.raises(RuntimeError, match="DataAccess.*not injected"):
         _step(ctx, scenario)
+
+
+# ---------------------------------------------------------------------------
+# Lane cleanup
+# ---------------------------------------------------------------------------
+
+_FCID = "SC2177698-SC3"
+_BRANCHES = ("lane_1_settings_0", "lane_1_settings_1", "lane_2_settings_0")
+
+
+@pytest.fixture
+def earlier_run(tmp_path, monkeypatch):
+    """Lay out the results, work dirs, links and fields of an earlier run."""
+    results, work = tmp_path / "results", tmp_path / "work"
+    realm_config = RealmConfig(
+        hpc_base_path="",
+        nextflow=settings_from_mapping(
+            {"outdir_base": str(results), "work_base": str(work)}
+        ),
+    )
+    monkeypatch.setattr("demux_realm.steps.load_realm_config", lambda: realm_config)
+    runfolder = tmp_path / "runfolder"
+    demux_dir = runfolder / "Demultiplexing"
+    demux_dir.mkdir(parents=True)
+    for branch in _BRANCHES:
+        fastq = results / _FCID / branch / _FCID / f"{branch}_R1.fastq.gz"
+        fastq.parent.mkdir(parents=True)
+        fastq.touch()
+        (work / _FCID / branch / "ab").mkdir(parents=True)
+        (demux_dir / fastq.name).symlink_to(fastq)
+    # A dangling link left by a branch whose results are already gone.
+    (demux_dir / "gone_R1.fastq.gz").symlink_to(
+        results / _FCID / "lane_1_settings_7" / "gone_R1.fastq.gz"
+    )
+    (results / _FCID / "lane_1_settings_7").mkdir()
+    (demux_dir / "unrelated.txt").touch()
+
+    doc = {
+        "_id": "doc-123",
+        "_rev": "2-abc",
+        "name": "20260312_ASC2177698-SC3",
+        "illumina": {"x": 1},
+        **{f"Demultiplex_{branch}": {"Demultiplex_Stats": []} for branch in _BRANCHES},
+    }
+    ctx = MagicMock()
+    client = ctx.data.connection.return_value
+    client.find_one.return_value = doc
+    client.clean_doc.side_effect = lambda d: {
+        k: v for k, v in d.items() if k not in ("_id", "_rev")
+    }
+    scenario = {
+        "canonical_flowcell_id": _FCID,
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+        "hpc_runfolder_path": str(runfolder),
+    }
+    return SimpleNamespace(
+        results=results,
+        work=work,
+        demux_dir=demux_dir,
+        ctx=ctx,
+        client=client,
+        scenario=scenario,
+    )
+
+
+def test_clean_lane_removes_only_that_lanes_results(earlier_run):
+    result = _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "1"})
+
+    flowcell_results = earlier_run.results / _FCID
+    assert sorted(p.name for p in flowcell_results.iterdir()) == ["lane_2_settings_0"]
+    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == [
+        "lane_2_settings_0"
+    ]
+    assert sorted(p.name for p in earlier_run.demux_dir.iterdir()) == [
+        "lane_2_settings_0_R1.fastq.gz",
+        "unrelated.txt",
+    ]
+    saved = earlier_run.client.save.call_args.args[0]
+    assert sorted(saved) == ["Demultiplex_lane_2_settings_0", "illumina", "name"]
+    assert result.metrics["removed_fields"] == [
+        "Demultiplex_lane_1_settings_0",
+        "Demultiplex_lane_1_settings_1",
+    ]
+    assert len(result.metrics["removed_symlinks"]) == 3
+    assert len(result.metrics["removed_dirs"]) == 5
+
+
+def test_clean_lane_without_earlier_results_does_nothing(earlier_run):
+    earlier_run.client.find_one.return_value = None
+
+    result = _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "3"})
+
+    assert result.metrics["removed_dirs"] == []
+    assert result.metrics["removed_symlinks"] == []
+    assert result.metrics["removed_fields"] == []
+    earlier_run.client.save.assert_not_called()
+
+
+@pytest.mark.parametrize("fcid", ["", "..", "a/b"])
+def test_clean_lane_refuses_a_flowcell_id_that_is_not_one_component(
+    earlier_run, fcid
+):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "canonical_flowcell_id": fcid}
+
+    with pytest.raises(PermanentStepError, match="Refusing"):
+        _clean_lane(earlier_run.ctx, scenario)

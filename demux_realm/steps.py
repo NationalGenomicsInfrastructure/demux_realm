@@ -1,6 +1,9 @@
 import csv
 import logging
+import os
 import re
+import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -75,6 +78,141 @@ def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
 
 # Matches branch fields written by upload_results, e.g. "Demultiplex_lane_1_settings_0".
 _BRANCH_FIELD_RE = re.compile(r"^Demultiplex_lane_.+_settings_.+$")
+# Same branch fields, capturing the lane ID.
+_BRANCH_FIELD_LANE_RE = re.compile(r"^Demultiplex_lane_(?P<lane>[^_]+)_settings_[^_]+$")
+# Per-branch directory names under <base>/<FCID>, e.g. "lane_1_settings_0"
+# (see nextflow.branch_run_tag).
+_BRANCH_DIR_RE = re.compile(r"^lane_(?P<lane>[^_]+)_settings_[^_]+$")
+
+
+def _find_x_flowcell(client: Any, name: str) -> dict[str, Any] | None:
+    """Return the x_flowcells document named name, or None if there is none."""
+    existing: Any = None
+    if hasattr(client, "find_one"):
+        existing = client.find_one({"name": {"$eq": name}})
+    elif hasattr(client, "get"):
+        existing = client.get(name)
+    if existing is not None and not isinstance(existing, dict):
+        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+    return existing
+
+
+def _branch_dirs(
+    base: Path, canonical_flowcell_id: str, drop_lane: Callable[[str], bool]
+) -> list[Path]:
+    """Return the branch directories under base/<FCID> whose lane drop_lane selects.
+
+    Raises:
+        PermanentStepError: If the flowcell ID could point outside base.
+    """
+    if (
+        not canonical_flowcell_id
+        or canonical_flowcell_id in (".", "..")
+        or ("/" in canonical_flowcell_id)
+    ):
+        raise PermanentStepError(
+            f"Refusing to clean up for flowcell ID {canonical_flowcell_id!r}.",
+            advice="The canonical flowcell ID must be a single path component.",
+        )
+    flowcell_dir = base / canonical_flowcell_id
+    if not flowcell_dir.is_dir():
+        return []
+    if not flowcell_dir.resolve().is_relative_to(base.resolve()):
+        raise PermanentStepError(
+            f"Refusing to clean up {flowcell_dir}: it resolves outside {base}.",
+            advice="Check the realm config's work_base and outdir_base.",
+        )
+    return sorted(
+        path
+        for path in flowcell_dir.iterdir()
+        if path.is_dir()
+        and not path.is_symlink()
+        and (match := _BRANCH_DIR_RE.match(path.name))
+        and drop_lane(match["lane"])
+    )
+
+
+def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
+    """Remove the links in demux_dir that point into any of outdirs.
+
+    Dangling links count too: their target may already be gone.
+    """
+    if not outdirs or not demux_dir.is_dir():
+        return []
+    removed = []
+    for link in sorted(demux_dir.iterdir()):
+        if not link.is_symlink():
+            continue
+        target = Path(os.readlink(link))
+        if not target.is_absolute():
+            target = demux_dir / target
+        if any(target.is_relative_to(outdir) for outdir in outdirs):
+            link.unlink()
+            removed.append(str(link))
+    return removed
+
+
+def _remove_branch_fields(
+    ctx: StepContext, runfolder_id: str, drop_lane: Callable[[str], bool]
+) -> list[str]:
+    """Remove the branch fields of the selected lanes from the x_flowcells document.
+
+    A missing document is left alone: there is nothing to clean up yet.
+    """
+    if ctx.data is None:
+        raise RuntimeError("StepContext.data (DataAccess) was not injected.")
+    name = derive_xflowcell_name(runfolder_id)
+    client = ctx.data.connection("x_flowcells_db")
+    existing = _find_x_flowcell(client, name)
+    if existing is None:
+        return []
+    removed = sorted(
+        key
+        for key in existing
+        if (match := _BRANCH_FIELD_LANE_RE.match(key)) and drop_lane(match["lane"])
+    )
+    if not removed:
+        return []
+    if hasattr(client, "clean_doc"):
+        updated_doc = client.clean_doc(existing)
+    else:
+        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    for key in removed:
+        del updated_doc[key]
+    client.save(updated_doc, selector={"name": {"$eq": name}}, mode="upsert")
+    return removed
+
+
+def _remove_branches(
+    ctx: StepContext, scenario: dict, drop_lane: Callable[[str], bool]
+) -> dict[str, Any]:
+    """Remove every trace of the selected lanes' branches from earlier runs.
+
+    That is: the links in the runfolder's Demultiplexing directory that point
+    into their results, their Nextflow results and work directories, and their
+    branch fields on the x_flowcells document. Settings indices that are no
+    longer planned are matched too, since directories and fields are selected
+    by lane only.
+
+    Returns:
+        Metrics listing what was removed.
+    """
+    settings = load_realm_config().nextflow
+    fcid = scenario["canonical_flowcell_id"]
+    outdirs = _branch_dirs(settings.outdir_base, fcid, drop_lane)
+    work_dirs = _branch_dirs(settings.work_base, fcid, drop_lane)
+    demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
+
+    links = _remove_branch_symlinks(demux_dir, outdirs)
+    for path in [*outdirs, *work_dirs]:
+        shutil.rmtree(path)
+        logger.info("Removed %s.", path)
+    fields = _remove_branch_fields(ctx, scenario["runfolder_id"], drop_lane)
+    return {
+        "removed_dirs": [str(path) for path in [*outdirs, *work_dirs]],
+        "removed_symlinks": links,
+        "removed_fields": fields,
+    }
 
 
 def _parse_int(value: str | None) -> int:
@@ -308,6 +446,23 @@ def setup_common_demux_dir(ctx: StepContext, scenario: dict) -> StepResult:
             "demux_dir": str(demux_dir),
         }
     )
+
+
+@step
+def clean_lane(ctx: StepContext, scenario: dict) -> StepResult:
+    """Remove every earlier demultiplexing result of one lane.
+
+    A lane is the smallest unit that is re-demultiplexed: every branch of the
+    lane depends on this step, and the plan gives this step and those
+    branches the same lane digest, so any change in the lane re-runs this
+    cleanup and then all of the lane's branches. Without the cleanup, a sample
+    removed from a samplesheet would keep its FASTQ files, links and stats
+    from the earlier run.
+    """
+    lane_id = str(scenario["lane_id"])
+    metrics = _remove_branches(ctx, scenario, lambda lane: lane == lane_id)
+    logger.info("Cleaned lane %s: %s", lane_id, metrics)
+    return StepResult(metrics={"lane_id": lane_id, **metrics})
 
 
 @step
