@@ -7,6 +7,7 @@ step for another @step function, never through plan parameters.
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -436,6 +437,21 @@ def test_settings_change_cleans_and_reruns_its_whole_lane_only(ws, monkeypatch):
     ]
     assert (results / "lane_1_settings_0" / "L1S0_1.fastq.gz").is_file()
     assert lane_2_fastq.stat().st_mtime_ns == lane_2_mtime
+
+
+def test_forced_cleanup_reruns_every_later_step_of_its_lane(ws):
+    plan = plan_for(ws, [lane_entry(1), lane_entry(2)])
+    engine = engine_for(ws)
+    engine.run(plan)
+
+    # Removing the cleanup's success marker forces it to run again.
+    shutil.rmtree(ws.work / plan.plan_id / CLEAN_1)
+    report = engine.run(plan)
+
+    for step_id in [CLEAN_1, *LANE_1]:
+        assert report.step_outcomes[step_id] is SUCCEEDED, step_id
+    for step_id in [CLEAN_2, *LANE_2]:
+        assert report.step_outcomes[step_id] is REUSED, step_id
 
 
 def test_removed_settings_group_leaves_no_results_behind(ws, monkeypatch):

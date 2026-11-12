@@ -584,6 +584,7 @@ def earlier_run(tmp_path, monkeypatch):
         "canonical_flowcell_id": _FCID,
         "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
         "hpc_runfolder_path": str(runfolder),
+        "cleanup_token": str(tmp_path / "artifacts" / "lane_1" / "cleanup.token"),
     }
     return SimpleNamespace(
         results=results,
@@ -606,6 +607,18 @@ def test_clean_lane_removes_only_that_lanes_results(earlier_run):
     ]
     assert len(result.metrics["removed_symlinks"]) == 3
     assert len(result.metrics["removed_dirs"]) == 3
+
+
+def test_clean_lane_writes_a_new_token_every_run(earlier_run):
+    scenario = {**earlier_run.scenario, "lane_id": "1"}
+    token = Path(scenario["cleanup_token"])
+
+    _clean_lane(earlier_run.ctx, scenario)
+    first = token.read_text()
+    _clean_lane(earlier_run.ctx, scenario)
+
+    assert first.strip()
+    assert token.read_text() != first
 
 
 def test_clean_lane_keeps_work_dirs_and_x_flowcells(earlier_run):

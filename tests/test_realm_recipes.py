@@ -147,9 +147,18 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
     ]
     scenario = steps[0].params["scenario"]
     assert (scenario["lane_id"], scenario["settings_index"]) == ("3", "1")
-    assert scenario["lane_digest"] == _step(_plan(), "lane_3__clean_lane").params[
-        "scenario"
-    ]["lane_digest"]
+    assert "lane_digest" not in scenario
+    token = "/work/artifacts/lane_3/cleanup.token"
+    assert _step(_plan(), "lane_3__clean_lane").outputs == {"cleanup_token": token}
+    # Every later step of the lane re-runs whenever the lane's cleanup ran.
+    assert [s.inputs for s in steps] == [
+        {"lane_cleanup": token},
+        {"lane_cleanup": token},
+        {"lane_cleanup": token, "samplesheet": sheet},
+        {"lane_cleanup": token},
+        {"lane_cleanup": token},
+        {"lane_cleanup": token},
+    ]
     assert scenario["samplesheet_payload"] == {"lane": 3}
     assert scenario["demux_sample_info_doc"] == {"metadata": {"m": 1}}
     # Only execute_demux gets the sheet location and the per-run options.
@@ -159,7 +168,6 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
         "samplesheet_path": Path(sheet),
         "nextflow": {"skip_tools": ["samshee"]},
     }
-    assert steps[2].inputs == {"samplesheet": sheet}
     assert steps[1].params == {"scenario": scenario, "samplesheet": Path(sheet)}
     assert all(
         s.params == {"scenario": scenario} for i, s in enumerate(steps) if i not in (1, 2)

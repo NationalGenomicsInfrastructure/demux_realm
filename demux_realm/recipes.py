@@ -39,6 +39,10 @@ def clean_lane_step_id(lane_id: str) -> str:
     return f"{lane_namespace(lane_id)}__clean_lane"
 
 
+#: Input key under which every step of a lane declares its cleanup token.
+LANE_CLEANUP_INPUT = "lane_cleanup"
+
+
 def _digest(data: Any) -> str:
     """Return a stable sha256 of JSON-serializable data."""
     text = json.dumps(data, sort_keys=True, default=str)
@@ -79,11 +83,11 @@ def build_demux_plan(
     every lane/settings branch of the lane as a chain of steps whose first
     step depends on the clean_lane step.
 
-    A lane is the smallest unit that is re-demultiplexed. The lane's steps
-    all carry the same lane_digest, a hash of everything its branches are
-    planned from, so a change to any branch of the lane changes the
-    fingerprint of every step in the lane: its earlier results are removed
-    and all of its branches re-run, while unchanged lanes are reused.
+    A lane is the smallest unit that is re-demultiplexed. The clean_lane
+    step carries a lane_digest, a hash of everything the lane's branches are
+    planned from, so a change to any branch of the lane re-runs it. It then
+    writes a new cleanup token, which every later step of the lane declares
+    as an input, so all of them run again too; unchanged lanes are reused.
 
     Args:
         plan_id: The combined plan ID.
@@ -164,6 +168,8 @@ def build_demux_plan(
         )
         lane_digests[lane_id] = lane_digest
         clean_lane = clean_lane_step_id(lane_id)
+        cleanup_token = str(artifact_base / lane_namespace(lane_id) / "cleanup.token")
+        lane_inputs = {LANE_CLEANUP_INPUT: cleanup_token}
         steps.append(
             StepSpec(
                 step_id=clean_lane,
@@ -174,9 +180,11 @@ def build_demux_plan(
                         **common,
                         "lane_id": lane_id,
                         "lane_digest": lane_digest,
+                        "cleanup_token": cleanup_token,
                     }
                 },
                 deps=list(branch_prerequisites),
+                outputs={"cleanup_token": cleanup_token},
             )
         )
         for branch in lane_branches:
@@ -186,7 +194,6 @@ def build_demux_plan(
                 **common,
                 "lane_id": branch.lane_id,
                 "settings_index": branch.settings_index,
-                "lane_digest": lane_digest,
                 "samplesheet_payload": branch.payload,
                 "demux_sample_info_doc": {"metadata": metadata},
             }
@@ -201,6 +208,7 @@ def build_demux_plan(
                     fn_ref=f"{_PREFIX}.materialize_extra_config",
                     params={"scenario": scenario},
                     deps=[clean_lane],
+                    inputs=dict(lane_inputs),
                     outputs={"demux_config": DEMUX_CONFIG_FILENAME},
                 ),
                 StepSpec(
@@ -209,6 +217,7 @@ def build_demux_plan(
                     fn_ref=f"{_PREFIX}.generate_samplesheet",
                     params={"scenario": scenario, "samplesheet": samplesheet_path},
                     deps=[f"{ns}__materialize_config"],
+                    inputs=dict(lane_inputs),
                     outputs={"samplesheet": str(samplesheet_path)},
                 ),
                 StepSpec(
@@ -224,7 +233,7 @@ def build_demux_plan(
                         "samplesheet": samplesheet_path,
                     },
                     deps=[f"{ns}__generate_samplesheet"],
-                    inputs={"samplesheet": str(samplesheet_path)},
+                    inputs={**lane_inputs, "samplesheet": str(samplesheet_path)},
                 ),
                 StepSpec(
                     step_id=f"{ns}__collect_results",
@@ -232,6 +241,7 @@ def build_demux_plan(
                     fn_ref=f"{_PREFIX}.collect_results",
                     params={"scenario": scenario},
                     deps=[f"{ns}__execute_demux"],
+                    inputs=dict(lane_inputs),
                 ),
                 StepSpec(
                     step_id=f"{ns}__symlink_fastqs",
@@ -239,6 +249,7 @@ def build_demux_plan(
                     fn_ref=f"{_PREFIX}.symlink_fastqs",
                     params={"scenario": scenario},
                     deps=[f"{ns}__execute_demux"],
+                    inputs=dict(lane_inputs),
                 ),
                 StepSpec(
                     step_id=f"{ns}__upload_results",
@@ -246,6 +257,7 @@ def build_demux_plan(
                     fn_ref=f"{_PREFIX}.upload_results",
                     params={"scenario": scenario},
                     deps=[f"{ns}__collect_results"],
+                    inputs=dict(lane_inputs),
                 ),
             ]
 

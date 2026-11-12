@@ -314,7 +314,7 @@ async def test_branch_payload_change_leaves_other_branches_unchanged(handler):
 
 
 @pytest.mark.asyncio
-async def test_settings_change_changes_every_step_of_its_lane(handler):
+async def test_settings_change_changes_only_its_lanes_cleanup(handler):
     entries = [
         lane_entry(1, settings_index=0),
         lane_entry(1, settings_index=1),
@@ -324,18 +324,16 @@ async def test_settings_change_changes_every_step_of_its_lane(handler):
     before = step_dicts((await plan_for(handler, entries)).plan)
     after = step_dicts((await plan_for(handler, changed)).plan)
 
-    lane_1 = [
-        clean_lane_id("1"),
-        *branch_ids("lane_1_settings_0"),
-        *branch_ids("lane_1_settings_1"),
+    # The cleanup re-runs; its new token then re-runs the rest of the lane.
+    assert before[clean_lane_id("1")] != after[clean_lane_id("1")]
+    token = after[clean_lane_id("1")]["outputs"]["cleanup_token"]
+    for step_id in [*branch_ids("lane_1_settings_0"), *branch_ids("lane_1_settings_1")]:
+        assert after[step_id]["inputs"]["lane_cleanup"] == token
+    assert before["lane_1_settings_0__execute_demux"] == after[
+        "lane_1_settings_0__execute_demux"
     ]
-    for step_id in lane_1:
-        assert before[step_id]["params"] != after[step_id]["params"]
     for step_id in [clean_lane_id("2"), *branch_ids("lane_2_settings_0")]:
         assert before[step_id] == after[step_id]
-    digests = {after[i]["params"]["scenario"]["lane_digest"] for i in lane_1}
-    assert len(digests) == 1
-    assert digests != {after[clean_lane_id("2")]["params"]["scenario"]["lane_digest"]}
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
@@ -425,15 +426,22 @@ def setup_common_demux_dir(ctx: StepContext, scenario: dict) -> StepResult:
 def clean_lane(ctx: StepContext, scenario: dict) -> StepResult:
     """Remove every earlier demultiplexing result of one lane.
 
-    A lane is the smallest unit that is re-demultiplexed: every branch of the
-    lane depends on this step, and the plan gives this step and those
-    branches the same lane digest, so any change in the lane re-runs this
-    cleanup and then all of the lane's branches. Without the cleanup, a sample
-    removed from a samplesheet would keep its FASTQ files and links from the
-    earlier run. See _remove_branch_results for what is kept.
+    A lane is the smallest unit that is re-demultiplexed. This step's params
+    carry a digest of the lane's samplesheets, so any change in the lane
+    re-runs it. Each run writes a new random token to scenario's
+    cleanup_token path, which every later step of the lane declares as an
+    input: once the cleanup has run, their fingerprints no longer match and
+    all of them run again, even when the cleanup was forced by removing its
+    success marker. Without the cleanup, a sample removed from a samplesheet
+    would keep its FASTQ files and links from the earlier run. See
+    _remove_branch_results for what is kept.
     """
     lane_id = str(scenario["lane_id"])
     metrics = _remove_branch_results(scenario, lambda lane: lane == lane_id)
+    token = Path(scenario["cleanup_token"])
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text(f"{uuid.uuid4().hex}\n", encoding="utf-8")
+    ctx.record_artifact(SimpleArtifactRef("cleanup_token", "lane"), path=token)
     logger.info("Cleaned lane %s: %s", lane_id, metrics)
     return StepResult(metrics={"lane_id": lane_id, **metrics})
 
