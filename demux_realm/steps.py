@@ -78,6 +78,8 @@ def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
 
 # Matches branch fields written by upload_results, e.g. "Demultiplex_lane_1_settings_0".
 _BRANCH_FIELD_RE = re.compile(r"^Demultiplex_lane_.+_settings_.+$")
+# Fields aggregate_illumina_stats and aggregate_undetermined_stats write.
+_AGGREGATE_FIELDS = frozenset({"illumina", "Undetermined"})
 # Same branch fields, capturing the lane ID.
 _BRANCH_FIELD_LANE_RE = re.compile(r"^Demultiplex_lane_(?P<lane>[^_]+)_settings_[^_]+$")
 # Per-branch directory names under <base>/<FCID>, e.g. "lane_1_settings_0"
@@ -491,8 +493,14 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
 
     The document is identified by its `name` field (Mango selector). If no
     matching document exists it is created; if exactly one exists its whole body
-    is replaced by this payload, keeping only its _id and _rev. Fields written by
-    other processes, such as post-demux Json_Stats, are not preserved.
+    is replaced by this payload, keeping only its _id and _rev and the demux
+    results: the per-branch Demultiplex_lane_<n>_settings_<i> fields and the
+    aggregated illumina and Undetermined fields. This step re-runs whenever any
+    samplesheet changes, while the branches of unchanged lanes are reused and
+    do not upload again, so dropping their fields would lose their results.
+    Results of re-run or removed lanes are removed by clean_lane and
+    prune_stale_lanes instead. Other fields, such as post-demux Json_Stats,
+    are not preserved.
     """
     runfolder_path = Path(scenario["hpc_runfolder_path"])
     runfolder_id = scenario["runfolder_id"]
@@ -529,8 +537,14 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
     client = ctx.data.connection("x_flowcells_db")
+    existing = _find_x_flowcell(client, name) or {}
+    kept = {
+        key: value
+        for key, value in existing.items()
+        if _BRANCH_FIELD_RE.match(key) or key in _AGGREGATE_FIELDS
+    }
     write_result = client.save(
-        payload,
+        {**kept, **payload},
         selector={"name": {"$eq": name}},
         mode="upsert",
     )
@@ -545,6 +559,7 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
         metrics={
             "x_flowcell_name": name,
             "samplesheet_row_count": len(samplesheet_csv),
+            "kept_fields": sorted(kept),
             "write_status": write_result.status,
             "doc_id": write_result.doc_id,
         }

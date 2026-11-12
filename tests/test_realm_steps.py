@@ -120,6 +120,7 @@ def _make_ctx(tmp_path, *, save_status="created", save_doc_id="couch-id-abc123")
     write_result.doc_id = save_doc_id
 
     x_flowcells_client = MagicMock()
+    x_flowcells_client.find_one.return_value = None
     x_flowcells_client.save.return_value = write_result
     ctx.data.connection.return_value = x_flowcells_client
     return ctx, x_flowcells_client
@@ -161,6 +162,37 @@ def test_step_payload_has_no_id_or_rev(tmp_path, scenario):
 # ---------------------------------------------------------------------------
 # Payload content
 # ---------------------------------------------------------------------------
+
+
+def test_step_keeps_demux_results_of_the_existing_document(tmp_path, scenario):
+    ctx, x_client = _make_ctx(tmp_path)
+    x_client.find_one.return_value = {
+        "_id": "doc-1",
+        "_rev": "3-x",
+        "name": "20260312_ASC2177698-SC3",
+        "samplesheet_csv": ["stale"],
+        "Json_Stats": {"x": 1},
+        "Demultiplex_lane_1_settings_0": {"Demultiplex_Stats": [{"Lane": "1"}]},
+        "illumina": {"Demultiplex_Stats": {}},
+        "Undetermined": {"1": {}},
+    }
+
+    result = _step(ctx, scenario)
+
+    payload = _saved_payload(x_client)
+    assert payload["Demultiplex_lane_1_settings_0"] == {
+        "Demultiplex_Stats": [{"Lane": "1"}]
+    }
+    assert payload["illumina"] == {"Demultiplex_Stats": {}}
+    assert payload["Undetermined"] == {"1": {}}
+    assert "Json_Stats" not in payload
+    assert payload["samplesheet_csv"] != ["stale"]
+    assert "_id" not in payload and "_rev" not in payload
+    assert result.metrics["kept_fields"] == [
+        "Demultiplex_lane_1_settings_0",
+        "Undetermined",
+        "illumina",
+    ]
 
 
 def test_step_payload_has_required_fields(tmp_path, scenario):
