@@ -19,8 +19,6 @@ _PREFIX = "demux_realm.steps"
 VALIDATE_RUNFOLDER = "validate_runfolder"
 SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
-AGGREGATE_ILLUMINA_STATS = "aggregate_illumina_stats"
-AGGREGATE_UNDETERMINED_STATS = "aggregate_undetermined_stats"
 PRUNE_STALE_LANES = "prune_stale_lanes"
 
 
@@ -278,20 +276,24 @@ def build_demux_plan(
             f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
             for b in lane_branches
         ]
-        for aggregate, title in (
-            (AGGREGATE_ILLUMINA_STATS, "Aggregate Illumina Demux Stats"),
-            (AGGREGATE_UNDETERMINED_STATS, "Aggregate Undetermined Barcode Stats"),
-        ):
-            steps.append(
-                StepSpec(
-                    step_id=f"{lane_namespace(lane_id)}__{aggregate}",
-                    name=f"{title} (lane {lane_id})",
-                    fn_ref=f"{_PREFIX}.{aggregate}",
-                    params={"scenario": dict(lane_scenario)},
-                    deps=list(uploads),
-                    inputs=dict(lane_inputs),
-                )
-            )
+        steps += [
+            StepSpec(
+                step_id=f"{lane_namespace(lane_id)}__aggregate_illumina_stats",
+                name=f"Aggregate Illumina Demux Stats (lane {lane_id})",
+                fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
+                params={"scenario": dict(lane_scenario)},
+                deps=list(uploads),
+                inputs=dict(lane_inputs),
+            ),
+            StepSpec(
+                step_id=f"{lane_namespace(lane_id)}__aggregate_undetermined_stats",
+                name=f"Aggregate Undetermined Barcode Stats (lane {lane_id})",
+                fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
+                params={"scenario": dict(lane_scenario)},
+                deps=list(uploads),
+                inputs=dict(lane_inputs),
+            ),
+        ]
     # End of the lane level: every lane is planned. What follows is
     # flowcell-wide again and does not depend on any lane.
 
