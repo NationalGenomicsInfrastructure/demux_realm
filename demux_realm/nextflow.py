@@ -43,7 +43,6 @@ _SETTINGS_KEYS = frozenset(
         "skip_tools",
         "executor",
         "sbatch_cpus",
-        "sbatch_mem",
         "sbatch_time",
         "sbatch_partition",
     }

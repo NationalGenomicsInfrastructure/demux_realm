@@ -104,12 +104,17 @@ def test_settings_overrides_for_hpc():
         {"sbatch_cpus": 0},
         {"sbatch_cpus": "4"},
         {"sbatch_cpus": True},
-        {"sbatch_mem": ""},
     ],
 )
 def test_settings_reject_invalid_config(raw):
     with pytest.raises(ValueError):
         settings_from_mapping({**REQUIRED_NEXTFLOW, **raw})
+
+
+def test_settings_reject_sbatch_mem():
+    # Not configurable: SLURM jobs always get the 4G default.
+    with pytest.raises(ValueError, match="unknown key"):
+        settings_from_mapping({**REQUIRED_NEXTFLOW, "sbatch_mem": "16G"})
 
 
 def test_settings_reject_non_object():
@@ -132,7 +137,6 @@ def test_settings_slurm_executor_overrides():
             **REQUIRED_NEXTFLOW,
             "executor": "slurm",
             "sbatch_cpus": 8,
-            "sbatch_mem": "16G",
             "sbatch_time": "8:00:00",
             "sbatch_partition": "comp",
         }
@@ -142,7 +146,7 @@ def test_settings_slurm_executor_overrides():
         s.sbatch_mem,
         s.sbatch_time,
         s.sbatch_partition,
-    ) == (8, "16G", "8:00:00", "comp")
+    ) == (8, "4G", "8:00:00", "comp")
 
 
 def test_realm_config_defaults_and_hpc_base_path():
