@@ -862,3 +862,29 @@ def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario):
     rows = store.doc["illumina"]["Demultiplex_Stats"]["Barcode_lane_statistics"]
     assert sorted(row["Sample"] for row in rows) == ["A", "B", "C"]
     assert store.doc["Undetermined"] == {"1": {"GGGG": 14}, "2": {"GGGG": 7}}
+
+
+@pytest.mark.parametrize(
+    ("settings_count", "undetermined_linked"), [(1, True), (2, False)]
+)
+def test_symlink_fastqs_links_undetermined_only_for_a_single_settings_run(
+    earlier_run, settings_count, undetermined_linked
+):
+    branch_results = earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
+    undetermined = branch_results / "Undetermined_S0_L001_R1_001.fastq.gz"
+    undetermined.touch()
+    scenario = {
+        **earlier_run.scenario,
+        "lane_id": "1",
+        "settings_index": "0",
+        "lane_settings_count": settings_count,
+    }
+
+    result = _symlink_fastqs(earlier_run.ctx, scenario)
+
+    links = {p.name for p in earlier_run.demux_dir.iterdir()}
+    assert "lane_1_settings_0_R1.fastq.gz" in links
+    assert (undetermined.name in links) is undetermined_linked
+    assert result.metrics["skipped_undetermined"] == (
+        [] if undetermined_linked else [str(undetermined)]
+    )

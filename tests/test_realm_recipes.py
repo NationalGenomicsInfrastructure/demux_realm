@@ -168,8 +168,11 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
         "nextflow": {"skip_tools": ["samshee"]},
     }
     assert steps[1].params == {"scenario": scenario, "samplesheet": Path(sheet)}
+    assert steps[4].params == {"scenario": {**scenario, "lane_settings_count": 1}}
     assert all(
-        s.params == {"scenario": scenario} for i, s in enumerate(steps) if i not in (1, 2)
+        s.params == {"scenario": scenario}
+        for i, s in enumerate(steps)
+        if i not in (1, 2, 4)
     )
     assert all(s.name.endswith("(lane 3, settings 1)") for s in steps)
 
@@ -255,3 +258,29 @@ def test_post_demux_aggregates_are_lane_steps():
         assert spec.inputs == {"lane_cleanup": "/work/artifacts/lane_1/cleanup.token"}
         assert spec.params["scenario"]["lane_id"] == "1"
         assert spec.params["scenario"]["settings_indices"] == ["0", "2"]
+
+
+def test_symlink_steps_know_how_many_settings_runs_their_lane_has():
+    plan = _plan(
+        branches=[
+            SamplesheetBranch("1", "0", 0, {"lane": 1}),
+            SamplesheetBranch("1", "2", 1, {"lane": 1}),
+            SamplesheetBranch("3", "1", 2, {"lane": 3}),
+        ],
+        run_options={
+            ("1", "0"): NextflowRunOptions(),
+            ("1", "2"): NextflowRunOptions(),
+            ("3", "1"): NextflowRunOptions(),
+        },
+    )
+
+    counts = {
+        s.step_id: s.params["scenario"]["lane_settings_count"]
+        for s in plan.steps
+        if s.step_id.endswith("__symlink_fastqs")
+    }
+    assert counts == {
+        "lane_1_settings_0__symlink_fastqs": 2,
+        "lane_1_settings_2__symlink_fastqs": 2,
+        "lane_3_settings_1__symlink_fastqs": 1,
+    }

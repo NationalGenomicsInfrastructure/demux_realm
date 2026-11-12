@@ -883,7 +883,12 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
-    """Symlinks fastq files from the branch's results directory to the common demux directory."""
+    """Symlinks fastq files from the branch's results directory to the common demux directory.
+
+    When the lane has several settings runs (scenario's lane_settings_count),
+    each run writes its own Undetermined FASTQs under the same file names, and
+    the links share one flat directory, so none of them is linked.
+    """
     settings = load_realm_config().nextflow
     tag = branch_run_tag(
         scenario["canonical_flowcell_id"],
@@ -898,6 +903,12 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
         )
     results_dir = outdir / scenario["canonical_flowcell_id"]
     fastqs = sorted(results_dir.rglob("*.fastq.gz"))
+    skipped = []
+    if scenario.get("lane_settings_count", 1) > 1:
+        skipped = [fq for fq in fastqs if fq.name.startswith("Undetermined")]
+        fastqs = [fq for fq in fastqs if fq not in skipped]
+        for fq in skipped:
+            logger.info("Not linking %s: the lane has several settings runs.", fq)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
     for fq in fastqs:
         symlink_path = (
@@ -917,6 +928,7 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
     return StepResult(
         metrics={
             "symlinked_fastq_count": len(fastqs),
+            "skipped_undetermined": [str(fq) for fq in skipped],
             "demux_dir": str(demux_dir),
         }
     )
