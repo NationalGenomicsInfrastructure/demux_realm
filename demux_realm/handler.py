@@ -17,6 +17,7 @@ from .recipes import (
     branch_namespace,
     build_demux_plan,
     clean_lane_step_id,
+    group_by_lane,
 )
 from .utils import group_samplesheet_branches, normalize_flowcell_id
 
@@ -318,6 +319,16 @@ class DemuxHandler(BaseHandler):
             artifact_base = ctx.scope_dir / "artifacts" / self._plan_id(canonical_fcid),
         )
         steps = {s.step_id: s for s in plan.steps}
+        lane_summaries = [
+            {
+                "lane_id": lane_id,
+                "lane_digest": steps[clean_lane_step_id(lane_id)].params["scenario"][
+                    "lane_digest"
+                ],
+                "settings_indices": [b.settings_index for b in lane_branches],
+            }
+            for lane_id, lane_branches in group_by_lane(branches).items()
+        ]
         branch_summaries = []
         for branch in branches:
             prefix = f"{branch_namespace(branch.lane_id, branch.settings_index)}__"
@@ -360,20 +371,7 @@ class DemuxHandler(BaseHandler):
                     ],
                     "branch_prerequisites": list(self.branch_prerequisites),
                     "metadata_required": UPSERT_X_FLOWCELL in self.branch_prerequisites,
-                    "lanes": [
-                        {
-                            "lane_id": lane_id,
-                            "lane_digest": steps[clean_lane_step_id(lane_id)].params[
-                                "scenario"
-                            ]["lane_digest"],
-                            "settings_indices": [
-                                b.settings_index
-                                for b in branches
-                                if b.lane_id == lane_id
-                            ],
-                        }
-                        for lane_id in dict.fromkeys(b.lane_id for b in branches)
-                    ],
+                    "lanes": lane_summaries,
                     "branches": branch_summaries,
                     "step_count": len(plan.steps),
                 },

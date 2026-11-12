@@ -47,7 +47,7 @@ def _digest(data: Any) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _group_by_lane(
+def group_by_lane(
     branches: Sequence[SamplesheetBranch],
 ) -> dict[str, list[SamplesheetBranch]]:
     """Group branches by lane, keeping the order lanes and branches come in."""
@@ -148,7 +148,7 @@ def build_demux_plan(
         ),
     ]
 
-    lanes = _group_by_lane(branches)
+    lanes = group_by_lane(branches)
     # Lane level: one clean_lane step, then the lane's branches, then the
     # lane's post-demux steps. Everything in this loop shares the lane's
     # cleanup token, so a cleanup re-runs the whole lane.
