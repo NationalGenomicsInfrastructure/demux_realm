@@ -66,6 +66,7 @@ LANE_1 = [
     )
 ]
 LANE_2 = [step_id.replace("lane_1_", "lane_2_") for step_id in LANE_1]
+CLEAN_1, CLEAN_2 = "lane_1__clean_lane", "lane_2__clean_lane"
 AGGREGATES = [AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS]
 
 
@@ -119,6 +120,15 @@ def ws(tmp_path, monkeypatch):
         handler_module,
         "load_realm_config",
         lambda: realm_config_from_mapping(None),
+    )
+    nextflow_dirs = {
+        "work_base": str(tmp_path / "nf-work"),
+        "outdir_base": str(tmp_path / "nf-results"),
+    }
+    monkeypatch.setattr(
+        realm_steps,
+        "load_realm_config",
+        lambda: realm_config_from_mapping({"nextflow": nextflow_dirs}),
     )
     monkeypatch.setenv("YGG_WORK_ROOT", str(tmp_path / "work"))
     monkeypatch.setenv("YGG_EVENT_SPOOL", str(tmp_path / "spool"))
@@ -236,6 +246,7 @@ def test_early_branch_failure_leaves_later_branch_running(ws, monkeypatch):
         VALIDATE_RUNFOLDER: SUCCEEDED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: SUCCEEDED,
+        **dict.fromkeys([CLEAN_1, CLEAN_2], SUCCEEDED),
         **failed_branch(LANE_1),
         **dict.fromkeys(LANE_2, SUCCEEDED),
         **dict.fromkeys(AGGREGATES, BLOCKED),
@@ -263,7 +274,7 @@ def test_validation_failure_blocks_metadata_and_every_branch(
         VALIDATE_RUNFOLDER: FAILED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: BLOCKED,
-        **dict.fromkeys(LANE_1 + LANE_2 + AGGREGATES, BLOCKED),
+        **dict.fromkeys([CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, *AGGREGATES], BLOCKED),
     }
     assert x_flowcells.saved == []
 
@@ -280,7 +291,7 @@ def test_metadata_failure_lets_independent_branches_finish(ws, x_flowcells):
         VALIDATE_RUNFOLDER: SUCCEEDED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: FAILED,
-        **dict.fromkeys(LANE_1 + LANE_2, SUCCEEDED),
+        **dict.fromkeys([CLEAN_1, CLEAN_2, *LANE_1, *LANE_2], SUCCEEDED),
         # The uploads write to the same unavailable database.
         LANE_1[5]: FAILED,
         LANE_2[5]: FAILED,
@@ -302,9 +313,9 @@ def test_required_metadata_failure_blocks_every_branch(ws, monkeypatch, x_flowce
         VALIDATE_RUNFOLDER: SUCCEEDED,
         SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: FAILED,
-        **dict.fromkeys(LANE_1 + LANE_2 + AGGREGATES, BLOCKED),
+        **dict.fromkeys([CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, *AGGREGATES], BLOCKED),
     }
-    assert report.direct_blockers[LANE_1[0]] == [UPSERT_X_FLOWCELL]
+    assert report.direct_blockers[CLEAN_1] == [UPSERT_X_FLOWCELL]
 
 
 def test_one_settings_branch_fails_while_its_sibling_continues(ws, monkeypatch):
@@ -368,6 +379,66 @@ def test_unchanged_rerun_reuses_and_missing_output_reruns_its_producer(ws):
         LANE_1[1]: SUCCEEDED,
     }
     assert lane_1_sheet.is_file()
+
+
+def _fastq_writing_demux(ws):
+    """Build an execute_demux stand-in that writes one FASTQ per sample."""
+
+    @step(name="execute_demux")
+    def fake_demux(ctx, scenario, samplesheet=None):
+        branch = f"lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
+        outdir = ws.root / "nf-results" / FCID / branch
+        outdir.mkdir(parents=True, exist_ok=True)
+        for row in scenario["samplesheet_payload"]["BCLConvert_Data"]:
+            (outdir / f"{row['Sample_ID']}.fastq.gz").touch()
+        return StepResult()
+
+    return fake_demux
+
+
+def test_settings_change_cleans_and_reruns_its_whole_lane_only(ws, monkeypatch):
+    monkeypatch.setattr(realm_steps, "execute_demux", _fastq_writing_demux(ws))
+    engine = engine_for(ws)
+    results = ws.root / "nf-results" / FCID
+    lane_1_s1 = [step_id.replace("settings_0", "settings_1") for step_id in LANE_1]
+    entries = [
+        lane_entry(1, settings_index=0),
+        lane_entry(1, settings_index=1, samples=["KEEP", "DROP"]),
+        lane_entry(2),
+    ]
+    engine.run(plan_for(ws, entries))
+    assert (results / "lane_1_settings_1" / "DROP.fastq.gz").is_file()
+    lane_2_fastq = results / "lane_2_settings_0" / "L2S0_1.fastq.gz"
+    lane_2_mtime = lane_2_fastq.stat().st_mtime_ns
+
+    # A sample is removed from one samplesheet of lane 1.
+    entries[1] = lane_entry(1, settings_index=1, samples=["KEEP"])
+    report = engine.run(plan_for(ws, entries))
+
+    assert report.outcome is ExecutionOutcome.SUCCEEDED
+    for step_id in [CLEAN_1, *LANE_1, *lane_1_s1]:
+        assert report.step_outcomes[step_id] is SUCCEEDED, step_id
+    for step_id in [CLEAN_2, *LANE_2]:
+        assert report.step_outcomes[step_id] is REUSED, step_id
+    assert sorted(p.name for p in (results / "lane_1_settings_1").iterdir()) == [
+        "KEEP.fastq.gz"
+    ]
+    assert (results / "lane_1_settings_0" / "L1S0_1.fastq.gz").is_file()
+    assert lane_2_fastq.stat().st_mtime_ns == lane_2_mtime
+
+
+def test_removed_settings_group_leaves_no_results_behind(ws, monkeypatch):
+    monkeypatch.setattr(realm_steps, "execute_demux", _fastq_writing_demux(ws))
+    engine = engine_for(ws)
+    results = ws.root / "nf-results" / FCID
+    two_groups = [lane_entry(1, settings_index=0), lane_entry(1, settings_index=1)]
+    engine.run(plan_for(ws, two_groups))
+    assert (results / "lane_1_settings_1").is_dir()
+
+    report = engine.run(plan_for(ws, two_groups[:1]))
+
+    assert report.step_outcomes[CLEAN_1] is SUCCEEDED
+    assert sorted(p.name for p in results.iterdir()) == ["lane_1_settings_0"]
 
 
 def test_runfolder_xml_change_reruns_only_the_metadata_update(ws, x_flowcells):
@@ -440,6 +511,7 @@ async def test_finished_failed_continuation_needs_a_new_run_request(ws, monkeypa
         VALIDATE_RUNFOLDER: REUSED,
         SETUP_COMMON_DEMUX_DIR: REUSED,
         UPSERT_X_FLOWCELL: REUSED,
+        **dict.fromkeys([CLEAN_1, CLEAN_2], REUSED),
         **failed_branch(LANE_1),
         LANE_1[0]: REUSED,
         LANE_1[1]: REUSED,

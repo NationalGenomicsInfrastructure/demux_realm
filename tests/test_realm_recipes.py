@@ -90,6 +90,10 @@ def test_shared_steps_declare_the_xml_the_metadata_step_reads():
     assert validate.outputs == upsert.outputs == {}
 
 
+def _step(plan, step_id):
+    return next(s for s in plan.steps if s.step_id == step_id)
+
+
 def _branch_steps(plan, namespace):
     return [s for s in plan.steps if s.step_id.startswith(f"{namespace}__")]
 
@@ -101,7 +105,7 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
         (
             "lane_3_settings_1__materialize_config",
             "demux_realm.steps.materialize_extra_config",
-            [VALIDATE_RUNFOLDER],
+            ["lane_3__clean_lane"],
         ),
         (
             "lane_3_settings_1__generate_samplesheet",
@@ -140,6 +144,9 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
     ]
     scenario = steps[0].params["scenario"]
     assert (scenario["lane_id"], scenario["settings_index"]) == ("3", "1")
+    assert scenario["lane_digest"] == _step(_plan(), "lane_3__clean_lane").params[
+        "scenario"
+    ]["lane_digest"]
     assert scenario["samplesheet_payload"] == {"lane": 3}
     assert scenario["demux_sample_info_doc"] == {"metadata": {"m": 1}}
     # Only execute_demux gets the sheet location and the per-run options.
@@ -159,11 +166,42 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
 
 def test_metadata_prerequisite_is_the_authors_choice():
     plan = _plan(prerequisites=(VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL))
-    first_steps = [s for s in plan.steps if s.step_id.endswith("__materialize_config")]
+    clean_steps = [s for s in plan.steps if s.step_id.endswith("__clean_lane")]
 
-    assert [s.deps for s in first_steps] == [
+    assert [s.deps for s in clean_steps] == [
         [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
     ] * 2
+
+
+def test_each_lane_starts_with_a_clean_lane_step():
+    plan = _plan()
+    clean = _step(plan, "lane_1__clean_lane")
+
+    assert clean.fn_ref == "demux_realm.steps.clean_lane"
+    assert clean.deps == [VALIDATE_RUNFOLDER]
+    assert clean.params["scenario"]["lane_id"] == "1"
+    step_ids = [s.step_id for s in plan.steps]
+    assert step_ids.index("lane_1__clean_lane") < step_ids.index(
+        "lane_1_settings_0__materialize_config"
+    )
+
+
+def test_lane_digest_follows_the_lanes_samplesheets_only():
+    def digests(branches):
+        plan = _plan(branches=branches)
+        return {
+            lane: _step(plan, f"lane_{lane}__clean_lane").params["scenario"][
+                "lane_digest"
+            ]
+            for lane in ("1", "3")
+        }
+
+    before = digests(_BRANCHES)
+    after = digests([_BRANCHES[0], SamplesheetBranch("3", "1", 0, {"lane": 3, "x": 1})])
+
+    assert before["1"] != before["3"]
+    assert after["1"] == before["1"]
+    assert after["3"] != before["3"]
 
 
 def test_branches_never_share_mutable_step_state():

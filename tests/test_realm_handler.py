@@ -47,8 +47,12 @@ def branch_ids(namespace: str) -> list[str]:
     return [f"{namespace}__{stage}" for stage in BRANCH_STAGES]
 
 
+def clean_lane_id(lane: str) -> str:
+    return f"lane_{lane}__clean_lane"
+
+
 def branch_step_ids(plan: Plan) -> list[str]:
-    return [s.step_id for s in plan.steps if s.step_id.startswith("lane_")]
+    return [s.step_id for s in plan.steps if "_settings_" in s.step_id]
 
 
 def branch_deps(ids: list[str], first: list[str]) -> dict[str, list[str]]:
@@ -149,6 +153,7 @@ async def test_single_lane_yields_one_plan(handler):
     lane_1 = branch_ids("lane_1_settings_0")
     assert [s.step_id for s in plan.steps] == [
         *SHARED_STEPS,
+        clean_lane_id("1"),
         *lane_1,
         *AGGREGATE_STEPS,
     ]
@@ -156,7 +161,8 @@ async def test_single_lane_yields_one_plan(handler):
         VALIDATE_RUNFOLDER: [],
         SETUP_COMMON_DEMUX_DIR: [],
         UPSERT_X_FLOWCELL: [VALIDATE_RUNFOLDER],
-        **branch_deps(lane_1, [VALIDATE_RUNFOLDER]),
+        clean_lane_id("1"): [VALIDATE_RUNFOLDER],
+        **branch_deps(lane_1, [clean_lane_id("1")]),
         AGGREGATE_ILLUMINA_STATS: [lane_1[-1]],
         AGGREGATE_UNDETERMINED_STATS: [lane_1[-1]],
     }
@@ -179,7 +185,11 @@ async def test_lanes_and_settings_become_independent_branches(handler):
 
     assert [s.step_id for s in plan.steps] == [
         *SHARED_STEPS,
-        *(step_id for ns in namespaces for step_id in branch_ids(ns)),
+        clean_lane_id("1"),
+        *branch_ids("lane_1_settings_0"),
+        clean_lane_id("2"),
+        *branch_ids("lane_2_settings_0"),
+        *branch_ids("lane_2_settings_1"),
         *AGGREGATE_STEPS,
     ]
     assert [s.fn_ref for s in plan.steps].count(
@@ -187,9 +197,12 @@ async def test_lanes_and_settings_become_independent_branches(handler):
     ) == 1
     deps = {s.step_id: s.deps for s in plan.steps}
     assert deps[UPSERT_X_FLOWCELL] == [VALIDATE_RUNFOLDER]
+    for lane in ("1", "2"):
+        assert deps[clean_lane_id(lane)] == [VALIDATE_RUNFOLDER]
     for ns in namespaces:
         ids = branch_ids(ns)
-        assert {i: deps[i] for i in ids} == branch_deps(ids, [VALIDATE_RUNFOLDER])
+        lane = ns.split("_")[1]
+        assert {i: deps[i] for i in ids} == branch_deps(ids, [clean_lane_id(lane)])
 
     assert draft.preview["metadata_required"] is False
     assert [
@@ -286,6 +299,31 @@ async def test_branch_payload_change_leaves_other_branches_unchanged(handler):
         assert before[step_id] == after[step_id]
     for step_id in branch_ids("lane_2_settings_0"):
         assert before[step_id]["params"] != after[step_id]["params"]
+
+
+@pytest.mark.asyncio
+async def test_settings_change_changes_every_step_of_its_lane(handler):
+    entries = [
+        lane_entry(1, settings_index=0),
+        lane_entry(1, settings_index=1),
+        lane_entry(2),
+    ]
+    changed = [*entries[:1], lane_entry(1, settings_index=1, samples=["NEW"]), entries[2]]
+    before = step_dicts((await plan_for(handler, entries)).plan)
+    after = step_dicts((await plan_for(handler, changed)).plan)
+
+    lane_1 = [
+        clean_lane_id("1"),
+        *branch_ids("lane_1_settings_0"),
+        *branch_ids("lane_1_settings_1"),
+    ]
+    for step_id in lane_1:
+        assert before[step_id]["params"] != after[step_id]["params"]
+    for step_id in [clean_lane_id("2"), *branch_ids("lane_2_settings_0")]:
+        assert before[step_id] == after[step_id]
+    digests = {after[i]["params"]["scenario"]["lane_digest"] for i in lane_1}
+    assert len(digests) == 1
+    assert digests != {after[clean_lane_id("2")]["params"]["scenario"]["lane_digest"]}
 
 
 @pytest.mark.asyncio
@@ -435,8 +473,8 @@ async def test_metadata_can_be_made_a_branch_prerequisite(handler, monkeypatch):
     draft = await plan_for(handler, [lane_entry(1), lane_entry(2)])
     deps = {s.step_id: s.deps for s in draft.plan.steps}
 
-    for ns in ("lane_1_settings_0", "lane_2_settings_0"):
-        assert deps[branch_ids(ns)[0]] == [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
+    for lane in ("1", "2"):
+        assert deps[clean_lane_id(lane)] == [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
     assert draft.preview["metadata_required"] is True
 
 

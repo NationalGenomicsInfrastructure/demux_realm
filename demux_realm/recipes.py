@@ -1,3 +1,5 @@
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -21,9 +23,35 @@ AGGREGATE_ILLUMINA_STATS = "aggregate_illumina_stats"
 AGGREGATE_UNDETERMINED_STATS = "aggregate_undetermined_stats"
 
 
+def lane_namespace(lane_id: str) -> str:
+    """Return the step-ID prefix of one lane's own steps, e.g. lane_2."""
+    return f"lane_{lane_id}"
+
+
 def branch_namespace(lane_id: str, settings_index: str) -> str:
     """Return the step-ID prefix of one lane/settings branch, e.g. lane_2_settings_0."""
     return f"lane_{lane_id}_settings_{settings_index}"
+
+
+def clean_lane_step_id(lane_id: str) -> str:
+    """Return the ID of the step that removes a lane's earlier results."""
+    return f"{lane_namespace(lane_id)}__clean_lane"
+
+
+def _digest(data: Any) -> str:
+    """Return a stable sha256 of JSON-serializable data."""
+    text = json.dumps(data, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _group_by_lane(
+    branches: Sequence[SamplesheetBranch],
+) -> dict[str, list[SamplesheetBranch]]:
+    """Group branches by lane, keeping the order lanes and branches come in."""
+    lanes: dict[str, list[SamplesheetBranch]] = {}
+    for branch in branches:
+        lanes.setdefault(branch.lane_id, []).append(branch)
+    return lanes
 
 
 def build_demux_plan(
@@ -43,10 +71,18 @@ def build_demux_plan(
 ) -> Plan:
     """Build the flowcell's demux plan from validated planning data.
 
-    Two shared steps come first: runfolder validation, then the x_flowcells
-    metadata update. Each lane/settings branch follows as a chain of five
-    steps whose first step depends on branch_prerequisites; include
-    UPSERT_X_FLOWCELL there to make branches wait for the metadata update.
+    Shared steps come first: runfolder validation, the common demux
+    directory and the x_flowcells metadata update. Each lane follows: a
+    clean_lane step that depends on branch_prerequisites (include
+    UPSERT_X_FLOWCELL there to make lanes wait for the metadata update), then
+    every lane/settings branch of the lane as a chain of steps whose first
+    step depends on the clean_lane step.
+
+    A lane is the smallest unit that is re-demultiplexed. The lane's steps
+    all carry the same lane_digest, a hash of everything its branches are
+    planned from, so a change to any branch of the lane changes the
+    fingerprint of every step in the lane: its earlier results are removed
+    and all of its branches re-run, while unchanged lanes are reused.
 
     Args:
         plan_id: The combined plan ID.
@@ -61,7 +97,8 @@ def build_demux_plan(
             keyed by (lane_id, settings_index); carried only by each
             branch's execute_demux step.
         branches: Validated branches, in plan order.
-        branch_prerequisites: Shared step IDs each branch's first step depends on.
+        branch_prerequisites: Shared step IDs each lane's clean_lane step
+            depends on.
 
     Returns:
         The complete plan, run under continue_independent.
@@ -107,74 +144,107 @@ def build_demux_plan(
         ),
     ]
 
-    for branch in branches:
-        ns = branch_namespace(branch.lane_id, branch.settings_index)
-        label = f"lane {branch.lane_id}, settings {branch.settings_index}"
-        scenario = {
-            **common,
-            "lane_id": branch.lane_id,
-            "settings_index": branch.settings_index,
-            "samplesheet_payload": branch.payload,
-            "demux_sample_info_doc": {"metadata": metadata},
-        }
-
-        samplesheet_path = Path(artifact_base / ns / "SampleSheet.csv")
-        run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
-        # Relative outputs resolve inside each producer's own work directory.
-        steps += [
+    for lane_id, lane_branches in _group_by_lane(branches).items():
+        lane_digest = _digest(
+            {
+                "metadata": metadata,
+                "branches": [
+                    {
+                        "settings_index": b.settings_index,
+                        "payload": b.payload,
+                        "nextflow": branch_run_options[
+                            (b.lane_id, b.settings_index)
+                        ].to_dict(),
+                    }
+                    for b in lane_branches
+                ],
+            }
+        )
+        clean_lane = clean_lane_step_id(lane_id)
+        steps.append(
             StepSpec(
-                step_id=f"{ns}__materialize_config",
-                name=f"Materialize Demux Config ({label})",
-                fn_ref=f"{_PREFIX}.materialize_extra_config",
-                params={"scenario": scenario},
-                deps=list(branch_prerequisites),
-                outputs={"demux_config": DEMUX_CONFIG_FILENAME},
-            ),
-            StepSpec(
-                step_id=f"{ns}__generate_samplesheet",
-                name=f"Generate SampleSheet.csv ({label})",
-                fn_ref=f"{_PREFIX}.generate_samplesheet",
-                params={"scenario": scenario, "samplesheet": samplesheet_path},
-                deps=[f"{ns}__materialize_config"],
-                outputs={"samplesheet": str(samplesheet_path)},
-            ),
-            StepSpec(
-                step_id=f"{ns}__execute_demux",
-                name=f"Execute Demux (nf-core/demultiplex) ({label})",
-                fn_ref=f"{_PREFIX}.execute_demux",
+                step_id=clean_lane,
+                name=f"Clean Earlier Demux Results (lane {lane_id})",
+                fn_ref=f"{_PREFIX}.clean_lane",
                 params={
                     "scenario": {
-                        **scenario,
-                        "samplesheet_path": samplesheet_path,
-                        "nextflow": run_options.to_dict(),
-                    },
-                    "samplesheet": samplesheet_path,
+                        **common,
+                        "lane_id": lane_id,
+                        "lane_digest": lane_digest,
+                    }
                 },
-                deps=[f"{ns}__generate_samplesheet"],
-                inputs={"samplesheet": str(samplesheet_path)},
-            ),
-            StepSpec(
-                step_id=f"{ns}__collect_results",
-                name=f"Collect Results and Artifacts ({label})",
-                fn_ref=f"{_PREFIX}.collect_results",
-                params={"scenario": scenario},
-                deps=[f"{ns}__execute_demux"],
-            ),
-            StepSpec(
-                step_id=f"{ns}__symlink_fastqs",
-                name=f"Symlink Fastqs ({label})",
-                fn_ref=f"{_PREFIX}.symlink_fastqs",
-                params={"scenario": scenario},
-                deps=[f"{ns}__execute_demux"],
-            ),
-            StepSpec(
-                step_id=f"{ns}__upload_results",
-                name=f"Upload/Simulate Upload Results ({label})",
-                fn_ref=f"{_PREFIX}.upload_results",
-                params={"scenario": scenario},
-                deps=[f"{ns}__collect_results"],
-            ),
-        ]
+                deps=list(branch_prerequisites),
+            )
+        )
+        for branch in lane_branches:
+            ns = branch_namespace(branch.lane_id, branch.settings_index)
+            label = f"lane {branch.lane_id}, settings {branch.settings_index}"
+            scenario = {
+                **common,
+                "lane_id": branch.lane_id,
+                "settings_index": branch.settings_index,
+                "lane_digest": lane_digest,
+                "samplesheet_payload": branch.payload,
+                "demux_sample_info_doc": {"metadata": metadata},
+            }
+
+            samplesheet_path = Path(artifact_base / ns / "SampleSheet.csv")
+            run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
+            # Relative outputs resolve inside each producer's own work directory.
+            steps += [
+                StepSpec(
+                    step_id=f"{ns}__materialize_config",
+                    name=f"Materialize Demux Config ({label})",
+                    fn_ref=f"{_PREFIX}.materialize_extra_config",
+                    params={"scenario": scenario},
+                    deps=[clean_lane],
+                    outputs={"demux_config": DEMUX_CONFIG_FILENAME},
+                ),
+                StepSpec(
+                    step_id=f"{ns}__generate_samplesheet",
+                    name=f"Generate SampleSheet.csv ({label})",
+                    fn_ref=f"{_PREFIX}.generate_samplesheet",
+                    params={"scenario": scenario, "samplesheet": samplesheet_path},
+                    deps=[f"{ns}__materialize_config"],
+                    outputs={"samplesheet": str(samplesheet_path)},
+                ),
+                StepSpec(
+                    step_id=f"{ns}__execute_demux",
+                    name=f"Execute Demux (nf-core/demultiplex) ({label})",
+                    fn_ref=f"{_PREFIX}.execute_demux",
+                    params={
+                        "scenario": {
+                            **scenario,
+                            "samplesheet_path": samplesheet_path,
+                            "nextflow": run_options.to_dict(),
+                        },
+                        "samplesheet": samplesheet_path,
+                    },
+                    deps=[f"{ns}__generate_samplesheet"],
+                    inputs={"samplesheet": str(samplesheet_path)},
+                ),
+                StepSpec(
+                    step_id=f"{ns}__collect_results",
+                    name=f"Collect Results and Artifacts ({label})",
+                    fn_ref=f"{_PREFIX}.collect_results",
+                    params={"scenario": scenario},
+                    deps=[f"{ns}__execute_demux"],
+                ),
+                StepSpec(
+                    step_id=f"{ns}__symlink_fastqs",
+                    name=f"Symlink Fastqs ({label})",
+                    fn_ref=f"{_PREFIX}.symlink_fastqs",
+                    params={"scenario": scenario},
+                    deps=[f"{ns}__execute_demux"],
+                ),
+                StepSpec(
+                    step_id=f"{ns}__upload_results",
+                    name=f"Upload/Simulate Upload Results ({label})",
+                    fn_ref=f"{_PREFIX}.upload_results",
+                    params={"scenario": scenario},
+                    deps=[f"{ns}__collect_results"],
+                ),
+            ]
 
     steps.append(
         StepSpec(
