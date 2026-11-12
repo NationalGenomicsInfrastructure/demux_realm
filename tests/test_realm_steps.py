@@ -1,3 +1,4 @@
+import os
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from demux_realm.steps import (
     clean_lane,
     collect_results,
     prune_stale_lanes,
+    symlink_fastqs,
     upload_results,
     upsert_x_flowcell_pre_demux,
     validate_runfolder,
@@ -28,6 +30,7 @@ _validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-define
 _aggregate_illumina_stats = aggregate_illumina_stats.__wrapped__  # type: ignore[attr-defined]
 _clean_lane = clean_lane.__wrapped__  # type: ignore[attr-defined]
 _prune_stale_lanes = prune_stale_lanes.__wrapped__  # type: ignore[attr-defined]
+_symlink_fastqs = symlink_fastqs.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -663,3 +666,28 @@ def test_prune_stale_lanes_keeps_every_planned_lane(earlier_run):
         "removed_fields": [],
     }
     earlier_run.client.save.assert_not_called()
+
+
+def test_symlink_fastqs_replaces_a_dangling_link(earlier_run):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+    fastq = (
+        earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
+        / "lane_1_settings_0_R1.fastq.gz"
+    )
+    link = earlier_run.demux_dir / fastq.name
+    link.unlink()
+    link.symlink_to(earlier_run.results / "gone" / fastq.name)
+
+    _symlink_fastqs(earlier_run.ctx, scenario)
+
+    assert link.resolve() == fastq.resolve()
+
+
+def test_symlink_fastqs_keeps_a_current_link(earlier_run):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+    link = earlier_run.demux_dir / "lane_1_settings_0_R1.fastq.gz"
+    before = os.readlink(link)
+
+    _symlink_fastqs(earlier_run.ctx, scenario)
+
+    assert os.readlink(link) == before

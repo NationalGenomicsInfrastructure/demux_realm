@@ -743,7 +743,12 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
         symlink_path = (
             demux_dir / fq.name
         )  # TODO: should be demux_dir / project / sample / fq.name
-        if not symlink_path.exists():
+        # is_symlink() also sees a dangling link, which exists() does not.
+        if symlink_path.is_symlink() and Path(os.readlink(symlink_path)) != fq:
+            # Left by an earlier run that clean_lane did not cover.
+            logger.warning("Replacing stale symlink %s", symlink_path)
+            symlink_path.unlink()
+        if not symlink_path.is_symlink() and not symlink_path.exists():
             symlink_path.symlink_to(fq)
             logger.info("Symlinked %s to %s", fq, symlink_path)
         else:
