@@ -112,8 +112,8 @@ that the flowcell has been transferred (`transferred_to_hpc` and
 The result must be absolute; a relative path would depend on the executing
 process's working directory, so the proposal is rejected instead.
 
-For a ready flowcell with `N` valid lane/settings combinations the handler
-returns one plan, run automatically, with `2 + 5N` steps:
+For a ready flowcell with `L` lanes and `N` valid lane/settings combinations
+the handler returns one plan, run automatically, with `6 + L + 6N` steps:
 
 | Field | Value |
 |---|---|
@@ -122,25 +122,52 @@ returns one plan, run automatically, with `2 + 5N` steps:
 | `failure_policy` | `continue_independent` |
 
 ```text
+setup_common_demux_dir
 validate_runfolder
 ├── upsert_x_flowcell_pre_demux
-├── lane_1_settings_0__materialize_config
-│   └── lane_1_settings_0__generate_samplesheet
-│       └── lane_1_settings_0__execute_demux
-│           └── lane_1_settings_0__collect_results
-│               └── lane_1_settings_0__upload_results
-└── lane_2_settings_0__materialize_config
-    └── ...
+├── lane_1__clean_lane
+│   ├── lane_1_settings_0__materialize_config
+│   │   └── lane_1_settings_0__generate_samplesheet
+│   │       └── lane_1_settings_0__execute_demux
+│   │           ├── lane_1_settings_0__symlink_fastqs
+│   │           └── lane_1_settings_0__collect_results
+│   │               └── lane_1_settings_0__upload_results
+│   └── lane_1_settings_1__materialize_config
+│       └── ...
+├── lane_2__clean_lane
+│   └── ...
+└── prune_stale_lanes
+
+aggregate_illumina_stats, aggregate_undetermined_stats
+    depend on prune_stale_lanes and every branch's upload_results
 ```
+
+**Lanes are re-demultiplexed whole.** A lane is the smallest unit that is
+re-demultiplexed, even when it holds several settings groups. Every step of a
+lane carries the same `lane_digest`, a hash of all of the lane's samplesheet
+entries, their Nextflow options and the `demux_sample_info` metadata. Changing
+any of the lane's samplesheets therefore changes the fingerprint of every step
+in the lane: `clean_lane` removes the lane's earlier results and all of its
+branches run again, while unchanged lanes are reused. `clean_lane` removes, for
+every settings index of the lane (including ones no longer planned), the
+Nextflow results and work directories, the links into those results in the
+runfolder's `Demultiplexing` directory, and the
+`Demultiplex_lane_<n>_settings_<i>` fields on the `x_flowcells` document.
+`prune_stale_lanes` does the same for lanes no longer in the samplesheets. The
+aggregate steps carry a digest of every lane digest, so they run again whenever
+any lane does. A retry after a failed branch re-runs only that branch: the
+lane's `clean_lane` step is reused, so successful siblings keep their results.
+To re-demultiplex a lane whose samplesheets did not change, remove its
+`lane_<n>__clean_lane` step directory under the plan's work root.
 
 Both triggers produce the same plan for the same source data. Dependencies alone
 decide execution order; steps run one at a time.
 
-**Metadata relationship.** The metadata update and each branch's first step
-depend only on `validate_runfolder`. If the metadata update fails, the branches
-still run, and the attempt ends failed. To make branches wait for it instead,
-add `upsert_x_flowcell_pre_demux` to `DemuxHandler.branch_prerequisites`: its
-failure then blocks every branch.
+**Metadata relationship.** The metadata update and each lane's `clean_lane`
+step depend only on `validate_runfolder`. If the metadata update fails, the
+branches still run, and the attempt ends failed. To make lanes wait for it
+instead, add `upsert_x_flowcell_pre_demux` to `DemuxHandler.branch_prerequisites`:
+its failure then blocks every lane.
 
 **Branch identity.** Every samplesheet entry needs a top-level `lane`: a
 non-negative integer or a string of digits (`1`, `"1"` and `"01"` are the same
@@ -202,8 +229,10 @@ a new generation.
 
 > **Warning: `x_flowcells` documents are replaced, not merged.** The metadata
 > update saves by `name` with `mode="upsert"`. When a matching document exists,
-> its whole body is replaced; only `_id` and `_rev` are kept, so fields written
-> by other processes (for example post-demux `Json_Stats`) are lost. Plan and
+> its whole body is replaced; only `_id`, `_rev` and the demux results (the
+> `Demultiplex_lane_<n>_settings_<i>`, `illumina` and `Undetermined` fields)
+> are kept, so other fields written by other processes (for example post-demux
+> `Json_Stats`) are lost. Plan and
 > step IDs changed with the single-plan layout, so the first combined run for a
 > flowcell repeats the metadata update and overwrites any existing document.
 > Test against a disposable `x_flowcells` destination. A field-preserving write
