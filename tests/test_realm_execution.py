@@ -13,7 +13,13 @@ from types import SimpleNamespace
 import pytest
 from demux_realm.config import realm_config_from_mapping
 from demux_realm.handler import DemuxHandler
-from demux_realm.recipes import UPSERT_X_FLOWCELL, VALIDATE_RUNFOLDER
+from demux_realm.recipes import (
+    AGGREGATE_ILLUMINA_STATS,
+    AGGREGATE_UNDETERMINED_STATS,
+    SETUP_COMMON_DEMUX_DIR,
+    UPSERT_X_FLOWCELL,
+    VALIDATE_RUNFOLDER,
+)
 from realm_support import (
     REALM_ID,
     RUN_INFO_XML_TEXT,
@@ -55,10 +61,25 @@ LANE_1 = [
         "generate_samplesheet",
         "execute_demux",
         "collect_results",
+        "symlink_fastqs",
         "upload_results",
     )
 ]
 LANE_2 = [step_id.replace("lane_1_", "lane_2_") for step_id in LANE_1]
+AGGREGATES = [AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS]
+
+
+def failed_branch(ids: list[str]) -> dict:
+    """Outcomes of a branch whose execute_demux failed."""
+    materialize, generate, execute, collect, symlink, upload = ids
+    return {
+        materialize: SUCCEEDED,
+        generate: SUCCEEDED,
+        execute: FAILED,
+        collect: BLOCKED,
+        symlink: BLOCKED,
+        upload: BLOCKED,
+    }
 
 
 class FakeXFlowcells:
@@ -122,7 +143,10 @@ async def draft_for(ws, samplesheets):
         FCID, destination_path=str(ws.incoming), runfolder_id=RUNFOLDER_ID
     )
     ctx = planning_ctx(
-        FCID, demux_doc=demux_sample_info_doc(samplesheets, FCID), fc_doc=fc_doc
+        FCID,
+        demux_doc=demux_sample_info_doc(samplesheets, FCID),
+        fc_doc=fc_doc,
+        scope_dir=ws.root / "scope",
     )
     (draft,) = await handler.generate_plan_drafts(
         {"source": "flowcell_status", "doc": fc_doc, "planning_ctx": ctx}
@@ -143,7 +167,7 @@ def _no_op_step(name: str):
     """Build a stand-in @step that does nothing but report success."""
 
     @step(name=name)
-    def no_op(ctx, scenario):
+    def no_op(ctx, scenario, samplesheet=None):
         return StepResult(metrics={f"{name}_stand_in": True})
 
     return no_op
@@ -159,9 +183,13 @@ def no_external_side_effects(monkeypatch):
     from the module and records its calls.
     """
     monkeypatch.setattr(realm_steps, "execute_demux", _no_op_step("execute_demux"))
-    monkeypatch.setattr(
-        realm_steps, "collect_results", _no_op_step("collect_results")
-    )
+    for name in (
+        "collect_results",
+        "symlink_fastqs",
+        "aggregate_illumina_stats",
+        "aggregate_undetermined_stats",
+    ):
+        monkeypatch.setattr(realm_steps, name, _no_op_step(name))
 
 
 def instrument(monkeypatch, name, calls, fail_when=None):
@@ -169,11 +197,11 @@ def instrument(monkeypatch, name, calls, fail_when=None):
     body = getattr(realm_steps, name).__wrapped__
 
     @step(name=name)
-    def instrumented(ctx, scenario):
+    def instrumented(ctx, scenario, **kwargs):
         calls.append((name, scenario.get("lane_id"), scenario.get("settings_index")))
         if fail_when is not None and fail_when(scenario):
             raise RuntimeError(f"planned failure in {name}")
-        return body(ctx, scenario)
+        return body(ctx, scenario, **kwargs)
 
     monkeypatch.setattr(realm_steps, name, instrumented)
 
@@ -206,16 +234,14 @@ def test_early_branch_failure_leaves_later_branch_running(ws, monkeypatch):
     assert report.outcome is ExecutionOutcome.FAILED
     assert report.step_outcomes == {
         VALIDATE_RUNFOLDER: SUCCEEDED,
+        SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: SUCCEEDED,
-        LANE_1[0]: SUCCEEDED,
-        LANE_1[1]: SUCCEEDED,
-        LANE_1[2]: FAILED,
-        LANE_1[3]: BLOCKED,
-        LANE_1[4]: BLOCKED,
+        **failed_branch(LANE_1),
         **dict.fromkeys(LANE_2, SUCCEEDED),
+        **dict.fromkeys(AGGREGATES, BLOCKED),
     }
     assert report.direct_blockers[LANE_1[3]] == [LANE_1[2]]
-    assert report.failed_ancestors[LANE_1[4]] == [LANE_1[2]]
+    assert report.failed_ancestors[LANE_1[5]] == [LANE_1[2]]
     # Lane 1 had already failed when lane 2 went on to its upload.
     assert calls == [
         ("execute_demux", "1", "0"),
@@ -235,8 +261,9 @@ def test_validation_failure_blocks_metadata_and_every_branch(
     assert report.outcome is ExecutionOutcome.FAILED
     assert report.step_outcomes == {
         VALIDATE_RUNFOLDER: FAILED,
+        SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: BLOCKED,
-        **dict.fromkeys(LANE_1 + LANE_2, BLOCKED),
+        **dict.fromkeys(LANE_1 + LANE_2 + AGGREGATES, BLOCKED),
     }
     assert x_flowcells.saved == []
 
@@ -251,8 +278,13 @@ def test_metadata_failure_lets_independent_branches_finish(ws, x_flowcells):
     assert report.outcome is ExecutionOutcome.FAILED
     assert report.step_outcomes == {
         VALIDATE_RUNFOLDER: SUCCEEDED,
+        SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: FAILED,
         **dict.fromkeys(LANE_1 + LANE_2, SUCCEEDED),
+        # The uploads write to the same unavailable database.
+        LANE_1[5]: FAILED,
+        LANE_2[5]: FAILED,
+        **dict.fromkeys(AGGREGATES, BLOCKED),
     }
 
 
@@ -268,8 +300,9 @@ def test_required_metadata_failure_blocks_every_branch(ws, monkeypatch, x_flowce
     assert report.outcome is ExecutionOutcome.FAILED
     assert report.step_outcomes == {
         VALIDATE_RUNFOLDER: SUCCEEDED,
+        SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
         UPSERT_X_FLOWCELL: FAILED,
-        **dict.fromkeys(LANE_1 + LANE_2, BLOCKED),
+        **dict.fromkeys(LANE_1 + LANE_2 + AGGREGATES, BLOCKED),
     }
     assert report.direct_blockers[LANE_1[0]] == [UPSERT_X_FLOWCELL]
 
@@ -290,14 +323,8 @@ def test_one_settings_branch_fails_while_its_sibling_continues(ws, monkeypatch):
     report = engine_for(ws).run(plan)
 
     settings_1 = [step_id.replace("settings_0", "settings_1") for step_id in LANE_1]
-    assert [report.step_outcomes[step_id] for step_id in LANE_1] == [
-        SUCCEEDED,
-        SUCCEEDED,
-        FAILED,
-        BLOCKED,
-        BLOCKED,
-    ]
-    assert [report.step_outcomes[step_id] for step_id in settings_1] == [SUCCEEDED] * 5
+    assert {i: report.step_outcomes[i] for i in LANE_1} == failed_branch(LANE_1)
+    assert [report.step_outcomes[i] for i in settings_1] == [SUCCEEDED] * len(LANE_1)
     assert [call for call in calls if call[0] == "validate_runfolder"] == [
         ("validate_runfolder", None, None)
     ]
@@ -322,7 +349,9 @@ def test_unchanged_rerun_reuses_and_missing_output_reruns_its_producer(ws):
         assert artifacts.get(spec.step_id, {}) == {
             key: str(path) for key, path in declared.items()
         }
-    lane_1_sheet = plan_dir / LANE_1[1] / "SampleSheet.csv"
+    lane_1_sheet = Path(
+        next(s for s in plan.steps if s.step_id == LANE_1[1]).outputs["samplesheet"]
+    )
     assert "L1S0_1" in lane_1_sheet.read_text()
     assert "L2S0_1" not in lane_1_sheet.read_text()
 
@@ -357,7 +386,9 @@ def test_runfolder_xml_change_reruns_only_the_metadata_update(ws, x_flowcells):
         **dict.fromkeys((spec.step_id for spec in plan.steps), REUSED),
         UPSERT_X_FLOWCELL: SUCCEEDED,
     }
-    (first_doc, first_kwargs), (second_doc, _) = x_flowcells.saved
+    (first_doc, first_kwargs), (second_doc, _) = [
+        (doc, kwargs) for doc, kwargs in x_flowcells.saved if "RunParameters" in doc
+    ]
     assert first_kwargs == {
         "selector": {"name": {"$eq": "20260312_ASC2177698-SC3"}},
         "mode": "upsert",
@@ -407,12 +438,12 @@ async def test_finished_failed_continuation_needs_a_new_run_request(ws, monkeypa
     assert rerun.status is ExecutionStatus.FINALIZED
     assert rerun.report.step_outcomes == {
         VALIDATE_RUNFOLDER: REUSED,
+        SETUP_COMMON_DEMUX_DIR: REUSED,
         UPSERT_X_FLOWCELL: REUSED,
+        **failed_branch(LANE_1),
         LANE_1[0]: REUSED,
         LANE_1[1]: REUSED,
-        LANE_1[2]: FAILED,
-        LANE_1[3]: BLOCKED,
-        LANE_1[4]: BLOCKED,
         **dict.fromkeys(LANE_2, REUSED),
+        **dict.fromkeys(AGGREGATES, BLOCKED),
     }
     assert storage.plans.fetch_plan(doc_id)["executed_run_token"] == 1

@@ -3,6 +3,7 @@ from pathlib import Path
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY
 
 from demux_realm.recipes import (
+    SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
     branch_namespace,
@@ -73,12 +74,13 @@ def test_branch_run_options_are_carried_per_branch():
 
 def test_shared_steps_declare_the_xml_the_metadata_step_reads():
     plan = _plan()
-    validate, upsert = plan.steps[:2]
+    validate, setup, upsert = plan.steps[:3]
 
     assert plan.plan_id == "dmx_realm:SC123:demux"
     assert plan.scope == {"kind": "flowcell", "id": "SC123"}
     assert plan.failure_policy == CONTINUE_INDEPENDENT_POLICY
     assert (validate.step_id, validate.deps) == (VALIDATE_RUNFOLDER, [])
+    assert (setup.step_id, setup.deps) == (SETUP_COMMON_DEMUX_DIR, [])
     assert (upsert.step_id, upsert.deps) == (UPSERT_X_FLOWCELL, [VALIDATE_RUNFOLDER])
     assert upsert.params["scenario"]["samplesheets"] == [{"lane": 3}, {"lane": 1}]
     assert upsert.inputs == {
@@ -88,8 +90,12 @@ def test_shared_steps_declare_the_xml_the_metadata_step_reads():
     assert validate.outputs == upsert.outputs == {}
 
 
-def test_each_branch_is_a_chain_of_five_namespaced_steps():
-    steps = _plan().steps[7:]
+def _branch_steps(plan, namespace):
+    return [s for s in plan.steps if s.step_id.startswith(f"{namespace}__")]
+
+
+def test_each_branch_is_a_chain_of_namespaced_steps():
+    steps = _branch_steps(_plan(), "lane_3_settings_1")
 
     assert [(s.step_id, s.fn_ref, s.deps) for s in steps] == [
         (
@@ -113,14 +119,21 @@ def test_each_branch_is_a_chain_of_five_namespaced_steps():
             ["lane_3_settings_1__execute_demux"],
         ),
         (
+            "lane_3_settings_1__symlink_fastqs",
+            "demux_realm.steps.symlink_fastqs",
+            ["lane_3_settings_1__execute_demux"],
+        ),
+        (
             "lane_3_settings_1__upload_results",
             "demux_realm.steps.upload_results",
             ["lane_3_settings_1__collect_results"],
         ),
     ]
+    sheet = "/work/artifacts/lane_3_settings_1/SampleSheet.csv"
     assert [s.outputs for s in steps] == [
         {"demux_config": "extra_config_demultiplex.config"},
-        {"samplesheet": "SampleSheet.csv"},
+        {"samplesheet": sheet},
+        {},
         {},
         {},
         {},
@@ -133,13 +146,14 @@ def test_each_branch_is_a_chain_of_five_namespaced_steps():
     execute = steps[2].params["scenario"]
     assert execute == {
         **scenario,
-        "samplesheet_path": "lane_3_settings_1__generate_samplesheet/SampleSheet.csv",
+        "samplesheet_path": Path(sheet),
         "nextflow": {"skip_tools": ["samshee"]},
     }
-    assert steps[2].inputs == {
-        "samplesheet": "lane_3_settings_1__generate_samplesheet/SampleSheet.csv"
-    }
-    assert all(s.params == {"scenario": scenario} for i, s in enumerate(steps) if i != 2)
+    assert steps[2].inputs == {"samplesheet": sheet}
+    assert steps[1].params == {"scenario": scenario, "samplesheet": Path(sheet)}
+    assert all(
+        s.params == {"scenario": scenario} for i, s in enumerate(steps) if i not in (1, 2)
+    )
     assert all(s.name.endswith("(lane 3, settings 1)") for s in steps)
 
 
@@ -153,8 +167,9 @@ def test_metadata_prerequisite_is_the_authors_choice():
 
 
 def test_branches_never_share_mutable_step_state():
-    steps = _plan().steps
-    first, second = steps[2:7], steps[7:]
+    plan = _plan()
+    first = _branch_steps(plan, "lane_1_settings_0")
+    second = _branch_steps(plan, "lane_3_settings_1")
 
     for attribute in ("outputs", "deps"):
         assert not {id(getattr(s, attribute)) for s in first} & {
