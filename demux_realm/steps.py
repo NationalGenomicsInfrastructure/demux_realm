@@ -97,6 +97,18 @@ def _find_x_flowcell(client: Any, name: str) -> dict[str, Any] | None:
     return existing
 
 
+def _clean_x_flowcell(client: Any, doc: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of doc without CouchDB's _id and _rev, ready to save back.
+
+    DataAccess.save() manages those itself through the selector (fetching the
+    current _rev and retrying on a 409 conflict), so callers only strip them;
+    they never resolve conflicts.
+    """
+    if hasattr(client, "clean_doc"):
+        return client.clean_doc(doc)
+    return {k: v for k, v in doc.items() if k not in ("_id", "_rev")}
+
+
 def _lane_key(lane_id: object) -> str:
     """Return a lane's key in the reports field, e.g. lane_1."""
     return f"lane_{lane_id}"
@@ -972,14 +984,7 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
 
     lane_id, settings_index = scenario["lane_id"], scenario["settings_index"]
     branch_entry = f"{_lane_key(lane_id)}/{_settings_key(settings_index)}"
-    # existing may carry CouchDB's own _id/_rev; DataAccess.save() manages
-    # those internally via the selector (fetching the current _rev and
-    # retrying on a 409 conflict itself), so the caller's job is only to
-    # strip them before passing the body back in — never to resolve conflicts.
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    updated_doc = _clean_x_flowcell(client, existing)
     updated_doc["demux_realm_bclconvert_reports"] = _with_branch_report(
         updated_doc, lane_id, settings_index, metadata
     )
@@ -1033,10 +1038,7 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
 
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    updated_doc = _clean_x_flowcell(client, existing)
     superseded = _drop_superseded_reports(updated_doc, scenario)
 
     demux_stats_rows: list[dict[str, str]] = []
@@ -1103,10 +1105,7 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
 
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    updated_doc = _clean_x_flowcell(client, existing)
     superseded = _drop_superseded_reports(updated_doc, scenario)
 
     top_unknown_rows: list[dict[str, str]] = []
