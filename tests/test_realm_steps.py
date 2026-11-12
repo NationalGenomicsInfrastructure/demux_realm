@@ -600,32 +600,28 @@ def test_clean_lane_removes_only_that_lanes_results(earlier_run):
 
     flowcell_results = earlier_run.results / _FCID
     assert sorted(p.name for p in flowcell_results.iterdir()) == ["lane_2_settings_0"]
-    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == [
-        "lane_2_settings_0"
-    ]
     assert sorted(p.name for p in earlier_run.demux_dir.iterdir()) == [
         "lane_2_settings_0_R1.fastq.gz",
         "unrelated.txt",
     ]
-    saved = earlier_run.client.save.call_args.args[0]
-    assert sorted(saved) == ["Demultiplex_lane_2_settings_0", "illumina", "name"]
-    assert result.metrics["removed_fields"] == [
-        "Demultiplex_lane_1_settings_0",
-        "Demultiplex_lane_1_settings_1",
-    ]
     assert len(result.metrics["removed_symlinks"]) == 3
-    assert len(result.metrics["removed_dirs"]) == 5
+    assert len(result.metrics["removed_dirs"]) == 3
+
+
+def test_clean_lane_keeps_work_dirs_and_x_flowcells(earlier_run):
+    _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "1"})
+
+    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == list(
+        _BRANCHES
+    )
+    earlier_run.ctx.data.connection.assert_not_called()
 
 
 def test_clean_lane_without_earlier_results_does_nothing(earlier_run):
-    earlier_run.client.find_one.return_value = None
-
     result = _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "3"})
 
     assert result.metrics["removed_dirs"] == []
     assert result.metrics["removed_symlinks"] == []
-    assert result.metrics["removed_fields"] == []
-    earlier_run.client.save.assert_not_called()
 
 
 @pytest.mark.parametrize("fcid", ["", "..", "a/b"])
@@ -648,11 +644,12 @@ def test_prune_stale_lanes_removes_lanes_outside_the_plan(earlier_run):
         "lane_1_settings_1",
         "lane_1_settings_7",
     ]
-    assert not (earlier_run.work / _FCID / "lane_2_settings_0").exists()
     assert "lane_2_settings_0_R1.fastq.gz" not in {
         p.name for p in earlier_run.demux_dir.iterdir()
     }
-    assert result.metrics["removed_fields"] == ["Demultiplex_lane_2_settings_0"]
+    assert result.metrics["removed_dirs"] == [
+        str(earlier_run.results / _FCID / "lane_2_settings_0")
+    ]
 
 
 def test_prune_stale_lanes_keeps_every_planned_lane(earlier_run):
@@ -660,12 +657,7 @@ def test_prune_stale_lanes_keeps_every_planned_lane(earlier_run):
         earlier_run.ctx, {**earlier_run.scenario, "lanes": ["1", "2"]}
     )
 
-    assert result.metrics == {
-        "removed_dirs": [],
-        "removed_symlinks": [],
-        "removed_fields": [],
-    }
-    earlier_run.client.save.assert_not_called()
+    assert result.metrics == {"removed_dirs": [], "removed_symlinks": []}
 
 
 def test_symlink_fastqs_replaces_a_dangling_link(earlier_run):

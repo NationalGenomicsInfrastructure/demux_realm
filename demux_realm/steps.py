@@ -154,47 +154,21 @@ def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
     return removed
 
 
-def _remove_branch_fields(
-    ctx: StepContext, runfolder_id: str, drop_lane: Callable[[str], bool]
-) -> list[str]:
-    """Remove the branch fields of the selected lanes from the x_flowcells document.
-
-    A missing document is left alone: there is nothing to clean up yet.
-    """
-    if ctx.data is None:
-        raise RuntimeError("StepContext.data (DataAccess) was not injected.")
-    name = derive_xflowcell_name(runfolder_id)
-    client = ctx.data.connection("x_flowcells_db")
-    existing = _find_x_flowcell(client, name)
-    if existing is None:
-        return []
-    removed = sorted(
-        key
-        for key in existing
-        if (match := _BRANCH_FIELD_LANE_RE.match(key)) and drop_lane(match["lane"])
-    )
-    if not removed:
-        return []
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
-    for key in removed:
-        del updated_doc[key]
-    client.save(updated_doc, selector={"name": {"$eq": name}}, mode="upsert")
-    return removed
-
-
-def _remove_branches(
-    ctx: StepContext, scenario: dict, drop_lane: Callable[[str], bool]
+def _remove_branch_results(
+    scenario: dict, drop_lane: Callable[[str], bool]
 ) -> dict[str, Any]:
-    """Remove every trace of the selected lanes' branches from earlier runs.
+    """Remove the selected lanes' demultiplexing results from earlier runs.
 
-    That is: the links in the runfolder's Demultiplexing directory that point
-    into their results, their Nextflow results and work directories, and their
-    branch fields on the x_flowcells document. Settings indices that are no
-    longer planned are matched too, since directories and fields are selected
-    by lane only.
+    That is: their Nextflow results directories and the links in the
+    runfolder's Demultiplexing directory that point into them. Settings
+    indices that are no longer planned are matched too, since directories are
+    selected by lane only.
+
+    Two things are deliberately kept. The Nextflow work directories stay, so
+    -resume can reuse the tasks whose inputs did not change. The x_flowcells
+    document stays too, so operators keep seeing the earlier results while
+    the lane is re-demultiplexed; the lane's own steps overwrite them when
+    they finish.
 
     Returns:
         Metrics listing what was removed.
@@ -202,18 +176,15 @@ def _remove_branches(
     settings = load_realm_config().nextflow
     fcid = scenario["canonical_flowcell_id"]
     outdirs = _branch_dirs(settings.outdir_base, fcid, drop_lane)
-    work_dirs = _branch_dirs(settings.work_base, fcid, drop_lane)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
 
     links = _remove_branch_symlinks(demux_dir, outdirs)
-    for path in [*outdirs, *work_dirs]:
+    for path in outdirs:
         shutil.rmtree(path)
         logger.info("Removed %s.", path)
-    fields = _remove_branch_fields(ctx, scenario["runfolder_id"], drop_lane)
     return {
-        "removed_dirs": [str(path) for path in [*outdirs, *work_dirs]],
+        "removed_dirs": [str(path) for path in outdirs],
         "removed_symlinks": links,
-        "removed_fields": fields,
     }
 
 
@@ -458,11 +429,11 @@ def clean_lane(ctx: StepContext, scenario: dict) -> StepResult:
     lane depends on this step, and the plan gives this step and those
     branches the same lane digest, so any change in the lane re-runs this
     cleanup and then all of the lane's branches. Without the cleanup, a sample
-    removed from a samplesheet would keep its FASTQ files, links and stats
-    from the earlier run.
+    removed from a samplesheet would keep its FASTQ files and links from the
+    earlier run. See _remove_branch_results for what is kept.
     """
     lane_id = str(scenario["lane_id"])
-    metrics = _remove_branches(ctx, scenario, lambda lane: lane == lane_id)
+    metrics = _remove_branch_results(scenario, lambda lane: lane == lane_id)
     logger.info("Cleaned lane %s: %s", lane_id, metrics)
     return StepResult(metrics={"lane_id": lane_id, **metrics})
 
@@ -473,11 +444,11 @@ def prune_stale_lanes(ctx: StepContext, scenario: dict) -> StepResult:
 
     clean_lane covers only the lanes in the plan; this covers a lane removed
     from the samplesheets altogether, whose results would otherwise stay on
-    disk and in the aggregated stats. Its params hold the planned lanes, so it
-    re-runs whenever that set changes.
+    disk. Its params hold the planned lanes, so it re-runs whenever that set
+    changes.
     """
     planned = {str(lane) for lane in scenario["lanes"]}
-    metrics = _remove_branches(ctx, scenario, lambda lane: lane not in planned)
+    metrics = _remove_branch_results(scenario, lambda lane: lane not in planned)
     logger.info("Pruned lanes outside %s: %s", sorted(planned), metrics)
     return StepResult(metrics=metrics)
 
