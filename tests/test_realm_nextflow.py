@@ -27,6 +27,8 @@ from demux_realm.nextflow import (
 )
 from demux_realm.steps import SAMPLESHEET
 
+from realm_support import REQUIRED_NEXTFLOW
+
 SAMSHEE = NextflowRunOptions(skip_tools=("samshee",))
 NO_OPTIONS = NextflowRunOptions()
 
@@ -49,11 +51,24 @@ def make_settings(**overrides) -> NextflowSettings:
 # ---------------------------------------------------------------------------
 
 
-def test_settings_defaults_target_local_dind_stack():
-    s = settings_from_mapping(None)
+def test_settings_defaults_for_optional_keys():
+    s = settings_from_mapping(REQUIRED_NEXTFLOW)
     assert s == make_settings()
-    assert s == settings_from_mapping({})
     assert s.skip_tools == ()
+    assert s.executor == "local"
+
+
+@pytest.mark.parametrize("missing", ["profile", "work_base", "outdir_base"])
+def test_settings_require_deployment_keys(missing):
+    raw = {k: v for k, v in REQUIRED_NEXTFLOW.items() if k != missing}
+    with pytest.raises(ValueError, match=f"nextflow.{missing} is required"):
+        settings_from_mapping(raw)
+
+
+@pytest.mark.parametrize("raw", [None, {}])
+def test_settings_reject_empty_config(raw):
+    with pytest.raises(ValueError):
+        settings_from_mapping(raw)
 
 
 def test_settings_overrides_for_hpc():
@@ -90,16 +105,20 @@ def test_settings_overrides_for_hpc():
         {"sbatch_cpus": "4"},
         {"sbatch_cpus": True},
         {"sbatch_mem": ""},
-        ["not", "an", "object"],
     ],
 )
 def test_settings_reject_invalid_config(raw):
     with pytest.raises(ValueError):
-        settings_from_mapping(raw)
+        settings_from_mapping({**REQUIRED_NEXTFLOW, **raw})
+
+
+def test_settings_reject_non_object():
+    with pytest.raises(ValueError):
+        settings_from_mapping(["not", "an", "object"])
 
 
 def test_settings_slurm_executor_defaults():
-    s = settings_from_mapping({"executor": "slurm"})
+    s = settings_from_mapping({**REQUIRED_NEXTFLOW, "executor": "slurm"})
     assert s.executor == "slurm"
     assert s.sbatch_cpus == 4
     assert s.sbatch_mem == "4G"
@@ -110,6 +129,7 @@ def test_settings_slurm_executor_defaults():
 def test_settings_slurm_executor_overrides():
     s = settings_from_mapping(
         {
+            **REQUIRED_NEXTFLOW,
             "executor": "slurm",
             "sbatch_cpus": 8,
             "sbatch_mem": "16G",
@@ -126,11 +146,13 @@ def test_settings_slurm_executor_overrides():
 
 
 def test_realm_config_defaults_and_hpc_base_path():
-    assert realm_config_from_mapping(None) == RealmConfig(
+    assert realm_config_from_mapping({"nextflow": REQUIRED_NEXTFLOW}) == RealmConfig(
         hpc_base_path="", nextflow=make_settings()
     )
+    with pytest.raises(ValueError):
+        realm_config_from_mapping(None)
     cfg = realm_config_from_mapping(
-        {"hpc_base_path": "/work", "nextflow": {"profile": "slurm"}}
+        {"hpc_base_path": "/work", "nextflow": {**REQUIRED_NEXTFLOW, "profile": "slurm"}}
     )
     assert cfg.hpc_base_path == "/work"
     assert cfg.nextflow.profile == "slurm"
@@ -355,10 +377,9 @@ def test_batch_script_wraps_command_with_directives():
     # All job output goes to the shared-volume log the step tails.
     assert "#SBATCH --output=/work/plan/logs/run.log" in lines
     assert "#SBATCH --error=/work/plan/logs/run.log" in lines
-    # Node-side environment (shared NXF_HOME, DinD daemon, Nextflow on PATH).
-    assert 'export NXF_HOME="${NXF_HOME:-/work/nf-nxf}"' in lines
-    assert 'export DOCKER_HOST="${DOCKER_HOST:-tcp://dind:2375}"' in lines
-    assert 'export PATH="/opt/nextflow:${PATH}"' in lines
+    # The node environment is the deployment's business: no setup here.
+    assert "docker" not in script.lower()
+    assert not any(line.startswith("export ") for line in lines)
     # The argv is shlex-quoted, so a path with a space survives the node shell.
     assert lines[-1] == "nextflow run nf-core/demultiplex --flowcell_path '/a b/c'"
 
@@ -428,6 +449,7 @@ def use_config(monkeypatch, tmp_path: Path, **nextflow) -> NextflowSettings:
     config = realm_config_from_mapping(
         {
             "nextflow": {
+                "profile": "docker",
                 "work_base": str(tmp_path / "nf-work"),
                 "outdir_base": str(tmp_path / "nf-results"),
                 **nextflow,

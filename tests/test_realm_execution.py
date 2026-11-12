@@ -16,6 +16,7 @@ from demux_realm.handler import DemuxHandler
 from demux_realm.recipes import UPSERT_X_FLOWCELL, VALIDATE_RUNFOLDER
 from realm_support import (
     REALM_ID,
+    REQUIRED_NEXTFLOW,
     RUN_INFO_XML_TEXT,
     RUN_PARAMETERS_XML_TEXT,
     demux_sample_info_doc,
@@ -97,7 +98,7 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.setattr(
         handler_module,
         "load_realm_config",
-        lambda: realm_config_from_mapping(None),
+        lambda: realm_config_from_mapping({"nextflow": REQUIRED_NEXTFLOW}),
     )
     monkeypatch.setenv("YGG_WORK_ROOT", str(tmp_path / "work"))
     monkeypatch.setenv("YGG_EVENT_SPOOL", str(tmp_path / "spool"))

@@ -261,8 +261,8 @@ def _execute_on_slurm(
 
     The batch script is written to the step's work directory (on the shared
     work volume) and submitted with sbatch via the Yggdrasil toolkit's
-    SlurmJobManager; the job runs on the SLURM node (deploy/Dockerfile.slurmd
-    provides Nextflow there). The step blocks until the job reaches a
+    SlurmJobManager; the job runs on the SLURM node, whose environment
+    provides Nextflow. The step blocks until the job reaches a
     terminal state, so a failed run fails this step exactly like the local
     path does.
     """
@@ -293,8 +293,8 @@ def _execute_on_slurm(
             return None, None
         # One loop for submit + wait: the mock backend completes its jobs on
         # the loop that submitted them (see step_slurm_job in test_realm).
-        # The explicit poll interval keeps this step snappy in the compose
-        # stack, where main.json sets job_monitor_poll_interval high.
+        # The explicit poll interval keeps this step snappy even where
+        # main.json sets job_monitor_poll_interval high.
         final_state = await manager.wait_for_completion(job_id, poll_interval=5.0)
         return job_id, final_state
 
