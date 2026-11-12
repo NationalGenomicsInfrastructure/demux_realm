@@ -799,15 +799,7 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
         )
 
     client = ctx.data.connection("x_flowcells_db")
-    existing: dict[str, Any] | None = None
-    if hasattr(client, "find_one"):
-        existing = client.find_one({"name": {"$eq": name}})
-    elif hasattr(client, "get"):
-        existing = client.get(name)
-    if existing is None:
-        existing = {"name": name}
-    elif not isinstance(existing, dict):
-        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+    existing = _find_x_flowcell(client, name) or {"name": name}
 
     branch_field = (
         f"Demultiplex_lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
@@ -865,18 +857,12 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     name = derive_xflowcell_name(runfolder_id)
     client = ctx.data.connection("x_flowcells_db")
 
-    existing: dict[str, Any] | None = None
-    if hasattr(client, "find_one"):
-        existing = client.find_one({"name": {"$eq": name}})
-    elif hasattr(client, "get"):
-        existing = client.get(name)
+    existing = _find_x_flowcell(client, name)
     if existing is None:
         raise PermanentStepError(
             f"x_flowcells document '{name}' not found.",
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
-    if not isinstance(existing, dict):
-        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
 
     if hasattr(client, "clean_doc"):
         updated_doc = client.clean_doc(existing)
@@ -943,18 +929,12 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     name = derive_xflowcell_name(runfolder_id)
     client = ctx.data.connection("x_flowcells_db")
 
-    existing: dict[str, Any] | None = None
-    if hasattr(client, "find_one"):
-        existing = client.find_one({"name": {"$eq": name}})
-    elif hasattr(client, "get"):
-        existing = client.get(name)
+    existing = _find_x_flowcell(client, name)
     if existing is None:
         raise PermanentStepError(
             f"x_flowcells document '{name}' not found.",
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
-    if not isinstance(existing, dict):
-        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
 
     if hasattr(client, "clean_doc"):
         updated_doc = client.clean_doc(existing)
