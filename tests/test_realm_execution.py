@@ -6,6 +6,7 @@ step for another @step function, never through plan parameters.
 """
 
 import asyncio
+import copy
 import json
 import shutil
 from pathlib import Path
@@ -67,7 +68,10 @@ LANE_1 = [
 ]
 LANE_2 = [step_id.replace("lane_1_", "lane_2_") for step_id in LANE_1]
 CLEAN_1, CLEAN_2 = "lane_1__clean_lane", "lane_2__clean_lane"
-AGGREGATES_1 = ["lane_1__aggregate_illumina_stats", "lane_1__aggregate_undetermined_stats"]
+AGGREGATES_1 = [
+    "lane_1__aggregate_illumina_stats",
+    "lane_1__aggregate_undetermined_stats",
+]
 AGGREGATES_2 = [step_id.replace("lane_1_", "lane_2_") for step_id in AGGREGATES_1]
 AGGREGATES = AGGREGATES_1 + AGGREGATES_2
 
@@ -183,6 +187,46 @@ def _no_op_step(name: str):
         return StepResult(metrics={f"{name}_stand_in": True})
 
     return no_op
+
+
+_REAL_AGGREGATES = {
+    name: getattr(realm_steps, name)
+    for name in ("aggregate_illumina_stats", "aggregate_undetermined_stats")
+}
+
+
+class StoredXFlowcells:
+    """x_flowcells client backed by one stored document, copied on every
+    read and save as a real database would."""
+
+    def __init__(self) -> None:
+        self.doc: dict | None = None
+
+    def find_one(self, selector):
+        return copy.deepcopy(self.doc)
+
+    def save(self, doc: dict, **kwargs) -> SimpleNamespace:
+        self.doc = copy.deepcopy(doc)
+        return SimpleNamespace(status="updated", doc_id="xfc-1")
+
+
+@pytest.fixture
+def stored_x_flowcells(monkeypatch):
+    """Run the real uploads and aggregates against one stored document."""
+    client = StoredXFlowcells()
+
+    class StoredDataAccess:
+        def __init__(self, realm_id, phase, cfg=None, trace_context=None):
+            pass
+
+        def connection(self, name):
+            assert name == "x_flowcells_db"
+            return client
+
+    monkeypatch.setattr(engine_module, "DataAccess", StoredDataAccess)
+    for name, real in _REAL_AGGREGATES.items():
+        monkeypatch.setattr(realm_steps, name, real)
+    return client
 
 
 @pytest.fixture(autouse=True)
@@ -392,15 +436,36 @@ def test_unchanged_rerun_reuses_and_missing_output_reruns_its_producer(ws):
 
 
 def _fastq_writing_demux(ws):
-    """Build an execute_demux stand-in that writes one FASTQ per sample."""
+    """Build an execute_demux stand-in that writes one FASTQ per sample.
+
+    It also writes bcl-convert style Reports CSVs, one row per sample, where
+    upload_results reads them.
+    """
 
     @step(name="execute_demux")
     def fake_demux(ctx, scenario, samplesheet=None):
-        branch = f"lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
+        lane = scenario["lane_id"]
+        branch = f"lane_{lane}_settings_{scenario['settings_index']}"
         outdir = ws.root / "nf-results" / FCID / branch
-        outdir.mkdir(parents=True, exist_ok=True)
-        for row in scenario["samplesheet_payload"]["BCLConvert_Data"]:
-            (outdir / f"{row['Sample_ID']}.fastq.gz").touch()
+        reports = outdir / FCID / "Reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        samples = [
+            row["Sample_ID"]
+            for row in scenario["samplesheet_payload"]["BCLConvert_Data"]
+        ]
+        for sample in samples:
+            (outdir / f"{sample}.fastq.gz").touch()
+        (reports / "Demultiplex_Stats.csv").write_text(
+            "Lane,SampleID,Index,# Reads\n"
+            + "".join(f"{lane},{sample},ACGTACGT-,100\n" for sample in samples)
+        )
+        (reports / "Quality_Metrics.csv").write_text(
+            "Lane,SampleID,ReadNumber,Yield,YieldQ30,QualityScoreSum\n"
+            + "".join(f"{lane},{sample},1,1000,900,30000\n" for sample in samples)
+        )
+        (reports / "Top_Unknown_Barcodes.csv").write_text(
+            f"Lane,index,index2,# Reads\n{lane},GGGGGGGG,,{len(samples)}\n"
+        )
         return StepResult()
 
     return fake_demux
@@ -432,9 +497,9 @@ def test_settings_change_cleans_and_reruns_its_whole_lane_only(ws, monkeypatch):
         assert report.step_outcomes[step_id] is SUCCEEDED, step_id
     for step_id in [CLEAN_2, *LANE_2, *AGGREGATES_2, PRUNE_STALE_LANES]:
         assert report.step_outcomes[step_id] is REUSED, step_id
-    assert sorted(p.name for p in (results / "lane_1_settings_1").iterdir()) == [
-        "KEEP.fastq.gz"
-    ]
+    assert sorted(
+        p.name for p in (results / "lane_1_settings_1").glob("*.fastq.gz")
+    ) == ["KEEP.fastq.gz"]
     assert (results / "lane_1_settings_0" / "L1S0_1.fastq.gz").is_file()
     assert lane_2_fastq.stat().st_mtime_ns == lane_2_mtime
 
@@ -452,6 +517,67 @@ def test_forced_cleanup_reruns_every_later_step_of_its_lane(ws):
         assert report.step_outcomes[step_id] is SUCCEEDED, step_id
     for step_id in [CLEAN_2, *LANE_2, *AGGREGATES_2]:
         assert report.step_outcomes[step_id] is REUSED, step_id
+
+
+def _stored_reports(store) -> dict:
+    """Return {lane: {settings: [sample IDs]}} from the stored reports field."""
+    return {
+        lane: {
+            settings: [row["SampleID"] for row in report["Demultiplex_Stats"]]
+            for settings, report in lanes.items()
+        }
+        for lane, lanes in store.doc["demux_realm_bclconvert_reports"].items()
+    }
+
+
+def _illumina_samples(store) -> list[str]:
+    rows = store.doc["illumina"]["Demultiplex_Stats"]["Barcode_lane_statistics"]
+    return sorted(row["Sample"] for row in rows)
+
+
+def test_branch_reports_survive_every_other_branchs_writes(
+    ws, monkeypatch, stored_x_flowcells
+):
+    monkeypatch.setattr(realm_steps, "execute_demux", _fastq_writing_demux(ws))
+    engine = engine_for(ws)
+    entries = [
+        lane_entry(1, settings_index=0, samples=["A"]),
+        lane_entry(1, settings_index=1, samples=["B"]),
+        lane_entry(2, samples=["C"]),
+    ]
+
+    first = engine.run(plan_for(ws, entries))
+
+    assert first.outcome is ExecutionOutcome.SUCCEEDED
+    assert _stored_reports(stored_x_flowcells) == {
+        "lane_1": {"settings_0": ["A"], "settings_1": ["B"]},
+        "lane_2": {"settings_0": ["C"]},
+    }
+    assert _illumina_samples(stored_x_flowcells) == ["A", "B", "C"]
+    lane_2_report = copy.deepcopy(
+        stored_x_flowcells.doc["demux_realm_bclconvert_reports"]["lane_2"]
+    )
+
+    # Lane 1 loses its settings 1 group and gains a sample in settings 0.
+    second = engine.run(
+        plan_for(ws, [lane_entry(1, settings_index=0, samples=["A", "A2"]), entries[2]])
+    )
+
+    assert second.outcome is ExecutionOutcome.SUCCEEDED
+    assert second.step_outcomes["lane_2_settings_0__upload_results"] is REUSED
+    assert _stored_reports(stored_x_flowcells) == {
+        "lane_1": {"settings_0": ["A", "A2"]},
+        "lane_2": {"settings_0": ["C"]},
+    }
+    assert (
+        stored_x_flowcells.doc["demux_realm_bclconvert_reports"]["lane_2"]
+        == lane_2_report
+    )
+    assert _illumina_samples(stored_x_flowcells) == ["A", "A2", "C"]
+    assert stored_x_flowcells.doc["Undetermined"] == {
+        "1": {"GGGGGGGG": 2},
+        "2": {"GGGGGGGG": 1},
+    }
 
 
 def test_removed_settings_group_leaves_no_results_behind(ws, monkeypatch):
