@@ -81,8 +81,10 @@ def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
 _BRANCH_FIELD_RE = re.compile(r"^Demultiplex_lane_.+_settings_.+$")
 # Fields aggregate_illumina_stats and aggregate_undetermined_stats write.
 _AGGREGATE_FIELDS = frozenset({"illumina", "Undetermined"})
-# Same branch fields, capturing the lane ID.
-_BRANCH_FIELD_LANE_RE = re.compile(r"^Demultiplex_lane_(?P<lane>[^_]+)_settings_[^_]+$")
+# Same branch fields, capturing the lane ID and settings index.
+_BRANCH_FIELD_PARTS_RE = re.compile(
+    r"^Demultiplex_lane_(?P<lane>[^_]+)_settings_(?P<settings>[^_]+)$"
+)
 # Per-branch directory names under <base>/<FCID>, e.g. "lane_1_settings_0"
 # (see nextflow.branch_run_tag).
 _BRANCH_DIR_RE = re.compile(r"^lane_(?P<lane>[^_]+)_settings_[^_]+$")
@@ -98,6 +100,31 @@ def _find_x_flowcell(client: Any, name: str) -> dict[str, Any] | None:
     if existing is not None and not isinstance(existing, dict):
         raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
     return existing
+
+
+def _drop_superseded_branch_fields(doc: dict[str, Any], scenario: dict) -> list[str]:
+    """Remove, in place, the lane's branch fields of settings no longer planned.
+
+    Called by the lane's aggregate steps, once every branch of the lane has
+    uploaded: until then the earlier results stay visible to operators.
+    Fields of the lane's planned settings indices were already overwritten by
+    their upload_results steps; other lanes' fields are left alone.
+
+    Returns:
+        The removed field names.
+    """
+    lane_id = str(scenario["lane_id"])
+    planned = {str(index) for index in scenario["settings_indices"]}
+    superseded = sorted(
+        key
+        for key in doc
+        if (match := _BRANCH_FIELD_PARTS_RE.match(key))
+        and match["lane"] == lane_id
+        and match["settings"] not in planned
+    )
+    for key in superseded:
+        del doc[key]
+    return superseded
 
 
 def _branch_dirs(
@@ -822,16 +849,14 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     """Recompute the combined 'illumina' demux stats field from every branch
     already stored on the x_flowcells document, and save it back.
 
-    This is a common step, run once after all lane/settings branches'
-    upload_results steps (not a per-branch step): it reads every
-    Demultiplex_lane_<lane>_settings_<idx> field already persisted on the
-    document - including branches from earlier runs that were not rerun this
-    time - and rebuilds illumina.Demultiplex_Stats from their union. That
-    makes a rerun of a single lane safe: the aggregate always reflects
-    whatever is currently stored for every lane, not just the lanes that ran
-    in this invocation. Running this per-branch instead would require
-    merging a shared array field from concurrently-completing branches,
-    which risks lost updates/duplicate rows under _rev conflicts.
+    This is a lane step, run once after all of the lane's branches'
+    upload_results steps. It first drops the lane's branch fields of
+    settings indices no longer planned (see _drop_superseded_branch_fields),
+    then reads every Demultiplex_lane_<lane>_settings_<idx> field persisted
+    on the document - including other lanes' results, which may still be
+    from an earlier run - and rebuilds illumina.Demultiplex_Stats from their
+    union. That keeps the whole field correct whichever lane finishes last.
+    Steps run one at a time, so lanes never write the document concurrently.
     """
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
@@ -853,9 +878,15 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     if not isinstance(existing, dict):
         raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
 
+    if hasattr(client, "clean_doc"):
+        updated_doc = client.clean_doc(existing)
+    else:
+        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    superseded = _drop_superseded_branch_fields(updated_doc, scenario)
+
     demux_stats_rows: list[dict[str, str]] = []
     quality_rows: list[dict[str, str]] = []
-    for key, value in existing.items():
+    for key, value in updated_doc.items():
         if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
             continue
         demux_stats_rows.extend(value.get("Demultiplex_Stats") or [])
@@ -868,11 +899,6 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     }
 
     illumina = _build_illumina_stats(demux_stats_rows, quality_rows, sample_project)
-
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
     updated_doc["illumina"] = illumina
 
     write_result = client.save(
@@ -893,6 +919,7 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
                 {row["Lane"] for row in demux_stats_rows if row.get("Lane")}
             ),
             "sample_row_count": len(demux_stats_rows),
+            "removed_superseded_fields": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )
@@ -903,15 +930,11 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     """Recompute the combined 'Undetermined' demux stats field from every
     branch already stored on the x_flowcells document, and save it back.
 
-    This is a common step, run once after all lane/settings branches'
-    upload_results steps (same pattern as aggregate_illumina_stats): it reads
-    every Demultiplex_lane_<lane>_settings_<idx> field's Top_Unknown_Barcodes
-    rows already persisted on the document - including branches from earlier
-    runs that were not rerun this time - and rebuilds Undetermined from their
-    union, keyed by lane then by "<index>+<index2>" barcode with its read
-    count. That makes a rerun of a single lane safe: the aggregate always
-    reflects whatever is currently stored for every lane, not just the lanes
-    that ran in this invocation.
+    This is a lane step with the same pattern as aggregate_illumina_stats:
+    after dropping the lane's superseded branch fields, it reads every
+    Demultiplex_lane_<lane>_settings_<idx> field's Top_Unknown_Barcodes rows
+    persisted on the document and rebuilds Undetermined from their union,
+    keyed by lane then by "<index>+<index2>" barcode with its read count.
     """
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
@@ -933,18 +956,19 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     if not isinstance(existing, dict):
         raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
 
+    if hasattr(client, "clean_doc"):
+        updated_doc = client.clean_doc(existing)
+    else:
+        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
+    superseded = _drop_superseded_branch_fields(updated_doc, scenario)
+
     top_unknown_rows: list[dict[str, str]] = []
-    for key, value in existing.items():
+    for key, value in updated_doc.items():
         if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
             continue
         top_unknown_rows.extend(value.get("Top_Unknown_Barcodes") or [])
 
     undetermined = _build_undetermined_stats(top_unknown_rows)
-
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
     updated_doc["Undetermined"] = undetermined
 
     write_result = client.save(
@@ -963,6 +987,7 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
             "x_flowcell_name": name,
             "lane_count": len(undetermined),
             "barcode_row_count": len(top_unknown_rows),
+            "removed_superseded_fields": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )

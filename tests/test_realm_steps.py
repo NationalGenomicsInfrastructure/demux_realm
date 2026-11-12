@@ -12,6 +12,7 @@ from demux_realm.config import RealmConfig
 from demux_realm.nextflow import settings_from_mapping
 from demux_realm.steps import (
     aggregate_illumina_stats,
+    aggregate_undetermined_stats,
     clean_lane,
     collect_results,
     prune_stale_lanes,
@@ -29,6 +30,7 @@ _upload_results = upload_results.__wrapped__  # type: ignore[attr-defined]
 _validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-defined]
 _aggregate_illumina_stats = aggregate_illumina_stats.__wrapped__  # type: ignore[attr-defined]
 _clean_lane = clean_lane.__wrapped__  # type: ignore[attr-defined]
+_aggregate_undetermined_stats = aggregate_undetermined_stats.__wrapped__  # type: ignore[attr-defined]
 _prune_stale_lanes = prune_stale_lanes.__wrapped__  # type: ignore[attr-defined]
 _symlink_fastqs = symlink_fastqs.__wrapped__  # type: ignore[attr-defined]
 
@@ -477,7 +479,11 @@ def test_aggregate_illumina_stats_combines_all_lanes():
     ctx = MagicMock()
     ctx.data.connection.return_value = client
 
-    scenario = {"runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3"}
+    scenario = {
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+        "lane_id": "1",
+        "settings_indices": ["0"],
+    }
     result = _aggregate_illumina_stats(ctx, scenario)
 
     saved_doc = client.save.call_args.args[0]
@@ -696,3 +702,23 @@ def test_symlink_fastqs_keeps_a_current_link(earlier_run):
     _symlink_fastqs(earlier_run.ctx, scenario)
 
     assert os.readlink(link) == before
+
+
+@pytest.mark.parametrize(
+    "aggregate", [_aggregate_illumina_stats, _aggregate_undetermined_stats]
+)
+def test_lane_aggregate_drops_only_its_lanes_superseded_settings(
+    earlier_run, aggregate
+):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_indices": ["0"]}
+
+    result = aggregate(earlier_run.ctx, scenario)
+
+    saved = earlier_run.client.save.call_args.args[0]
+    assert sorted(k for k in saved if k.startswith("Demultiplex_")) == [
+        "Demultiplex_lane_1_settings_0",
+        "Demultiplex_lane_2_settings_0",
+    ]
+    assert result.metrics["removed_superseded_fields"] == [
+        "Demultiplex_lane_1_settings_1"
+    ]

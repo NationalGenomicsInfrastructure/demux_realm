@@ -81,7 +81,8 @@ def build_demux_plan(
     clean_lane step that depends on branch_prerequisites (include
     UPSERT_X_FLOWCELL there to make lanes wait for the metadata update), then
     every lane/settings branch of the lane as a chain of steps whose first
-    step depends on the clean_lane step.
+    step depends on the clean_lane step, and finally the lane's post-demux
+    aggregate steps, which wait for every branch of the lane.
 
     A lane is the smallest unit that is re-demultiplexed. The clean_lane
     step carries a lane_digest, a hash of everything the lane's branches are
@@ -149,8 +150,8 @@ def build_demux_plan(
         ),
     ]
 
-    lane_digests: dict[str, str] = {}
-    for lane_id, lane_branches in _group_by_lane(branches).items():
+    lanes = _group_by_lane(branches)
+    for lane_id, lane_branches in lanes.items():
         lane_digest = _digest(
             {
                 "metadata": metadata,
@@ -166,7 +167,6 @@ def build_demux_plan(
                 ],
             }
         )
-        lane_digests[lane_id] = lane_digest
         clean_lane = clean_lane_step_id(lane_id)
         cleanup_token = str(artifact_base / lane_namespace(lane_id) / "cleanup.token")
         lane_inputs = {LANE_CLEANUP_INPUT: cleanup_token}
@@ -261,49 +261,40 @@ def build_demux_plan(
                 ),
             ]
 
+        # Post-demux lane steps: run once every branch of the lane uploaded,
+        # and recompute the combined fields from whatever is stored for
+        # every lane (see aggregate_illumina_stats).
+        lane_scenario = {
+            **common,
+            "lane_id": lane_id,
+            "settings_indices": [b.settings_index for b in lane_branches],
+        }
+        uploads = [
+            f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
+            for b in lane_branches
+        ]
+        for aggregate, title in (
+            (AGGREGATE_ILLUMINA_STATS, "Aggregate Illumina Demux Stats"),
+            (AGGREGATE_UNDETERMINED_STATS, "Aggregate Undetermined Barcode Stats"),
+        ):
+            steps.append(
+                StepSpec(
+                    step_id=f"{lane_namespace(lane_id)}__{aggregate}",
+                    name=f"{title} (lane {lane_id})",
+                    fn_ref=f"{_PREFIX}.{aggregate}",
+                    params={"scenario": dict(lane_scenario)},
+                    deps=list(uploads),
+                    inputs=dict(lane_inputs),
+                )
+            )
+
     steps.append(
         StepSpec(
             step_id=PRUNE_STALE_LANES,
             name="Remove Demux Results of Unplanned Lanes",
             fn_ref=f"{_PREFIX}.prune_stale_lanes",
-            params={"scenario": {**common, "lanes": list(lane_digests)}},
+            params={"scenario": {**common, "lanes": list(lanes)}},
             deps=list(branch_prerequisites),
-        )
-    )
-
-    # The aggregates read every lane's stored stats, so they re-run whenever
-    # any lane, or the set of lanes, changes.
-    aggregate_scenario = {**common, "plan_digest": _digest(lane_digests)}
-    aggregate_deps = [
-        PRUNE_STALE_LANES,
-        *(
-            f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
-            for b in branches
-        ),
-    ]
-    steps.append(
-        StepSpec(
-            step_id=AGGREGATE_ILLUMINA_STATS,
-            name="Aggregate Illumina Demux Stats",
-            fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
-            params={"scenario": dict(aggregate_scenario)},
-            # Common step: runs once after every branch's upload_results, and
-            # recomputes the combined 'illumina' field from whatever is
-            # currently stored for each lane (see aggregate_illumina_stats).
-            deps=list(aggregate_deps),
-        )
-    )
-
-    steps.append(
-        StepSpec(
-            step_id=AGGREGATE_UNDETERMINED_STATS,
-            name="Aggregate Undetermined Barcode Stats",
-            fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
-            params={"scenario": dict(aggregate_scenario)},
-            # Common step: runs once after every branch's upload_results, and
-            # recomputes the combined 'Undetermined' field from whatever is
-            # currently stored for each lane (see aggregate_undetermined_stats).
-            deps=list(aggregate_deps),
         )
     )
 

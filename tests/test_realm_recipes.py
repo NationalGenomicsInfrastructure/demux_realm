@@ -3,8 +3,6 @@ from pathlib import Path
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY
 
 from demux_realm.recipes import (
-    AGGREGATE_ILLUMINA_STATS,
-    AGGREGATE_UNDETERMINED_STATS,
     PRUNE_STALE_LANES,
     SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
@@ -22,7 +20,7 @@ _BRANCHES = [
 ]
 
 
-def _plan(branches=_BRANCHES, prerequisites=(VALIDATE_RUNFOLDER,)):
+def _plan(branches=_BRANCHES, prerequisites=(VALIDATE_RUNFOLDER,), run_options=None):
     return build_demux_plan(
         plan_id="dmx_realm:SC123:demux",
         realm="dmx_realm",
@@ -32,7 +30,8 @@ def _plan(branches=_BRANCHES, prerequisites=(VALIDATE_RUNFOLDER,)):
         samplesheets=[{"lane": 3}, {"lane": 1}],
         uploaded_lims_info=[],
         metadata={"m": 1},
-        branch_run_options={
+        branch_run_options=run_options
+        or {
             ("1", "0"): NextflowRunOptions(skip_tools=("samshee",)),
             ("3", "1"): NextflowRunOptions(skip_tools=("samshee",)),
         },
@@ -226,33 +225,33 @@ def test_branches_never_share_mutable_step_state():
         }
 
 
-def test_unplanned_lanes_are_pruned_before_aggregation():
-    plan = _plan()
-    prune = _step(plan, PRUNE_STALE_LANES)
+def test_unplanned_lanes_are_pruned():
+    prune = _step(_plan(), PRUNE_STALE_LANES)
 
     assert prune.fn_ref == "demux_realm.steps.prune_stale_lanes"
     assert prune.params["scenario"]["lanes"] == ["1", "3"]
     assert prune.deps == [VALIDATE_RUNFOLDER]
-    for step_id in (AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS):
-        assert _step(plan, step_id).deps == [
-            PRUNE_STALE_LANES,
-            "lane_1_settings_0__upload_results",
-            "lane_3_settings_1__upload_results",
-        ]
 
 
-def test_aggregates_change_with_any_lane():
-    def aggregate_params(branches):
-        plan = _plan(branches=branches)
-        return [
-            _step(plan, step_id).params
-            for step_id in (AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS)
-        ]
-
-    before = aggregate_params(_BRANCHES)
-    after = aggregate_params(
-        [_BRANCHES[0], SamplesheetBranch("3", "1", 0, {"lane": 3, "x": 1})]
+def test_post_demux_aggregates_are_lane_steps():
+    plan = _plan(
+        branches=[
+            SamplesheetBranch("1", "0", 0, {"lane": 1}),
+            SamplesheetBranch("1", "2", 1, {"lane": 1}),
+        ],
+        run_options={
+            ("1", "0"): NextflowRunOptions(),
+            ("1", "2"): NextflowRunOptions(),
+        },
     )
 
-    assert before == aggregate_params(_BRANCHES)
-    assert all(b != a for b, a in zip(before, after))
+    for aggregate in ("aggregate_illumina_stats", "aggregate_undetermined_stats"):
+        spec = _step(plan, f"lane_1__{aggregate}")
+        assert spec.fn_ref == f"demux_realm.steps.{aggregate}"
+        assert spec.deps == [
+            "lane_1_settings_0__upload_results",
+            "lane_1_settings_2__upload_results",
+        ]
+        assert spec.inputs == {"lane_cleanup": "/work/artifacts/lane_1/cleanup.token"}
+        assert spec.params["scenario"]["lane_id"] == "1"
+        assert spec.params["scenario"]["settings_indices"] == ["0", "2"]

@@ -15,8 +15,6 @@ import pytest
 from demux_realm.config import realm_config_from_mapping
 from demux_realm.handler import DemuxHandler
 from demux_realm.recipes import (
-    AGGREGATE_ILLUMINA_STATS,
-    AGGREGATE_UNDETERMINED_STATS,
     PRUNE_STALE_LANES,
     SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
@@ -69,7 +67,9 @@ LANE_1 = [
 ]
 LANE_2 = [step_id.replace("lane_1_", "lane_2_") for step_id in LANE_1]
 CLEAN_1, CLEAN_2 = "lane_1__clean_lane", "lane_2__clean_lane"
-AGGREGATES = [AGGREGATE_ILLUMINA_STATS, AGGREGATE_UNDETERMINED_STATS]
+AGGREGATES_1 = ["lane_1__aggregate_illumina_stats", "lane_1__aggregate_undetermined_stats"]
+AGGREGATES_2 = [step_id.replace("lane_1_", "lane_2_") for step_id in AGGREGATES_1]
+AGGREGATES = AGGREGATES_1 + AGGREGATES_2
 
 
 def failed_branch(ids: list[str]) -> dict:
@@ -250,8 +250,8 @@ def test_early_branch_failure_leaves_later_branch_running(ws, monkeypatch):
         UPSERT_X_FLOWCELL: SUCCEEDED,
         **dict.fromkeys([CLEAN_1, CLEAN_2, PRUNE_STALE_LANES], SUCCEEDED),
         **failed_branch(LANE_1),
-        **dict.fromkeys(LANE_2, SUCCEEDED),
-        **dict.fromkeys(AGGREGATES, BLOCKED),
+        **dict.fromkeys(LANE_2 + AGGREGATES_2, SUCCEEDED),
+        **dict.fromkeys(AGGREGATES_1, BLOCKED),
     }
     assert report.direct_blockers[LANE_1[3]] == [LANE_1[2]]
     assert report.failed_ancestors[LANE_1[5]] == [LANE_1[2]]
@@ -428,10 +428,10 @@ def test_settings_change_cleans_and_reruns_its_whole_lane_only(ws, monkeypatch):
     assert report.outcome is ExecutionOutcome.SUCCEEDED
     for step_id in [CLEAN_1, *LANE_1, *lane_1_s1]:
         assert report.step_outcomes[step_id] is SUCCEEDED, step_id
-    for step_id in [CLEAN_2, *LANE_2, PRUNE_STALE_LANES]:
-        assert report.step_outcomes[step_id] is REUSED, step_id
-    for step_id in AGGREGATES:
+    for step_id in AGGREGATES_1:
         assert report.step_outcomes[step_id] is SUCCEEDED, step_id
+    for step_id in [CLEAN_2, *LANE_2, *AGGREGATES_2, PRUNE_STALE_LANES]:
+        assert report.step_outcomes[step_id] is REUSED, step_id
     assert sorted(p.name for p in (results / "lane_1_settings_1").iterdir()) == [
         "KEEP.fastq.gz"
     ]
@@ -448,9 +448,9 @@ def test_forced_cleanup_reruns_every_later_step_of_its_lane(ws):
     shutil.rmtree(ws.work / plan.plan_id / CLEAN_1)
     report = engine.run(plan)
 
-    for step_id in [CLEAN_1, *LANE_1]:
+    for step_id in [CLEAN_1, *LANE_1, *AGGREGATES_1]:
         assert report.step_outcomes[step_id] is SUCCEEDED, step_id
-    for step_id in [CLEAN_2, *LANE_2]:
+    for step_id in [CLEAN_2, *LANE_2, *AGGREGATES_2]:
         assert report.step_outcomes[step_id] is REUSED, step_id
 
 
@@ -479,7 +479,6 @@ def test_removed_lane_leaves_no_results_behind(ws, monkeypatch):
     assert report.step_outcomes[PRUNE_STALE_LANES] is SUCCEEDED
     assert report.step_outcomes[CLEAN_1] is REUSED
     assert sorted(p.name for p in results.iterdir()) == ["lane_1_settings_0"]
-    assert all(report.step_outcomes[step_id] is SUCCEEDED for step_id in AGGREGATES)
 
 
 def test_runfolder_xml_change_reruns_only_the_metadata_update(ws, x_flowcells):
@@ -556,7 +555,7 @@ async def test_finished_failed_continuation_needs_a_new_run_request(ws, monkeypa
         **failed_branch(LANE_1),
         LANE_1[0]: REUSED,
         LANE_1[1]: REUSED,
-        **dict.fromkeys(LANE_2, REUSED),
-        **dict.fromkeys(AGGREGATES, BLOCKED),
+        **dict.fromkeys(LANE_2 + AGGREGATES_2, REUSED),
+        **dict.fromkeys(AGGREGATES_1, BLOCKED),
     }
     assert storage.plans.fetch_plan(doc_id)["executed_run_token"] == 1
