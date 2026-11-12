@@ -160,16 +160,16 @@ re-demultiplexed, even when it holds several settings groups.
 samplesheet entries, their Nextflow options and the `demux_sample_info`
 metadata, so changing any of the lane's samplesheets re-runs it. It removes,
 for every settings index of the lane (including ones no longer planned), the
-Nextflow results directories and the links into them in the runfolder's
-`Demultiplexing` directory. Each run then writes a new random token to
+Nextflow results and work directories and the links into the results in the
+runfolder's `Demultiplexing` directory. Removing the work directories means
+`-resume` cannot reuse any earlier task, so the lane is demultiplexed from
+scratch. Each run then writes a new random token to
 `lane_<n>/cleanup.token` under the plan's artifact directory, and every later
 step of the lane declares that file as an input: whenever the cleanup has run,
 all of the lane's later steps run again. Unchanged lanes are reused.
 
-Two things are deliberately kept. The Nextflow work directories stay, so
-`-resume` reuses the tasks whose inputs did not change. The `x_flowcells`
-document is not cleaned either, so operators keep seeing the earlier results
-while a lane is re-demultiplexed.
+The `x_flowcells` document is deliberately not cleaned, so operators keep
+seeing the earlier results while a lane is re-demultiplexed.
 
 Each branch's parsed bcl-convert reports are stored under one field of the
 `x_flowcells` document, nested by lane and then settings index:
@@ -192,8 +192,8 @@ settings indices no longer planned and rebuild `illumina` and `Undetermined`
 from every entry in the field. Only those two derived fields are read by the
 StatusDB views; the reports field is the realm's own source data for them.
 
-`prune_stale_lanes` removes the results directories and links of lanes no
-longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
+`prune_stale_lanes` removes the results and work directories and links of
+lanes no longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
 in the aggregated stats until removed by hand.
 
 A retry after a failed branch re-runs only that branch: the lane's

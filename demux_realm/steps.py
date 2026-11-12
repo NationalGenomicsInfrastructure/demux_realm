@@ -239,16 +239,16 @@ def _remove_branch_results(
 ) -> dict[str, Any]:
     """Remove the selected lanes' demultiplexing results from earlier runs.
 
-    That is: their Nextflow results directories and the links in the
-    runfolder's Demultiplexing directory that point into them. Settings
-    indices that are no longer planned are matched too, since directories are
-    selected by lane only.
+    That is: their Nextflow results and work directories, and the links in
+    the runfolder's Demultiplexing directory that point into the results.
+    Removing the work directories means -resume cannot reuse any earlier
+    task, so the lane is demultiplexed from scratch. Settings indices that are
+    no longer planned are matched too, since directories are selected by lane
+    only.
 
-    Two things are deliberately kept. The Nextflow work directories stay, so
-    -resume can reuse the tasks whose inputs did not change. The x_flowcells
-    document stays too, so operators keep seeing the earlier results while
-    the lane is re-demultiplexed; the lane's own steps overwrite them when
-    they finish.
+    The x_flowcells document is deliberately kept, so operators keep seeing
+    the earlier results while the lane is re-demultiplexed; the lane's own
+    steps overwrite them when they finish.
 
     Returns:
         Metrics listing what was removed.
@@ -256,14 +256,15 @@ def _remove_branch_results(
     settings = load_realm_config().nextflow
     fcid = scenario["canonical_flowcell_id"]
     outdirs = _branch_dirs(settings.outdir_base, fcid, drop_lane)
+    work_dirs = _branch_dirs(settings.work_base, fcid, drop_lane)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
 
     links = _remove_branch_symlinks(demux_dir, outdirs)
-    for path in outdirs:
+    for path in [*outdirs, *work_dirs]:
         shutil.rmtree(path)
         logger.info("Removed %s.", path)
     return {
-        "removed_dirs": [str(path) for path in outdirs],
+        "removed_dirs": [str(path) for path in [*outdirs, *work_dirs]],
         "removed_symlinks": links,
     }
 

@@ -629,7 +629,8 @@ def test_clean_lane_removes_only_that_lanes_results(earlier_run):
         "unrelated.txt",
     ]
     assert len(result.metrics["removed_symlinks"]) == 3
-    assert len(result.metrics["removed_dirs"]) == 3
+    # Results of settings 0, 1 and 7, and work dirs of settings 0 and 1.
+    assert len(result.metrics["removed_dirs"]) == 5
 
 
 def test_clean_lane_writes_a_new_token_every_run(earlier_run):
@@ -644,12 +645,12 @@ def test_clean_lane_writes_a_new_token_every_run(earlier_run):
     assert token.read_text() != first
 
 
-def test_clean_lane_keeps_work_dirs_and_x_flowcells(earlier_run):
+def test_clean_lane_removes_work_dirs_but_keeps_x_flowcells(earlier_run):
     _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "1"})
 
-    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == list(
-        _BRANCHES
-    )
+    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == [
+        "lane_2_settings_0"
+    ]
     earlier_run.ctx.data.connection.assert_not_called()
 
 
@@ -683,8 +684,13 @@ def test_prune_stale_lanes_removes_lanes_outside_the_plan(earlier_run):
     assert "lane_2_settings_0_R1.fastq.gz" not in {
         p.name for p in earlier_run.demux_dir.iterdir()
     }
+    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == [
+        "lane_1_settings_0",
+        "lane_1_settings_1",
+    ]
     assert result.metrics["removed_dirs"] == [
-        str(earlier_run.results / _FCID / "lane_2_settings_0")
+        str(earlier_run.results / _FCID / "lane_2_settings_0"),
+        str(earlier_run.work / _FCID / "lane_2_settings_0"),
     ]
 
 
