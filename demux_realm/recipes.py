@@ -151,6 +151,9 @@ def build_demux_plan(
     ]
 
     lanes = _group_by_lane(branches)
+    # Lane level: one clean_lane step, then the lane's branches, then the
+    # lane's post-demux steps. Everything in this loop shares the lane's
+    # cleanup token, so a cleanup re-runs the whole lane.
     for lane_id, lane_branches in lanes.items():
         lane_digest = _digest(
             {
@@ -187,6 +190,7 @@ def build_demux_plan(
                 outputs={"cleanup_token": cleanup_token},
             )
         )
+        # Settings level: one chain of steps per lane/settings branch.
         for branch in lane_branches:
             ns = branch_namespace(branch.lane_id, branch.settings_index)
             label = f"lane {branch.lane_id}, settings {branch.settings_index}"
@@ -260,10 +264,11 @@ def build_demux_plan(
                     inputs=dict(lane_inputs),
                 ),
             ]
+        # End of the settings level: every branch of this lane is planned.
 
-        # Post-demux lane steps: run once every branch of the lane uploaded,
-        # and recompute the combined fields from whatever is stored for
-        # every lane (see aggregate_illumina_stats).
+        # Post-demux lane steps, back at the lane level: run once every branch
+        # of the lane uploaded, and recompute the combined fields from
+        # whatever is stored for every lane (see aggregate_illumina_stats).
         lane_scenario = {
             **common,
             "lane_id": lane_id,
@@ -287,6 +292,8 @@ def build_demux_plan(
                     inputs=dict(lane_inputs),
                 )
             )
+    # End of the lane level: every lane is planned. What follows is
+    # flowcell-wide again and does not depend on any lane.
 
     steps.append(
         StepSpec(
