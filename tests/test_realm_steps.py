@@ -1,3 +1,4 @@
+import copy
 import os
 import textwrap
 from pathlib import Path
@@ -177,7 +178,9 @@ def test_step_keeps_demux_results_of_the_existing_document(tmp_path, scenario):
         "name": "20260312_ASC2177698-SC3",
         "samplesheet_csv": ["stale"],
         "Json_Stats": {"x": 1},
-        "Demultiplex_lane_1_settings_0": {"Demultiplex_Stats": [{"Lane": "1"}]},
+        "demux_realm_bclconvert_reports": {
+            "lane_1": {"settings_0": {"Demultiplex_Stats": [{"Lane": "1"}]}}
+        },
         "illumina": {"Demultiplex_Stats": {}},
         "Undetermined": {"1": {}},
     }
@@ -185,8 +188,8 @@ def test_step_keeps_demux_results_of_the_existing_document(tmp_path, scenario):
     result = _step(ctx, scenario)
 
     payload = _saved_payload(x_client)
-    assert payload["Demultiplex_lane_1_settings_0"] == {
-        "Demultiplex_Stats": [{"Lane": "1"}]
+    assert payload["demux_realm_bclconvert_reports"] == {
+        "lane_1": {"settings_0": {"Demultiplex_Stats": [{"Lane": "1"}]}}
     }
     assert payload["illumina"] == {"Demultiplex_Stats": {}}
     assert payload["Undetermined"] == {"1": {}}
@@ -194,8 +197,8 @@ def test_step_keeps_demux_results_of_the_existing_document(tmp_path, scenario):
     assert payload["samplesheet_csv"] != ["stale"]
     assert "_id" not in payload and "_rev" not in payload
     assert result.metrics["kept_fields"] == [
-        "Demultiplex_lane_1_settings_0",
         "Undetermined",
+        "demux_realm_bclconvert_reports",
         "illumina",
     ]
 
@@ -386,12 +389,12 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
     saved_doc = client.save.call_args.args[0]
     assert "_id" not in saved_doc
     assert "_rev" not in saved_doc
-    branch_field = "Demultiplex_lane_1_settings_0"
-    assert saved_doc[branch_field]["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
-    assert saved_doc[branch_field]["Quality_Metrics"][0]["Mean_Q30"] == "92.1"
-    assert saved_doc[branch_field]["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
+    report = saved_doc["demux_realm_bclconvert_reports"]["lane_1"]["settings_0"]
+    assert report["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
+    assert report["Quality_Metrics"][0]["Mean_Q30"] == "92.1"
+    assert report["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
     assert upload_result.metrics["upload_status"] == "simulated_success"
-    assert upload_result.metrics["demultiplex_field"] == branch_field
+    assert upload_result.metrics["report_entry"] == "lane_1/settings_0"
 
 
 def _qm_row(lane, sample, read_number, yield_, yield_q30, quality_sum):
@@ -414,7 +417,7 @@ def test_aggregate_illumina_stats_combines_all_lanes():
             {"Sample_ID": "P1_101", "Sample_Project": "A__Proj"},
             {"Sample_ID": "P2_201", "Sample_Project": "B__Proj"},
         ],
-        "Demultiplex_lane_1_settings_0": {
+        "lane_1_settings_0": {
             "Demultiplex_Stats": [
                 {
                     "Lane": "1",
@@ -449,7 +452,7 @@ def test_aggregate_illumina_stats_combines_all_lanes():
                 _qm_row("1", "Undetermined", "2", 50_000_000, 19_000_000, 900_000_000),
             ],
         },
-        "Demultiplex_lane_2_settings_0": {
+        "lane_2_settings_0": {
             "Demultiplex_Stats": [
                 {
                     "Lane": "2",
@@ -470,6 +473,11 @@ def test_aggregate_illumina_stats_combines_all_lanes():
         },
     }
 
+    # Each lane's rows are stored as that lane's settings 0 report.
+    existing["demux_realm_bclconvert_reports"] = {
+        "lane_1": {"settings_0": existing.pop("lane_1_settings_0")},
+        "lane_2": {"settings_0": existing.pop("lane_2_settings_0")},
+    }
     client = MagicMock()
     client.find_one.return_value = existing
     client.clean_doc.side_effect = lambda doc: {
@@ -578,7 +586,13 @@ def earlier_run(tmp_path, monkeypatch):
         "_rev": "2-abc",
         "name": "20260312_ASC2177698-SC3",
         "illumina": {"x": 1},
-        **{f"Demultiplex_{branch}": {"Demultiplex_Stats": []} for branch in _BRANCHES},
+        "demux_realm_bclconvert_reports": {
+            "lane_1": {
+                "settings_0": {"Demultiplex_Stats": [{"SampleID": "L1S0"}]},
+                "settings_1": {"Demultiplex_Stats": [{"SampleID": "L1S1"}]},
+            },
+            "lane_2": {"settings_0": {"Demultiplex_Stats": [{"SampleID": "L2S0"}]}},
+        },
     }
     ctx = MagicMock()
     client = ctx.data.connection.return_value
@@ -715,10 +729,127 @@ def test_lane_aggregate_drops_only_its_lanes_superseded_settings(
     result = aggregate(earlier_run.ctx, scenario)
 
     saved = earlier_run.client.save.call_args.args[0]
-    assert sorted(k for k in saved if k.startswith("Demultiplex_")) == [
-        "Demultiplex_lane_1_settings_0",
-        "Demultiplex_lane_2_settings_0",
-    ]
-    assert result.metrics["removed_superseded_fields"] == [
-        "Demultiplex_lane_1_settings_1"
-    ]
+    assert saved["demux_realm_bclconvert_reports"] == {
+        "lane_1": {"settings_0": {"Demultiplex_Stats": [{"SampleID": "L1S0"}]}},
+        "lane_2": {"settings_0": {"Demultiplex_Stats": [{"SampleID": "L2S0"}]}},
+    }
+    assert result.metrics["removed_superseded_reports"] == ["lane_1/settings_1"]
+
+
+# ---------------------------------------------------------------------------
+# Branch reports never overwrite each other
+# ---------------------------------------------------------------------------
+
+
+class StoredXFlowcells:
+    """x_flowcells client backed by one stored document.
+
+    Reads and saves deep-copy, as a real database does, so a step can only
+    keep another branch's report by carrying it over explicitly.
+    """
+
+    def __init__(self, doc=None):
+        self.doc = copy.deepcopy(doc)
+
+    def find_one(self, selector):
+        return copy.deepcopy(self.doc)
+
+    def save(self, doc, **kwargs):
+        assert "_id" not in doc and "_rev" not in doc
+        self.doc = {"_id": "doc-1", "_rev": "n-x", **copy.deepcopy(doc)}
+        return SimpleNamespace(status="updated", doc_id="doc-1")
+
+
+def _report(sample, lane):
+    return {
+        "Demultiplex_Stats": [{"Lane": lane, "SampleID": sample, "# Reads": "100"}],
+        "Quality_Metrics": [
+            {"Lane": lane, "SampleID": sample, "ReadNumber": "1", "Yield": "1000"}
+        ],
+        "Top_Unknown_Barcodes": [
+            {"Lane": lane, "index": "GGGG", "index2": "", "# Reads": "7"}
+        ],
+    }
+
+
+def _upload(store, lane, settings, sample):
+    ctx = MagicMock()
+    ctx.data.connection.return_value = store
+    scenario = {
+        "canonical_flowcell_id": _FCID,
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+        "lane_id": lane,
+        "settings_index": settings,
+        "demultiplexing_metadata": _report(sample, lane),
+    }
+    return _upload_results(ctx, scenario)
+
+
+def _stored_samples(store):
+    return {
+        lane: {
+            settings: report["Demultiplex_Stats"][0]["SampleID"]
+            for settings, report in lanes.items()
+        }
+        for lane, lanes in store.doc["demux_realm_bclconvert_reports"].items()
+    }
+
+
+def test_uploads_of_different_branches_keep_each_others_reports():
+    store = StoredXFlowcells({"name": "20260312_ASC2177698-SC3", "Json_Stats": 1})
+
+    _upload(store, "1", "0", "A")
+    _upload(store, "1", "1", "B")
+    _upload(store, "2", "0", "C")
+
+    assert _stored_samples(store) == {
+        "lane_1": {"settings_0": "A", "settings_1": "B"},
+        "lane_2": {"settings_0": "C"},
+    }
+    assert store.doc["Json_Stats"] == 1
+
+
+def test_reupload_replaces_only_its_own_report():
+    store = StoredXFlowcells({"name": "20260312_ASC2177698-SC3"})
+    _upload(store, "1", "0", "A")
+    _upload(store, "1", "1", "B")
+    _upload(store, "2", "0", "C")
+
+    _upload(store, "1", "0", "A2")
+
+    assert _stored_samples(store) == {
+        "lane_1": {"settings_0": "A2", "settings_1": "B"},
+        "lane_2": {"settings_0": "C"},
+    }
+
+
+def test_upload_refuses_a_malformed_reports_field():
+    store = StoredXFlowcells(
+        {"name": "20260312_ASC2177698-SC3", "demux_realm_bclconvert_reports": []}
+    )
+
+    with pytest.raises(PermanentStepError, match="demux_realm_bclconvert_reports"):
+        _upload(store, "1", "0", "A")
+    assert store.doc["demux_realm_bclconvert_reports"] == []
+
+
+def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario):
+    store = StoredXFlowcells({"name": "20260312_ASC2177698-SC3"})
+    _upload(store, "1", "0", "A")
+    _upload(store, "1", "1", "B")
+    _upload(store, "2", "0", "C")
+    ctx = MagicMock()
+    ctx.data.connection.return_value = store
+
+    _step(ctx, scenario)
+    lane_1 = {**scenario, "lane_id": "1", "settings_indices": ["0", "1"]}
+    _aggregate_illumina_stats(ctx, lane_1)
+    _aggregate_undetermined_stats(ctx, lane_1)
+
+    assert _stored_samples(store) == {
+        "lane_1": {"settings_0": "A", "settings_1": "B"},
+        "lane_2": {"settings_0": "C"},
+    }
+    rows = store.doc["illumina"]["Demultiplex_Stats"]["Barcode_lane_statistics"]
+    assert sorted(row["Sample"] for row in rows) == ["A", "B", "C"]
+    assert store.doc["Undetermined"] == {"1": {"GGGG": 14}, "2": {"GGGG": 7}}

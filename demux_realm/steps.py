@@ -77,14 +77,13 @@ def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
     return metadata
 
 
-# Matches branch fields written by upload_results, e.g. "Demultiplex_lane_1_settings_0".
-_BRANCH_FIELD_RE = re.compile(r"^Demultiplex_lane_.+_settings_.+$")
+#: x_flowcells field holding every branch's parsed bcl-convert reports:
+#: {"lane_<n>": {"settings_<i>": {"Demultiplex_Stats": [rows], ...}}}.
+#: upload_results writes one branch's entry; the lane aggregate steps read
+#: all of them.
+BCLCONVERT_REPORTS_FIELD = "demux_realm_bclconvert_reports"
 # Fields aggregate_illumina_stats and aggregate_undetermined_stats write.
 _AGGREGATE_FIELDS = frozenset({"illumina", "Undetermined"})
-# Same branch fields, capturing the lane ID and settings index.
-_BRANCH_FIELD_PARTS_RE = re.compile(
-    r"^Demultiplex_lane_(?P<lane>[^_]+)_settings_(?P<settings>[^_]+)$"
-)
 # Per-branch directory names under <base>/<FCID>, e.g. "lane_1_settings_0"
 # (see nextflow.branch_run_tag).
 _BRANCH_DIR_RE = re.compile(r"^lane_(?P<lane>[^_]+)_settings_[^_]+$")
@@ -102,29 +101,79 @@ def _find_x_flowcell(client: Any, name: str) -> dict[str, Any] | None:
     return existing
 
 
-def _drop_superseded_branch_fields(doc: dict[str, Any], scenario: dict) -> list[str]:
-    """Remove, in place, the lane's branch fields of settings no longer planned.
+def _lane_key(lane_id: object) -> str:
+    """Return a lane's key in the reports field, e.g. lane_1."""
+    return f"lane_{lane_id}"
+
+
+def _settings_key(settings_index: object) -> str:
+    """Return a settings index's key within a lane's reports, e.g. settings_0."""
+    return f"settings_{settings_index}"
+
+
+def _mapping_at(value: Any, where: str) -> dict[str, Any]:
+    """Return a shallow copy of value, which must be a mapping or missing."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PermanentStepError(
+            f"x_flowcells {where} is a {type(value).__name__}, not an object.",
+            advice=f"Fix or remove the document's {BCLCONVERT_REPORTS_FIELD} field.",
+        )
+    return dict(value)
+
+
+def _with_branch_report(
+    doc: dict[str, Any], lane_id: object, settings_index: object, report: Any
+) -> dict[str, Any]:
+    """Return doc's reports field with one branch's report set.
+
+    Each level on the way to the branch's entry is copied rather than
+    replaced, so the reports of every other lane, and of the lane's other
+    settings indices, are carried over unchanged.
+    """
+    reports = _mapping_at(doc.get(BCLCONVERT_REPORTS_FIELD), BCLCONVERT_REPORTS_FIELD)
+    lane_key = _lane_key(lane_id)
+    lane = _mapping_at(reports.get(lane_key), f"{BCLCONVERT_REPORTS_FIELD}.{lane_key}")
+    lane[_settings_key(settings_index)] = report
+    reports[lane_key] = lane
+    return reports
+
+
+def _branch_reports(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return every branch's report on doc, all lanes, in stored order."""
+    reports = _mapping_at(doc.get(BCLCONVERT_REPORTS_FIELD), BCLCONVERT_REPORTS_FIELD)
+    found = []
+    for lane_key, lane in reports.items():
+        where = f"{BCLCONVERT_REPORTS_FIELD}.{lane_key}"
+        for settings_key, report in _mapping_at(lane, where).items():
+            found.append(_mapping_at(report, f"{where}.{settings_key}"))
+    return found
+
+
+def _drop_superseded_reports(doc: dict[str, Any], scenario: dict) -> list[str]:
+    """Remove from doc the lane's reports of settings indices no longer planned.
 
     Called by the lane's aggregate steps, once every branch of the lane has
     uploaded: until then the earlier results stay visible to operators.
-    Fields of the lane's planned settings indices were already overwritten by
-    their upload_results steps; other lanes' fields are left alone.
+    Reports of the lane's planned settings indices were already overwritten
+    by their upload_results steps; other lanes' reports are left alone.
 
     Returns:
-        The removed field names.
+        The removed entries, e.g. ["lane_1/settings_1"].
     """
-    lane_id = str(scenario["lane_id"])
-    planned = {str(index) for index in scenario["settings_indices"]}
-    superseded = sorted(
-        key
-        for key in doc
-        if (match := _BRANCH_FIELD_PARTS_RE.match(key))
-        and match["lane"] == lane_id
-        and match["settings"] not in planned
-    )
+    reports = _mapping_at(doc.get(BCLCONVERT_REPORTS_FIELD), BCLCONVERT_REPORTS_FIELD)
+    lane_key = _lane_key(scenario["lane_id"])
+    lane = _mapping_at(reports.get(lane_key), f"{BCLCONVERT_REPORTS_FIELD}.{lane_key}")
+    planned = {_settings_key(index) for index in scenario["settings_indices"]}
+    superseded = sorted(key for key in lane if key not in planned)
+    if not superseded:
+        return []
     for key in superseded:
-        del doc[key]
-    return superseded
+        del lane[key]
+    reports[lane_key] = lane
+    doc[BCLCONVERT_REPORTS_FIELD] = reports
+    return [f"{lane_key}/{key}" for key in superseded]
 
 
 def _branch_dirs(
@@ -500,13 +549,12 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     The document is identified by its `name` field (Mango selector). If no
     matching document exists it is created; if exactly one exists its whole body
     is replaced by this payload, keeping only its _id and _rev and the demux
-    results: the per-branch Demultiplex_lane_<n>_settings_<i> fields and the
+    results: the per-branch reports under BCLCONVERT_REPORTS_FIELD and the
     aggregated illumina and Undetermined fields. This step re-runs whenever any
     samplesheet changes, while the branches of unchanged lanes are reused and
-    do not upload again, so dropping their fields would lose their results.
-    Results of re-run or removed lanes are removed by clean_lane and
-    prune_stale_lanes instead. Other fields, such as post-demux Json_Stats,
-    are not preserved.
+    do not upload again, so dropping their reports would lose their results.
+    Re-run lanes overwrite their own reports instead. Other fields, such as
+    post-demux Json_Stats, are not preserved.
     """
     runfolder_path = Path(scenario["hpc_runfolder_path"])
     runfolder_id = scenario["runfolder_id"]
@@ -547,7 +595,7 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     kept = {
         key: value
         for key, value in existing.items()
-        if _BRANCH_FIELD_RE.match(key) or key in _AGGREGATE_FIELDS
+        if key == BCLCONVERT_REPORTS_FIELD or key in _AGGREGATE_FIELDS
     }
     write_result = client.save(
         {**kept, **payload},
@@ -771,13 +819,16 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
 @step
 def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
     """Fetch the current x_flowcells doc, add this branch's demux CSV metadata
-    under its own field, and save it back.
+    under its own entry, and save it back.
 
     Each lane/settings branch publishes its Demultiplex_Stats.csv,
-    Quality_Metrics.csv and Top_Unknown_Barcodes.csv rows under a dedicated
-    top-level field named Demultiplex_lane_<lane_id>_settings_<settings_index>.
-    Since the field is unique per branch, branches never collide and a
-    branch can be re-run without touching any other branch's results.
+    Quality_Metrics.csv and Top_Unknown_Barcodes.csv rows at
+    BCLCONVERT_REPORTS_FIELD -> lane_<lane_id> -> settings_<settings_index>.
+    Only that entry is replaced (see _with_branch_report), so branches never
+    overwrite each other's reports and a branch can be re-run without
+    touching any other branch's results. Steps run one at a time, so no
+    other branch of the plan writes the document between the read and the
+    save.
     """
     logger.info("Uploading metrics to remote API...")
     if ctx.data is None:
@@ -801,9 +852,8 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
     client = ctx.data.connection("x_flowcells_db")
     existing = _find_x_flowcell(client, name) or {"name": name}
 
-    branch_field = (
-        f"Demultiplex_lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
-    )
+    lane_id, settings_index = scenario["lane_id"], scenario["settings_index"]
+    branch_entry = f"{_lane_key(lane_id)}/{_settings_key(settings_index)}"
     # existing may carry CouchDB's own _id/_rev; DataAccess.save() manages
     # those internally via the selector (fetching the current _rev and
     # retrying on a 409 conflict itself), so the caller's job is only to
@@ -812,7 +862,9 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
         updated_doc = client.clean_doc(existing)
     else:
         updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
-    updated_doc[branch_field] = metadata
+    updated_doc[BCLCONVERT_REPORTS_FIELD] = _with_branch_report(
+        updated_doc, lane_id, settings_index, metadata
+    )
 
     write_result = client.save(
         updated_doc,
@@ -829,7 +881,7 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
         metrics={
             "upload_status": "simulated_success",
             "x_flowcell_name": name,
-            "demultiplex_field": branch_field,
+            "report_entry": branch_entry,
             "demultiplexing_metadata_files": list(metadata),
             "doc_id": getattr(write_result, "doc_id", None),
         }
@@ -842,12 +894,11 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     already stored on the x_flowcells document, and save it back.
 
     This is a lane step, run once after all of the lane's branches'
-    upload_results steps. It first drops the lane's branch fields of
-    settings indices no longer planned (see _drop_superseded_branch_fields),
-    then reads every Demultiplex_lane_<lane>_settings_<idx> field persisted
-    on the document - including other lanes' results, which may still be
-    from an earlier run - and rebuilds illumina.Demultiplex_Stats from their
-    union. That keeps the whole field correct whichever lane finishes last.
+    upload_results steps. It first drops the lane's reports of settings
+    indices no longer planned (see _drop_superseded_reports), then reads
+    every branch report under BCLCONVERT_REPORTS_FIELD - including other
+    lanes' reports, which may still be from an earlier run - and rebuilds
+    illumina.Demultiplex_Stats from their union. That keeps the whole field correct whichever lane finishes last.
     Steps run one at a time, so lanes never write the document concurrently.
     """
     if ctx.data is None:
@@ -868,15 +919,13 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
         updated_doc = client.clean_doc(existing)
     else:
         updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
-    superseded = _drop_superseded_branch_fields(updated_doc, scenario)
+    superseded = _drop_superseded_reports(updated_doc, scenario)
 
     demux_stats_rows: list[dict[str, str]] = []
     quality_rows: list[dict[str, str]] = []
-    for key, value in updated_doc.items():
-        if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
-            continue
-        demux_stats_rows.extend(value.get("Demultiplex_Stats") or [])
-        quality_rows.extend(value.get("Quality_Metrics") or [])
+    for report in _branch_reports(updated_doc):
+        demux_stats_rows.extend(report.get("Demultiplex_Stats") or [])
+        quality_rows.extend(report.get("Quality_Metrics") or [])
 
     sample_project = {
         row["Sample_ID"]: row.get("Sample_Project", "default")
@@ -905,7 +954,7 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
                 {row["Lane"] for row in demux_stats_rows if row.get("Lane")}
             ),
             "sample_row_count": len(demux_stats_rows),
-            "removed_superseded_fields": superseded,
+            "removed_superseded_reports": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )
@@ -917,9 +966,9 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     branch already stored on the x_flowcells document, and save it back.
 
     This is a lane step with the same pattern as aggregate_illumina_stats:
-    after dropping the lane's superseded branch fields, it reads every
-    Demultiplex_lane_<lane>_settings_<idx> field's Top_Unknown_Barcodes rows
-    persisted on the document and rebuilds Undetermined from their union,
+    after dropping the lane's superseded reports, it reads the
+    Top_Unknown_Barcodes rows of every branch report under
+    BCLCONVERT_REPORTS_FIELD and rebuilds Undetermined from their union,
     keyed by lane then by "<index>+<index2>" barcode with its read count.
     """
     if ctx.data is None:
@@ -940,13 +989,11 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
         updated_doc = client.clean_doc(existing)
     else:
         updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
-    superseded = _drop_superseded_branch_fields(updated_doc, scenario)
+    superseded = _drop_superseded_reports(updated_doc, scenario)
 
     top_unknown_rows: list[dict[str, str]] = []
-    for key, value in updated_doc.items():
-        if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
-            continue
-        top_unknown_rows.extend(value.get("Top_Unknown_Barcodes") or [])
+    for report in _branch_reports(updated_doc):
+        top_unknown_rows.extend(report.get("Top_Unknown_Barcodes") or [])
 
     undetermined = _build_undetermined_stats(top_unknown_rows)
     updated_doc["Undetermined"] = undetermined
@@ -967,7 +1014,7 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
             "x_flowcell_name": name,
             "lane_count": len(undetermined),
             "barcode_row_count": len(top_unknown_rows),
-            "removed_superseded_fields": superseded,
+            "removed_superseded_reports": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )
