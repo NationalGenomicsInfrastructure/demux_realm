@@ -1,10 +1,15 @@
 """Tests for the per-branch Nextflow launch module and the real execute_demux step."""
 
+import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from yggdrasil.flow.errors import PermanentStepError
+from yggdrasil.toolkit.sjob_manager import SlurmManagerFactory
+
+from demux_realm import steps
 from demux_realm.config import RealmConfig, realm_config_from_mapping
 from demux_realm.nextflow import (
     NextflowRunOptions,
@@ -13,13 +18,15 @@ from demux_realm.nextflow import (
     branch_run_tag,
     branch_work_dir,
     build_nextflow_command,
+    build_slurm_batch_script,
     parse_run_options,
     resolve_run_options,
     run_nextflow,
     settings_from_mapping,
+    slurm_job_name,
 )
-from demux_realm import steps
-from yggdrasil.flow.errors import PermanentStepError
+
+from realm_support import REQUIRED_NEXTFLOW
 
 SAMSHEE = NextflowRunOptions(skip_tools=("samshee",))
 NO_OPTIONS = NextflowRunOptions()
@@ -43,11 +50,24 @@ def make_settings(**overrides) -> NextflowSettings:
 # ---------------------------------------------------------------------------
 
 
-def test_settings_defaults_target_local_dind_stack():
-    s = settings_from_mapping(None)
+def test_settings_defaults_for_optional_keys():
+    s = settings_from_mapping(REQUIRED_NEXTFLOW)
     assert s == make_settings()
-    assert s == settings_from_mapping({})
     assert s.skip_tools == ()
+    assert s.executor == "local"
+
+
+@pytest.mark.parametrize("missing", ["profile", "work_base", "outdir_base"])
+def test_settings_require_deployment_keys(missing):
+    raw = {k: v for k, v in REQUIRED_NEXTFLOW.items() if k != missing}
+    with pytest.raises(ValueError, match=f"nextflow.{missing} is required"):
+        settings_from_mapping(raw)
+
+
+@pytest.mark.parametrize("raw", [None, {}])
+def test_settings_reject_empty_config(raw):
+    with pytest.raises(ValueError):
+        settings_from_mapping(raw)
 
 
 def test_settings_overrides_for_hpc():
@@ -79,20 +99,65 @@ def test_settings_overrides_for_hpc():
         {"work_base": 3},
         {"extra_args": "-resume"},
         {"common_config": ""},
-        ["not", "an", "object"],
+        {"executor": "gridengine"},  # unknown executor
+        {"sbatch_cpus": 0},
+        {"sbatch_cpus": "4"},
+        {"sbatch_cpus": True},
     ],
 )
 def test_settings_reject_invalid_config(raw):
     with pytest.raises(ValueError):
-        settings_from_mapping(raw)
+        settings_from_mapping({**REQUIRED_NEXTFLOW, **raw})
+
+
+def test_settings_reject_sbatch_mem():
+    # No --mem in the batch script: the cluster's default (e.g. memory
+    # per requested CPU) applies.
+    with pytest.raises(ValueError, match="unknown key"):
+        settings_from_mapping({**REQUIRED_NEXTFLOW, "sbatch_mem": "16G"})
+
+
+def test_settings_reject_non_object():
+    with pytest.raises(ValueError):
+        settings_from_mapping(["not", "an", "object"])
+
+
+def test_settings_slurm_executor_defaults():
+    s = settings_from_mapping({**REQUIRED_NEXTFLOW, "executor": "slurm"})
+    assert s.executor == "slurm"
+    assert s.sbatch_cpus == 4
+    assert s.sbatch_time == "240:00:00"
+    assert s.sbatch_partition == "local"
+
+
+def test_settings_slurm_executor_overrides():
+    s = settings_from_mapping(
+        {
+            **REQUIRED_NEXTFLOW,
+            "executor": "slurm",
+            "sbatch_cpus": 8,
+            "sbatch_time": "8:00:00",
+            "sbatch_partition": "comp",
+        }
+    )
+    assert (
+        s.sbatch_cpus,
+        s.sbatch_time,
+        s.sbatch_partition,
+    ) == (8, "8:00:00", "comp")
 
 
 def test_realm_config_defaults_and_hpc_base_path():
-    assert realm_config_from_mapping(None) == RealmConfig(
+    assert realm_config_from_mapping({"nextflow": REQUIRED_NEXTFLOW}) == RealmConfig(
         hpc_base_path="", nextflow=make_settings()
     )
+    with pytest.raises(ValueError):
+        realm_config_from_mapping(None)
     cfg = realm_config_from_mapping(
-        {"hpc_base_path": "/work", "nextflow": {"profile": "slurm"}}
+        {
+            "hpc_base_path": "/work",
+            "nextflow": {**REQUIRED_NEXTFLOW, "profile": "slurm"},
+        }
     )
     assert cfg.hpc_base_path == "/work"
     assert cfg.nextflow.profile == "slurm"
@@ -261,20 +326,25 @@ def test_branch_directories_never_shared():
 
 def test_run_nextflow_streams_output_to_log():
     # The log is written while the process runs (live-tailable), and the
-    # combined output is returned for error reporting.
+    # combined output is returned for error reporting. (stdout and stderr
+    # share one pipe, so the two lines may arrive in either order.)
     import sys
     import tempfile
 
     with tempfile.TemporaryDirectory() as td:
         log_path = Path(td) / "nextflow_run.log"
         proc = run_nextflow(
-            [sys.executable, "-c", "print('line one'); print('line two', file=__import__('sys').stderr)"],
+            [
+                sys.executable,
+                "-c",
+                "print('line one'); print('line two', file=__import__('sys').stderr)",
+            ],
             log_path,
         )
         log_text = log_path.read_text()
     assert proc.returncode == 0
-    assert proc.stdout == "line one\nline two\n"
-    assert log_text == "line one\nline two\n"
+    assert sorted(proc.stdout.splitlines()) == ["line one", "line two"]
+    assert sorted(log_text.splitlines()) == ["line one", "line two"]
 
 
 def test_command_has_no_stable_run_name():
@@ -294,6 +364,40 @@ def test_command_has_no_stable_run_name():
     )
     assert "-name" not in cmd
     assert "-resume" in cmd
+
+
+def test_batch_script_wraps_command_with_directives():
+    script = build_slurm_batch_script(
+        ["nextflow", "run", "nf-core/demultiplex", "--flowcell_path", "/a b/c"],
+        job_name="dmx-test",
+        log_path=Path("/work/plan/logs/run.log"),
+        cpus=4,
+        time="240:00:00",
+        partition="local",
+    )
+    lines = script.splitlines()
+    assert lines[0] == "#!/bin/bash"
+    assert "#SBATCH --job-name=dmx-test" in lines
+    assert "#SBATCH --cpus-per-task=4" in lines
+    assert not any(line.startswith("#SBATCH --mem") for line in lines)
+    assert "#SBATCH --time=240:00:00" in lines
+    assert "#SBATCH --partition=local" in lines
+    # All job output goes to the shared-volume log the step tails.
+    assert "#SBATCH --output=/work/plan/logs/run.log" in lines
+    assert "#SBATCH --error=/work/plan/logs/run.log" in lines
+    # The node environment is the deployment's business: no setup here.
+    assert "docker" not in script.lower()
+    assert not any(line.startswith("export ") for line in lines)
+    # The argv is shlex-quoted, so a path with a space survives the node shell.
+    assert lines[-1] == "nextflow run nf-core/demultiplex --flowcell_path '/a b/c'"
+
+
+def test_slurm_job_name_sanitizes_and_bounds():
+    assert slurm_job_name("FC/lane_1_settings_0") == "dmx-FC-lane_1_settings_0"
+    assert slurm_job_name("A B/lane_1_settings_0") == "dmx-A-B-lane_1_settings_0"
+    long = slurm_job_name("F" * 200 + "/lane_1_settings_0")
+    assert len(long) == 80
+    assert long.startswith("dmx-")
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +457,7 @@ def use_config(monkeypatch, tmp_path: Path, **nextflow) -> NextflowSettings:
     config = realm_config_from_mapping(
         {
             "nextflow": {
+                "profile": "docker",
                 "work_base": str(tmp_path / "nf-work"),
                 "outdir_base": str(tmp_path / "nf-results"),
                 **nextflow,
@@ -367,7 +472,6 @@ def step_scenario(runfolder: Path, **overrides) -> dict:
     return {
         **SCENARIO,
         "hpc_runfolder_path": str(runfolder),
-        "samplesheet_path": SHEET_REL,
         "nextflow": {"skip_tools": ["samshee"]},
         **overrides,
     }
@@ -389,9 +493,12 @@ def test_execute_demux_launches_nextflow_and_records(tmp_path, monkeypatch):
 
     monkeypatch.setattr(steps, "run_nextflow", fake_run)
 
-    result = steps.execute_demux.__wrapped__(ctx, scenario=step_scenario(runfolder))
+    result = steps.execute_demux.__wrapped__(
+        ctx, scenario=step_scenario(runfolder), samplesheet=sheet
+    )
 
     assert result.metrics["exit_status"] == 0
+    assert result.metrics["executor"] == "local"
     # The step must delegate to the command builder with the branch values:
     # the producer step's sheet and the per-run options from the scenario.
     assert captured["cmd"] == build_nextflow_command(
@@ -404,9 +511,6 @@ def test_execute_demux_launches_nextflow_and_records(tmp_path, monkeypatch):
         run_options=SAMSHEE,
     )
     assert "--skip_tools" in captured["cmd"]
-    assert ("samplesheets", sheet.resolve()) in [
-        (ref.folder, path) for ref, path in recorded
-    ]
     assert "logs" in [ref.folder for ref, _ in recorded]
 
 
@@ -415,7 +519,7 @@ def test_execute_demux_without_options_skips_nothing(tmp_path, monkeypatch):
     runfolder = tmp_path / "fc"
     runfolder.mkdir()
     ctx, _ = make_ctx(tmp_path)
-    write_sheet(tmp_path)
+    sheet = write_sheet(tmp_path)
     captured: dict = {}
 
     def fake_run(cmd, log_path):
@@ -427,7 +531,7 @@ def test_execute_demux_without_options_skips_nothing(tmp_path, monkeypatch):
     scenario = step_scenario(runfolder)
     del scenario["nextflow"]
 
-    steps.execute_demux.__wrapped__(ctx, scenario=scenario)
+    steps.execute_demux.__wrapped__(ctx, scenario=scenario, samplesheet=sheet)
 
     assert "--skip_tools" not in captured["cmd"]
 
@@ -437,7 +541,7 @@ def test_execute_demux_nonzero_exit_fails_permanently(tmp_path, monkeypatch):
     runfolder = tmp_path / "fc"
     runfolder.mkdir()
     ctx, _ = make_ctx(tmp_path)
-    write_sheet(tmp_path)
+    sheet = write_sheet(tmp_path)
 
     def fake_run(cmd, log_path):
         log_path.write_text("ERROR: something\n")
@@ -446,41 +550,20 @@ def test_execute_demux_nonzero_exit_fails_permanently(tmp_path, monkeypatch):
     monkeypatch.setattr(steps, "run_nextflow", fake_run)
 
     with pytest.raises(PermanentStepError):
-        steps.execute_demux.__wrapped__(ctx, scenario=step_scenario(runfolder))
-
-
-def test_execute_demux_missing_samplesheet_fails_permanently(tmp_path, monkeypatch):
-    use_config(monkeypatch, tmp_path)
-    ctx, _ = make_ctx(tmp_path)
-    with pytest.raises(PermanentStepError, match="samplesheet missing"):
         steps.execute_demux.__wrapped__(
-            ctx, scenario=step_scenario(tmp_path / "fc")
-        )
-
-
-def test_execute_demux_samplesheet_cannot_escape_plan_dir(tmp_path, monkeypatch):
-    use_config(monkeypatch, tmp_path)
-    ctx, _ = make_ctx(tmp_path)
-    (tmp_path / "outside.csv").write_text("x")
-    with pytest.raises(PermanentStepError, match="escapes"):
-        steps.execute_demux.__wrapped__(
-            ctx,
-            scenario=step_scenario(
-                tmp_path / "fc", samplesheet_path="../outside.csv"
-            ),
+            ctx, scenario=step_scenario(runfolder), samplesheet=sheet
         )
 
 
 def test_execute_demux_invalid_options_fail_permanently(tmp_path, monkeypatch):
     use_config(monkeypatch, tmp_path)
     ctx, _ = make_ctx(tmp_path)
-    write_sheet(tmp_path)
+    sheet = write_sheet(tmp_path)
     with pytest.raises(PermanentStepError, match="nextflow options"):
         steps.execute_demux.__wrapped__(
             ctx,
-            scenario=step_scenario(
-                tmp_path / "fc", nextflow={"skip_tools": "samshee"}
-            ),
+            scenario=step_scenario(tmp_path / "fc", nextflow={"skip_tools": "samshee"}),
+            samplesheet=sheet,
         )
 
 
@@ -505,3 +588,104 @@ def test_collect_results_missing_outdir_fails_permanently(tmp_path, monkeypatch)
     ctx, _ = make_ctx(tmp_path)
     with pytest.raises(PermanentStepError):
         steps.collect_results.__wrapped__(ctx, scenario=SCENARIO)
+
+
+# ---------------------------------------------------------------------------
+# execute_demux with the SLURM executor
+# ---------------------------------------------------------------------------
+
+
+class StubSlurmManager:
+    """A SlurmJobManager stand-in: no sbatch/sacct, script path captured."""
+
+    def __init__(self, job_id, final_state):
+        self._job_id = job_id
+        self._final_state = final_state
+        self.submitted: list[Path] = []
+        self.wait_args = None
+
+    async def submit_job(self, script_path):
+        self.submitted.append(Path(script_path))
+        return self._job_id
+
+    async def wait_for_completion(self, job_id, poll_interval=None):
+        self.wait_args = (job_id, poll_interval)
+        return self._final_state
+
+
+def test_execute_demux_slurm_submits_and_waits(tmp_path, monkeypatch):
+    use_config(monkeypatch, tmp_path, executor="slurm")
+    runfolder = tmp_path / "fc"
+    runfolder.mkdir()
+    ctx, recorded = make_ctx(tmp_path)
+    sheet = write_sheet(tmp_path)
+
+    stub = StubSlurmManager("42", "COMPLETED")
+    monkeypatch.setattr(SlurmManagerFactory, "get_manager", lambda is_dev: stub)
+
+    result = steps.execute_demux.__wrapped__(
+        ctx, scenario=step_scenario(runfolder), samplesheet=sheet
+    )
+
+    tag = "FC/lane_1_settings_0"
+    assert result.metrics == {
+        "branch": tag,
+        "executor": "slurm",
+        "job_id": "42",
+        "final_state": "COMPLETED",
+        "script": str(ctx.workdir / "nextflow_slurm.sh"),
+        "work_dir": str(tmp_path / "nf-work" / tag),
+        "outdir": str(tmp_path / "nf-results" / tag),
+    }
+    # The batch script carries the resource directives and the real argv.
+    script = ctx.workdir / "nextflow_slurm.sh"
+    assert script.exists()
+    text = script.read_text()
+    assert f"#SBATCH --job-name={slurm_job_name(tag)}" in text
+    assert "#SBATCH --cpus-per-task=4" in text
+    assert f"--flowcell_samplesheet {shlex.quote(str(sheet.resolve()))}" in text
+    assert stub.submitted == [script]
+    # One loop for submit + wait, with the explicit poll interval.
+    assert stub.wait_args == ("42", 5.0)
+    # The (shared-volume) log is recorded like on the local path.
+    assert "logs" in [ref.folder for ref, _ in recorded]
+
+
+def test_execute_demux_slurm_failed_state_fails_permanently(tmp_path, monkeypatch):
+    use_config(monkeypatch, tmp_path, executor="slurm")
+    runfolder = tmp_path / "fc"
+    runfolder.mkdir()
+    ctx, _ = make_ctx(tmp_path)
+    sheet = write_sheet(tmp_path)
+    # The node writes the shared-volume log; simulate a failed run.
+    (ctx.workdir / "nextflow_run.log").write_text("ERROR: boom\n")
+
+    monkeypatch.setattr(
+        SlurmManagerFactory,
+        "get_manager",
+        lambda is_dev: StubSlurmManager("43", "FAILED"),
+    )
+    with pytest.raises(PermanentStepError, match="FAILED"):
+        steps.execute_demux.__wrapped__(
+            ctx, scenario=step_scenario(runfolder), samplesheet=sheet
+        )
+
+
+def test_execute_demux_slurm_submission_failure_fails_permanently(
+    tmp_path, monkeypatch
+):
+    use_config(monkeypatch, tmp_path, executor="slurm")
+    runfolder = tmp_path / "fc"
+    runfolder.mkdir()
+    ctx, _ = make_ctx(tmp_path)
+    sheet = write_sheet(tmp_path)
+
+    monkeypatch.setattr(
+        SlurmManagerFactory,
+        "get_manager",
+        lambda is_dev: StubSlurmManager(None, None),
+    )
+    with pytest.raises(PermanentStepError, match="sbatch submission failed"):
+        steps.execute_demux.__wrapped__(
+            ctx, scenario=step_scenario(runfolder), samplesheet=sheet
+        )
