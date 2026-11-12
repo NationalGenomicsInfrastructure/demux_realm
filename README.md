@@ -168,15 +168,32 @@ all of the lane's later steps run again. Unchanged lanes are reused.
 Two things are deliberately kept. The Nextflow work directories stay, so
 `-resume` reuses the tasks whose inputs did not change. The `x_flowcells`
 document is not cleaned either, so operators keep seeing the earlier results
-while a lane is re-demultiplexed. Each branch's `upload_results` overwrites
-its own `Demultiplex_lane_<n>_settings_<i>` field. Once all of a lane's
-branches have uploaded, the lane's aggregate steps drop the lane's fields for
+while a lane is re-demultiplexed.
+
+Each branch's parsed bcl-convert reports are stored under one field of the
+`x_flowcells` document, nested by lane and then settings index:
+
+```json
+"demux_realm_bclconvert_reports": {
+  "lane_1": {
+    "settings_0": {"Demultiplex_Stats": [...], "Quality_Metrics": [...], "Top_Unknown_Barcodes": [...]},
+    "settings_1": {...}
+  },
+  "lane_2": {"settings_0": {...}}
+}
+```
+
+Each branch's `upload_results` replaces only its own
+`lane_<n>` → `settings_<i>` entry and carries every other entry over, so
+branches never overwrite each other's reports. Once all of a lane's branches
+have uploaded, the lane's aggregate steps drop the lane's entries for
 settings indices no longer planned and rebuild `illumina` and `Undetermined`
-from every branch field on the document.
+from every entry in the field. Only those two derived fields are read by the
+StatusDB views; the reports field is the realm's own source data for them.
 
 `prune_stale_lanes` removes the results directories and links of lanes no
-longer in the samplesheets. Their `x_flowcells` fields are not removed, and
-stay in the aggregated stats until removed by hand.
+longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
+in the aggregated stats until removed by hand.
 
 A retry after a failed branch re-runs only that branch: the lane's
 `clean_lane` step is reused, so successful siblings keep their results. To
@@ -251,7 +268,7 @@ a new generation.
 > **Warning: `x_flowcells` documents are replaced, not merged.** The metadata
 > update saves by `name` with `mode="upsert"`. When a matching document exists,
 > its whole body is replaced; only `_id`, `_rev` and the demux results (the
-> `Demultiplex_lane_<n>_settings_<i>`, `illumina` and `Undetermined` fields)
+> `demux_realm_bclconvert_reports`, `illumina` and `Undetermined` fields)
 > are kept, so other fields written by other processes (for example post-demux
 > `Json_Stats`) are lost. Plan and
 > step IDs changed with the single-plan layout, so the first combined run for a
