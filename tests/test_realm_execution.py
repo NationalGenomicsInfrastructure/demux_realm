@@ -135,7 +135,9 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.setattr(
         realm_steps,
         "load_realm_config",
-        lambda: realm_config_from_mapping({"nextflow": nextflow_dirs}),
+        lambda: realm_config_from_mapping(
+            {"nextflow": {**REQUIRED_NEXTFLOW, **nextflow_dirs}}
+        ),
     )
     monkeypatch.setenv("YGG_WORK_ROOT", str(tmp_path / "work"))
     monkeypatch.setenv("YGG_EVENT_SPOOL", str(tmp_path / "spool"))

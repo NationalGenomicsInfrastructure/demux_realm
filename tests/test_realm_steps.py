@@ -7,6 +7,7 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from realm_support import REQUIRED_NEXTFLOW
 from yggdrasil.flow.errors import PermanentStepError
 
 from demux_realm.config import RealmConfig
@@ -338,7 +339,9 @@ def test_step_samplesheet_missing_bcl_data_raises(tmp_path, scenario):
 def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeypatch):
     realm_config = RealmConfig(
         hpc_base_path="",
-        nextflow=settings_from_mapping({"outdir_base": str(tmp_path / "results")}),
+        nextflow=settings_from_mapping(
+            {**REQUIRED_NEXTFLOW, "outdir_base": str(tmp_path / "results")}
+        ),
     )
     monkeypatch.setattr("demux_realm.steps.load_realm_config", lambda: realm_config)
     scenario: dict[str, Any] = {
@@ -561,7 +564,7 @@ def earlier_run(tmp_path, monkeypatch):
     realm_config = RealmConfig(
         hpc_base_path="",
         nextflow=settings_from_mapping(
-            {"outdir_base": str(results), "work_base": str(work)}
+            {**REQUIRED_NEXTFLOW, "outdir_base": str(results), "work_base": str(work)}
         ),
     )
     monkeypatch.setattr("demux_realm.steps.load_realm_config", lambda: realm_config)
