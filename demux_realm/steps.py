@@ -1,6 +1,5 @@
 import csv
 import logging
-import os
 import re
 import shutil
 import uuid
@@ -85,40 +84,6 @@ def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
 _BRANCH_DIR_RE = re.compile(r"^lane_(?P<lane>[^_]+)_settings_[^_]+$")
 
 
-def _find_x_flowcell(client: Any, name: str) -> dict[str, Any] | None:
-    """Return the x_flowcells document named name, or None if there is none."""
-    existing: Any = None
-    if hasattr(client, "find_one"):
-        existing = client.find_one({"name": {"$eq": name}})
-    elif hasattr(client, "get"):
-        existing = client.get(name)
-    if existing is not None and not isinstance(existing, dict):
-        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
-    return existing
-
-
-def _clean_x_flowcell(client: Any, doc: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of doc without CouchDB's _id and _rev, ready to save back.
-
-    DataAccess.save() manages those itself through the selector (fetching the
-    current _rev and retrying on a 409 conflict), so callers only strip them;
-    they never resolve conflicts.
-    """
-    if hasattr(client, "clean_doc"):
-        return client.clean_doc(doc)
-    return {k: v for k, v in doc.items() if k not in ("_id", "_rev")}
-
-
-def _lane_key(lane_id: object) -> str:
-    """Return a lane's key in the reports field, e.g. lane_1."""
-    return f"lane_{lane_id}"
-
-
-def _settings_key(settings_index: object) -> str:
-    """Return a settings index's key within a lane's reports, e.g. settings_0."""
-    return f"settings_{settings_index}"
-
-
 def _mapping_at(value: Any, where: str) -> dict[str, Any]:
     """Return a shallow copy of value, which must be a mapping or missing."""
     if value is None:
@@ -149,11 +114,11 @@ def _with_branch_report(
     reports = _mapping_at(
         doc.get("demux_realm_bclconvert_reports"), "demux_realm_bclconvert_reports"
     )
-    lane_key = _lane_key(lane_id)
+    lane_key = f"lane_{lane_id}"
     lane = _mapping_at(
         reports.get(lane_key), f"demux_realm_bclconvert_reports.{lane_key}"
     )
-    lane[_settings_key(settings_index)] = report
+    lane[f"settings_{settings_index}"] = report
     reports[lane_key] = lane
     return reports
 
@@ -185,11 +150,11 @@ def _drop_superseded_reports(doc: dict[str, Any], scenario: dict) -> list[str]:
     reports = _mapping_at(
         doc.get("demux_realm_bclconvert_reports"), "demux_realm_bclconvert_reports"
     )
-    lane_key = _lane_key(scenario["lane_id"])
+    lane_key = f"lane_{scenario['lane_id']}"
     lane = _mapping_at(
         reports.get(lane_key), f"demux_realm_bclconvert_reports.{lane_key}"
     )
-    planned = {_settings_key(index) for index in scenario["settings_indices"]}
+    planned = {f"settings_{index}" for index in scenario["settings_indices"]}
     superseded = sorted(key for key in lane if key not in planned)
     if not superseded:
         return []
@@ -242,14 +207,14 @@ def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
     """
     if not outdirs or not demux_dir.is_dir():
         return []
+    # Resolve both sides, so links through symlinked directories still match.
+    resolved_outdirs = [outdir.resolve() for outdir in outdirs]
     removed = []
     for link in sorted(demux_dir.iterdir()):
         if not link.is_symlink():
             continue
-        target = Path(os.readlink(link))
-        if not target.is_absolute():
-            target = demux_dir / target
-        if any(target.is_relative_to(outdir) for outdir in outdirs):
+        target = link.resolve()
+        if any(target.is_relative_to(outdir) for outdir in resolved_outdirs):
             link.unlink()
             removed.append(str(link))
     return removed
@@ -616,7 +581,7 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
     client = ctx.data.connection("x_flowcells_db")
-    existing = _find_x_flowcell(client, name) or {}
+    existing = client.find_one({"name": {"$eq": name}}) or {}
     kept = {
         key: value
         for key, value in existing.items()
@@ -927,7 +892,7 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
             demux_dir / fq.name
         )  # TODO: should be demux_dir / project / sample / fq.name
         # is_symlink() also sees a dangling link, which exists() does not.
-        if symlink_path.is_symlink() and Path(os.readlink(symlink_path)) != fq:
+        if symlink_path.is_symlink() and symlink_path.resolve() != fq.resolve():
             # Left by an earlier run that clean_lane did not cover.
             logger.warning("Replacing stale symlink %s", symlink_path)
             symlink_path.unlink()
@@ -980,11 +945,11 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
         )
 
     client = ctx.data.connection("x_flowcells_db")
-    existing = _find_x_flowcell(client, name) or {"name": name}
+    existing = client.find_one({"name": {"$eq": name}}) or {"name": name}
 
     lane_id, settings_index = scenario["lane_id"], scenario["settings_index"]
-    branch_entry = f"{_lane_key(lane_id)}/{_settings_key(settings_index)}"
-    updated_doc = _clean_x_flowcell(client, existing)
+    branch_entry = f"lane_{lane_id}/settings_{settings_index}"
+    updated_doc = client.clean_doc(existing)
     updated_doc["demux_realm_bclconvert_reports"] = _with_branch_report(
         updated_doc, lane_id, settings_index, metadata
     )
@@ -1031,14 +996,14 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     name = derive_xflowcell_name(runfolder_id)
     client = ctx.data.connection("x_flowcells_db")
 
-    existing = _find_x_flowcell(client, name)
+    existing = client.find_one({"name": {"$eq": name}})
     if existing is None:
         raise PermanentStepError(
             f"x_flowcells document '{name}' not found.",
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
 
-    updated_doc = _clean_x_flowcell(client, existing)
+    updated_doc = client.clean_doc(existing)
     superseded = _drop_superseded_reports(updated_doc, scenario)
 
     demux_stats_rows: list[dict[str, str]] = []
@@ -1098,14 +1063,14 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     name = derive_xflowcell_name(runfolder_id)
     client = ctx.data.connection("x_flowcells_db")
 
-    existing = _find_x_flowcell(client, name)
+    existing = client.find_one({"name": {"$eq": name}})
     if existing is None:
         raise PermanentStepError(
             f"x_flowcells document '{name}' not found.",
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
 
-    updated_doc = _clean_x_flowcell(client, existing)
+    updated_doc = client.clean_doc(existing)
     superseded = _drop_superseded_reports(updated_doc, scenario)
 
     top_unknown_rows: list[dict[str, str]] = []

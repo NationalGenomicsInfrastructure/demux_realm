@@ -1,5 +1,6 @@
 import hashlib
 import json
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,6 @@ UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
 PRUNE_STALE_LANES = "prune_stale_lanes"
 
 
-def lane_namespace(lane_id: str) -> str:
-    """Return the step-ID prefix of one lane's own steps, e.g. lane_2."""
-    return f"lane_{lane_id}"
-
-
 def branch_namespace(lane_id: str, settings_index: str) -> str:
     """Return the step-ID prefix of one lane/settings branch, e.g. lane_2_settings_0."""
     return f"lane_{lane_id}_settings_{settings_index}"
@@ -34,7 +30,7 @@ def branch_namespace(lane_id: str, settings_index: str) -> str:
 
 def clean_lane_step_id(lane_id: str) -> str:
     """Return the ID of the step that removes a lane's earlier results."""
-    return f"{lane_namespace(lane_id)}__clean_lane"
+    return f"lane_{lane_id}__clean_lane"
 
 
 #: Input key under which every step of a lane declares its cleanup token.
@@ -51,10 +47,10 @@ def group_by_lane(
     branches: Sequence[SamplesheetBranch],
 ) -> dict[str, list[SamplesheetBranch]]:
     """Group branches by lane, keeping the order lanes and branches come in."""
-    lanes: dict[str, list[SamplesheetBranch]] = {}
+    lanes: defaultdict[str, list[SamplesheetBranch]] = defaultdict(list)
     for branch in branches:
-        lanes.setdefault(branch.lane_id, []).append(branch)
-    return lanes
+        lanes[branch.lane_id].append(branch)
+    return dict(lanes)
 
 
 def build_demux_plan(
@@ -169,8 +165,8 @@ def build_demux_plan(
             }
         )
         clean_lane = clean_lane_step_id(lane_id)
-        cleanup_token = str(artifact_base / lane_namespace(lane_id) / "cleanup.token")
-        lane_inputs = {LANE_CLEANUP_INPUT: cleanup_token}
+        cleanup_token = artifact_base / f"lane_{lane_id}" / "cleanup.token"
+        lane_inputs = {LANE_CLEANUP_INPUT: str(cleanup_token)}
         steps.append(
             StepSpec(
                 step_id=clean_lane,
@@ -181,11 +177,11 @@ def build_demux_plan(
                         **common,
                         "lane_id": lane_id,
                         "lane_digest": lane_digest,
-                        "cleanup_token": cleanup_token,
+                        "cleanup_token": str(cleanup_token),
                     }
                 },
                 deps=list(branch_prerequisites),
-                outputs={"cleanup_token": cleanup_token},
+                outputs={"cleanup_token": str(cleanup_token)},
             )
         )
         # Settings level: one chain of steps per lane/settings branch.
@@ -200,7 +196,7 @@ def build_demux_plan(
                 "demux_sample_info_doc": {"metadata": metadata},
             }
 
-            samplesheet_path = Path(artifact_base / ns / "SampleSheet.csv")
+            samplesheet_path = artifact_base / ns / "SampleSheet.csv"
             run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
             # Relative outputs resolve inside each producer's own work directory.
             steps += [
@@ -283,7 +279,7 @@ def build_demux_plan(
         ]
         steps += [
             StepSpec(
-                step_id=f"{lane_namespace(lane_id)}__aggregate_illumina_stats",
+                step_id=f"lane_{lane_id}__aggregate_illumina_stats",
                 name=f"Aggregate Illumina Demux Stats (lane {lane_id})",
                 fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
                 params={"scenario": dict(lane_scenario)},
@@ -291,7 +287,7 @@ def build_demux_plan(
                 inputs=dict(lane_inputs),
             ),
             StepSpec(
-                step_id=f"{lane_namespace(lane_id)}__aggregate_undetermined_stats",
+                step_id=f"lane_{lane_id}__aggregate_undetermined_stats",
                 name=f"Aggregate Undetermined Barcode Stats (lane {lane_id})",
                 fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
                 params={"scenario": dict(lane_scenario)},

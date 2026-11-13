@@ -763,6 +763,9 @@ class StoredXFlowcells:
     def find_one(self, selector):
         return copy.deepcopy(self.doc)
 
+    def clean_doc(self, doc):
+        return {k: v for k, v in doc.items() if k not in ("_id", "_rev")}
+
     def save(self, doc, **kwargs):
         assert "_id" not in doc and "_rev" not in doc
         self.doc = {"_id": "doc-1", "_rev": "n-x", **copy.deepcopy(doc)}

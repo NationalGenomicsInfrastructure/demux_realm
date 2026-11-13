@@ -97,6 +97,12 @@ class FakeXFlowcells:
         self.saved: list[tuple[dict, dict]] = []
         self.error: Exception | None = None
 
+    def find_one(self, selector):
+        return None
+
+    def clean_doc(self, doc):
+        return {k: v for k, v in doc.items() if k not in ("_id", "_rev")}
+
     def save(self, doc: dict, **kwargs) -> SimpleNamespace:
         if self.error is not None:
             raise self.error
@@ -207,6 +213,9 @@ class StoredXFlowcells:
 
     def find_one(self, selector):
         return copy.deepcopy(self.doc)
+
+    def clean_doc(self, doc):
+        return {k: v for k, v in doc.items() if k not in ("_id", "_rev")}
 
     def save(self, doc: dict, **kwargs) -> SimpleNamespace:
         self.doc = copy.deepcopy(doc)
