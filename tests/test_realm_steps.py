@@ -1,15 +1,24 @@
+import copy
+import os
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from realm_support import REQUIRED_NEXTFLOW
+from yggdrasil.flow.errors import PermanentStepError
 
 from demux_realm.config import RealmConfig
 from demux_realm.nextflow import settings_from_mapping
 from demux_realm.steps import (
     aggregate_illumina_stats,
+    aggregate_undetermined_stats,
+    clean_lane,
     collect_results,
+    prune_stale_lanes,
+    symlink_fastqs,
     upload_results,
     upsert_x_flowcell_pre_demux,
     validate_runfolder,
@@ -22,6 +31,10 @@ _collect_results = collect_results.__wrapped__  # type: ignore[attr-defined]
 _upload_results = upload_results.__wrapped__  # type: ignore[attr-defined]
 _validate_runfolder = validate_runfolder.__wrapped__  # type: ignore[attr-defined]
 _aggregate_illumina_stats = aggregate_illumina_stats.__wrapped__  # type: ignore[attr-defined]
+_clean_lane = clean_lane.__wrapped__  # type: ignore[attr-defined]
+_aggregate_undetermined_stats = aggregate_undetermined_stats.__wrapped__  # type: ignore[attr-defined]
+_prune_stale_lanes = prune_stale_lanes.__wrapped__  # type: ignore[attr-defined]
+_symlink_fastqs = symlink_fastqs.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -114,6 +127,7 @@ def _make_ctx(tmp_path, *, save_status="created", save_doc_id="couch-id-abc123")
     write_result.doc_id = save_doc_id
 
     x_flowcells_client = MagicMock()
+    x_flowcells_client.find_one.return_value = None
     x_flowcells_client.save.return_value = write_result
     ctx.data.connection.return_value = x_flowcells_client
     return ctx, x_flowcells_client
@@ -155,6 +169,39 @@ def test_step_payload_has_no_id_or_rev(tmp_path, scenario):
 # ---------------------------------------------------------------------------
 # Payload content
 # ---------------------------------------------------------------------------
+
+
+def test_step_keeps_demux_results_of_the_existing_document(tmp_path, scenario):
+    ctx, x_client = _make_ctx(tmp_path)
+    x_client.find_one.return_value = {
+        "_id": "doc-1",
+        "_rev": "3-x",
+        "name": "20260312_ASC2177698-SC3",
+        "samplesheet_csv": ["stale"],
+        "Json_Stats": {"x": 1},
+        "demux_realm_bclconvert_reports": {
+            "lane_1": {"settings_0": {"Demultiplex_Stats": [{"Lane": "1"}]}}
+        },
+        "illumina": {"Demultiplex_Stats": {}},
+        "Undetermined": {"1": {}},
+    }
+
+    result = _step(ctx, scenario)
+
+    payload = _saved_payload(x_client)
+    assert payload["demux_realm_bclconvert_reports"] == {
+        "lane_1": {"settings_0": {"Demultiplex_Stats": [{"Lane": "1"}]}}
+    }
+    assert payload["illumina"] == {"Demultiplex_Stats": {}}
+    assert payload["Undetermined"] == {"1": {}}
+    assert "Json_Stats" not in payload
+    assert payload["samplesheet_csv"] != ["stale"]
+    assert "_id" not in payload and "_rev" not in payload
+    assert result.metrics["kept_fields"] == [
+        "Undetermined",
+        "demux_realm_bclconvert_reports",
+        "illumina",
+    ]
 
 
 def test_step_payload_has_required_fields(tmp_path, scenario):
@@ -292,7 +339,9 @@ def test_step_samplesheet_missing_bcl_data_raises(tmp_path, scenario):
 def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeypatch):
     realm_config = RealmConfig(
         hpc_base_path="",
-        nextflow=settings_from_mapping({"outdir_base": str(tmp_path / "results")}),
+        nextflow=settings_from_mapping(
+            {**REQUIRED_NEXTFLOW, "outdir_base": str(tmp_path / "results")}
+        ),
     )
     monkeypatch.setattr("demux_realm.steps.load_realm_config", lambda: realm_config)
     scenario: dict[str, Any] = {
@@ -343,12 +392,12 @@ def test_collect_results_and_upload_results_update_x_flowcells(tmp_path, monkeyp
     saved_doc = client.save.call_args.args[0]
     assert "_id" not in saved_doc
     assert "_rev" not in saved_doc
-    branch_field = "Demultiplex_lane_1_settings_0"
-    assert saved_doc[branch_field]["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
-    assert saved_doc[branch_field]["Quality_Metrics"][0]["Mean_Q30"] == "92.1"
-    assert saved_doc[branch_field]["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
+    report = saved_doc["demux_realm_bclconvert_reports"]["lane_1"]["settings_0"]
+    assert report["Demultiplex_Stats"][0]["Sample"] == "P12345_1001"
+    assert report["Quality_Metrics"][0]["Mean_Q30"] == "92.1"
+    assert report["Top_Unknown_Barcodes"][0]["Barcode"] == "ACGT"
     assert upload_result.metrics["upload_status"] == "simulated_success"
-    assert upload_result.metrics["demultiplex_field"] == branch_field
+    assert upload_result.metrics["report_entry"] == "lane_1/settings_0"
 
 
 def _qm_row(lane, sample, read_number, yield_, yield_q30, quality_sum):
@@ -371,7 +420,7 @@ def test_aggregate_illumina_stats_combines_all_lanes():
             {"Sample_ID": "P1_101", "Sample_Project": "A__Proj"},
             {"Sample_ID": "P2_201", "Sample_Project": "B__Proj"},
         ],
-        "Demultiplex_lane_1_settings_0": {
+        "lane_1_settings_0": {
             "Demultiplex_Stats": [
                 {
                     "Lane": "1",
@@ -406,7 +455,7 @@ def test_aggregate_illumina_stats_combines_all_lanes():
                 _qm_row("1", "Undetermined", "2", 50_000_000, 19_000_000, 900_000_000),
             ],
         },
-        "Demultiplex_lane_2_settings_0": {
+        "lane_2_settings_0": {
             "Demultiplex_Stats": [
                 {
                     "Lane": "2",
@@ -427,6 +476,11 @@ def test_aggregate_illumina_stats_combines_all_lanes():
         },
     }
 
+    # Each lane's rows are stored as that lane's settings 0 report.
+    existing["demux_realm_bclconvert_reports"] = {
+        "lane_1": {"settings_0": existing.pop("lane_1_settings_0")},
+        "lane_2": {"settings_0": existing.pop("lane_2_settings_0")},
+    }
     client = MagicMock()
     client.find_one.return_value = existing
     client.clean_doc.side_effect = lambda doc: {
@@ -436,7 +490,11 @@ def test_aggregate_illumina_stats_combines_all_lanes():
     ctx = MagicMock()
     ctx.data.connection.return_value = client
 
-    scenario = {"runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3"}
+    scenario = {
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+        "lane_id": "1",
+        "settings_indices": ["0"],
+    }
     result = _aggregate_illumina_stats(ctx, scenario)
 
     saved_doc = client.save.call_args.args[0]
@@ -489,3 +547,347 @@ def test_step_raises_when_data_not_injected(tmp_path, scenario):
     ctx.data = None
     with pytest.raises(RuntimeError, match="DataAccess.*not injected"):
         _step(ctx, scenario)
+
+
+# ---------------------------------------------------------------------------
+# Lane cleanup
+# ---------------------------------------------------------------------------
+
+_FCID = "SC2177698-SC3"
+_BRANCHES = ("lane_1_settings_0", "lane_1_settings_1", "lane_2_settings_0")
+
+
+@pytest.fixture
+def earlier_run(tmp_path, monkeypatch):
+    """Lay out the results, work dirs, links and fields of an earlier run."""
+    results, work = tmp_path / "results", tmp_path / "work"
+    realm_config = RealmConfig(
+        hpc_base_path="",
+        nextflow=settings_from_mapping(
+            {**REQUIRED_NEXTFLOW, "outdir_base": str(results), "work_base": str(work)}
+        ),
+    )
+    monkeypatch.setattr("demux_realm.steps.load_realm_config", lambda: realm_config)
+    runfolder = tmp_path / "runfolder"
+    demux_dir = runfolder / "Demultiplexing"
+    demux_dir.mkdir(parents=True)
+    for branch in _BRANCHES:
+        fastq = results / _FCID / branch / _FCID / f"{branch}_R1.fastq.gz"
+        fastq.parent.mkdir(parents=True)
+        fastq.touch()
+        (work / _FCID / branch / "ab").mkdir(parents=True)
+        (demux_dir / fastq.name).symlink_to(fastq)
+    # A dangling link left by a branch whose results are already gone.
+    (demux_dir / "gone_R1.fastq.gz").symlink_to(
+        results / _FCID / "lane_1_settings_7" / "gone_R1.fastq.gz"
+    )
+    (results / _FCID / "lane_1_settings_7").mkdir()
+    (demux_dir / "unrelated.txt").touch()
+
+    doc = {
+        "_id": "doc-123",
+        "_rev": "2-abc",
+        "name": "20260312_ASC2177698-SC3",
+        "illumina": {"x": 1},
+        "demux_realm_bclconvert_reports": {
+            "lane_1": {
+                "settings_0": {"Demultiplex_Stats": [{"SampleID": "L1S0"}]},
+                "settings_1": {"Demultiplex_Stats": [{"SampleID": "L1S1"}]},
+            },
+            "lane_2": {"settings_0": {"Demultiplex_Stats": [{"SampleID": "L2S0"}]}},
+        },
+    }
+    ctx = MagicMock()
+    client = ctx.data.connection.return_value
+    client.find_one.return_value = doc
+    client.clean_doc.side_effect = lambda d: {
+        k: v for k, v in d.items() if k not in ("_id", "_rev")
+    }
+    scenario = {
+        "canonical_flowcell_id": _FCID,
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+        "hpc_runfolder_path": str(runfolder),
+        "cleanup_token": str(tmp_path / "artifacts" / "lane_1" / "cleanup.token"),
+    }
+    return SimpleNamespace(
+        results=results,
+        work=work,
+        demux_dir=demux_dir,
+        ctx=ctx,
+        client=client,
+        scenario=scenario,
+    )
+
+
+def test_clean_lane_removes_only_that_lanes_results(earlier_run):
+    result = _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "1"})
+
+    flowcell_results = earlier_run.results / _FCID
+    assert sorted(p.name for p in flowcell_results.iterdir()) == ["lane_2_settings_0"]
+    assert sorted(p.name for p in earlier_run.demux_dir.iterdir()) == [
+        "lane_2_settings_0_R1.fastq.gz",
+        "unrelated.txt",
+    ]
+    assert len(result.metrics["removed_symlinks"]) == 3
+    # Results of settings 0, 1 and 7, and work dirs of settings 0 and 1.
+    assert len(result.metrics["removed_dirs"]) == 5
+
+
+def test_clean_lane_writes_a_new_token_every_run(earlier_run):
+    scenario = {**earlier_run.scenario, "lane_id": "1"}
+    token = Path(scenario["cleanup_token"])
+
+    _clean_lane(earlier_run.ctx, scenario)
+    first = token.read_text()
+    _clean_lane(earlier_run.ctx, scenario)
+
+    assert first.strip()
+    assert token.read_text() != first
+
+
+def test_clean_lane_removes_work_dirs_but_keeps_x_flowcells(earlier_run):
+    _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "1"})
+
+    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == [
+        "lane_2_settings_0"
+    ]
+    earlier_run.ctx.data.connection.assert_not_called()
+
+
+def test_clean_lane_without_earlier_results_does_nothing(earlier_run):
+    result = _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "3"})
+
+    assert result.metrics["removed_dirs"] == []
+    assert result.metrics["removed_symlinks"] == []
+
+
+@pytest.mark.parametrize("fcid", ["", "..", "a/b"])
+def test_clean_lane_refuses_a_flowcell_id_that_is_not_one_component(
+    earlier_run, fcid
+):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "canonical_flowcell_id": fcid}
+
+    with pytest.raises(PermanentStepError, match="Refusing"):
+        _clean_lane(earlier_run.ctx, scenario)
+
+
+def test_prune_stale_lanes_removes_lanes_outside_the_plan(earlier_run):
+    result = _prune_stale_lanes(
+        earlier_run.ctx, {**earlier_run.scenario, "lanes": ["1"]}
+    )
+
+    assert sorted(p.name for p in (earlier_run.results / _FCID).iterdir()) == [
+        "lane_1_settings_0",
+        "lane_1_settings_1",
+        "lane_1_settings_7",
+    ]
+    assert "lane_2_settings_0_R1.fastq.gz" not in {
+        p.name for p in earlier_run.demux_dir.iterdir()
+    }
+    assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == [
+        "lane_1_settings_0",
+        "lane_1_settings_1",
+    ]
+    assert result.metrics["removed_dirs"] == [
+        str(earlier_run.results / _FCID / "lane_2_settings_0"),
+        str(earlier_run.work / _FCID / "lane_2_settings_0"),
+    ]
+
+
+def test_prune_stale_lanes_keeps_every_planned_lane(earlier_run):
+    result = _prune_stale_lanes(
+        earlier_run.ctx, {**earlier_run.scenario, "lanes": ["1", "2"]}
+    )
+
+    assert result.metrics == {"removed_dirs": [], "removed_symlinks": []}
+
+
+def test_symlink_fastqs_replaces_a_dangling_link(earlier_run):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+    fastq = (
+        earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
+        / "lane_1_settings_0_R1.fastq.gz"
+    )
+    link = earlier_run.demux_dir / fastq.name
+    link.unlink()
+    link.symlink_to(earlier_run.results / "gone" / fastq.name)
+
+    _symlink_fastqs(earlier_run.ctx, scenario)
+
+    assert link.resolve() == fastq.resolve()
+
+
+def test_symlink_fastqs_keeps_a_current_link(earlier_run):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+    link = earlier_run.demux_dir / "lane_1_settings_0_R1.fastq.gz"
+    before = os.readlink(link)
+
+    _symlink_fastqs(earlier_run.ctx, scenario)
+
+    assert os.readlink(link) == before
+
+
+@pytest.mark.parametrize(
+    "aggregate", [_aggregate_illumina_stats, _aggregate_undetermined_stats]
+)
+def test_lane_aggregate_drops_only_its_lanes_superseded_settings(
+    earlier_run, aggregate
+):
+    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_indices": ["0"]}
+
+    result = aggregate(earlier_run.ctx, scenario)
+
+    saved = earlier_run.client.save.call_args.args[0]
+    assert saved["demux_realm_bclconvert_reports"] == {
+        "lane_1": {"settings_0": {"Demultiplex_Stats": [{"SampleID": "L1S0"}]}},
+        "lane_2": {"settings_0": {"Demultiplex_Stats": [{"SampleID": "L2S0"}]}},
+    }
+    assert result.metrics["removed_superseded_reports"] == ["lane_1/settings_1"]
+
+
+# ---------------------------------------------------------------------------
+# Branch reports never overwrite each other
+# ---------------------------------------------------------------------------
+
+
+class StoredXFlowcells:
+    """x_flowcells client backed by one stored document.
+
+    Reads and saves deep-copy, as a real database does, so a step can only
+    keep another branch's report by carrying it over explicitly.
+    """
+
+    def __init__(self, doc=None):
+        self.doc = copy.deepcopy(doc)
+
+    def find_one(self, selector):
+        return copy.deepcopy(self.doc)
+
+    def clean_doc(self, doc):
+        return {k: v for k, v in doc.items() if k not in ("_id", "_rev")}
+
+    def save(self, doc, **kwargs):
+        assert "_id" not in doc and "_rev" not in doc
+        self.doc = {"_id": "doc-1", "_rev": "n-x", **copy.deepcopy(doc)}
+        return SimpleNamespace(status="updated", doc_id="doc-1")
+
+
+def _report(sample, lane):
+    return {
+        "Demultiplex_Stats": [{"Lane": lane, "SampleID": sample, "# Reads": "100"}],
+        "Quality_Metrics": [
+            {"Lane": lane, "SampleID": sample, "ReadNumber": "1", "Yield": "1000"}
+        ],
+        "Top_Unknown_Barcodes": [
+            {"Lane": lane, "index": "GGGG", "index2": "", "# Reads": "7"}
+        ],
+    }
+
+
+def _upload(store, lane, settings, sample):
+    ctx = MagicMock()
+    ctx.data.connection.return_value = store
+    scenario = {
+        "canonical_flowcell_id": _FCID,
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+        "lane_id": lane,
+        "settings_index": settings,
+        "demultiplexing_metadata": _report(sample, lane),
+    }
+    return _upload_results(ctx, scenario)
+
+
+def _stored_samples(store):
+    return {
+        lane: {
+            settings: report["Demultiplex_Stats"][0]["SampleID"]
+            for settings, report in lanes.items()
+        }
+        for lane, lanes in store.doc["demux_realm_bclconvert_reports"].items()
+    }
+
+
+def test_uploads_of_different_branches_keep_each_others_reports():
+    store = StoredXFlowcells({"name": "20260312_ASC2177698-SC3", "Json_Stats": 1})
+
+    _upload(store, "1", "0", "A")
+    _upload(store, "1", "1", "B")
+    _upload(store, "2", "0", "C")
+
+    assert _stored_samples(store) == {
+        "lane_1": {"settings_0": "A", "settings_1": "B"},
+        "lane_2": {"settings_0": "C"},
+    }
+    assert store.doc["Json_Stats"] == 1
+
+
+def test_reupload_replaces_only_its_own_report():
+    store = StoredXFlowcells({"name": "20260312_ASC2177698-SC3"})
+    _upload(store, "1", "0", "A")
+    _upload(store, "1", "1", "B")
+    _upload(store, "2", "0", "C")
+
+    _upload(store, "1", "0", "A2")
+
+    assert _stored_samples(store) == {
+        "lane_1": {"settings_0": "A2", "settings_1": "B"},
+        "lane_2": {"settings_0": "C"},
+    }
+
+
+def test_upload_refuses_a_malformed_reports_field():
+    store = StoredXFlowcells(
+        {"name": "20260312_ASC2177698-SC3", "demux_realm_bclconvert_reports": []}
+    )
+
+    with pytest.raises(PermanentStepError, match="demux_realm_bclconvert_reports"):
+        _upload(store, "1", "0", "A")
+    assert store.doc["demux_realm_bclconvert_reports"] == []
+
+
+def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario):
+    store = StoredXFlowcells({"name": "20260312_ASC2177698-SC3"})
+    _upload(store, "1", "0", "A")
+    _upload(store, "1", "1", "B")
+    _upload(store, "2", "0", "C")
+    ctx = MagicMock()
+    ctx.data.connection.return_value = store
+
+    _step(ctx, scenario)
+    lane_1 = {**scenario, "lane_id": "1", "settings_indices": ["0", "1"]}
+    _aggregate_illumina_stats(ctx, lane_1)
+    _aggregate_undetermined_stats(ctx, lane_1)
+
+    assert _stored_samples(store) == {
+        "lane_1": {"settings_0": "A", "settings_1": "B"},
+        "lane_2": {"settings_0": "C"},
+    }
+    rows = store.doc["illumina"]["Demultiplex_Stats"]["Barcode_lane_statistics"]
+    assert sorted(row["Sample"] for row in rows) == ["A", "B", "C"]
+    assert store.doc["Undetermined"] == {"1": {"GGGG": 14}, "2": {"GGGG": 7}}
+
+
+@pytest.mark.parametrize(
+    ("settings_count", "undetermined_linked"), [(1, True), (2, False)]
+)
+def test_symlink_fastqs_links_undetermined_only_for_a_single_settings_run(
+    earlier_run, settings_count, undetermined_linked
+):
+    branch_results = earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
+    undetermined = branch_results / "Undetermined_S0_L001_R1_001.fastq.gz"
+    undetermined.touch()
+    scenario = {
+        **earlier_run.scenario,
+        "lane_id": "1",
+        "settings_index": "0",
+        "lane_settings_count": settings_count,
+    }
+
+    result = _symlink_fastqs(earlier_run.ctx, scenario)
+
+    links = {p.name for p in earlier_run.demux_dir.iterdir()}
+    assert "lane_1_settings_0_R1.fastq.gz" in links
+    assert (undetermined.name in links) is undetermined_linked
+    assert result.metrics["skipped_undetermined"] == (
+        [] if undetermined_linked else [str(undetermined)]
+    )

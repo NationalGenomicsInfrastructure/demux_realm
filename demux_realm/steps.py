@@ -1,6 +1,9 @@
 import csv
 import logging
 import re
+import shutil
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -76,8 +79,180 @@ def _load_demux_metadata(reports_dir: Path) -> dict[str, list[dict[str, str]]]:
     return metadata
 
 
-# Matches branch fields written by upload_results, e.g. "Demultiplex_lane_1_settings_0".
-_BRANCH_FIELD_RE = re.compile(r"^Demultiplex_lane_.+_settings_.+$")
+# Per-branch directory names under <base>/<FCID>, e.g. "lane_1_settings_0"
+# (see nextflow.branch_run_tag).
+_BRANCH_DIR_RE = re.compile(r"^lane_(?P<lane>[^_]+)_settings_[^_]+$")
+
+
+def _mapping_at(value: Any, where: str) -> dict[str, Any]:
+    """Return a shallow copy of value, which must be a mapping or missing."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PermanentStepError(
+            f"x_flowcells {where} is a {type(value).__name__}, not an object.",
+            advice="Fix or remove the document's demux_realm_bclconvert_reports field.",
+        )
+    return dict(value)
+
+
+def _with_branch_report(
+    doc: dict[str, Any], lane_id: object, settings_index: object, report: Any
+) -> dict[str, Any]:
+    """Return doc's reports field with one branch's report set.
+
+    The x_flowcells field demux_realm_bclconvert_reports holds every branch's
+    parsed bcl-convert reports as
+    {"lane_<n>": {"settings_<i>": {"Demultiplex_Stats": [rows], ...}}}.
+    upload_results writes one branch's entry; the lane aggregate steps read
+    all of them.
+
+    Each level on the way to the branch's entry is copied rather than
+    replaced, so the reports of every other lane, and of the lane's other
+    settings indices, are carried over unchanged.
+    """
+    reports = _mapping_at(
+        doc.get("demux_realm_bclconvert_reports"), "demux_realm_bclconvert_reports"
+    )
+    lane_key = f"lane_{lane_id}"
+    lane = _mapping_at(
+        reports.get(lane_key), f"demux_realm_bclconvert_reports.{lane_key}"
+    )
+    lane[f"settings_{settings_index}"] = report
+    reports[lane_key] = lane
+    return reports
+
+
+def _branch_reports(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return every branch's report on doc, all lanes, in stored order."""
+    reports = _mapping_at(
+        doc.get("demux_realm_bclconvert_reports"), "demux_realm_bclconvert_reports"
+    )
+    found = []
+    for lane_key, lane in reports.items():
+        where = f"demux_realm_bclconvert_reports.{lane_key}"
+        for settings_key, report in _mapping_at(lane, where).items():
+            found.append(_mapping_at(report, f"{where}.{settings_key}"))
+    return found
+
+
+def _drop_superseded_reports(doc: dict[str, Any], scenario: dict) -> list[str]:
+    """Remove from doc the lane's reports of settings indices no longer planned.
+
+    Called by the lane's aggregate steps, once every branch of the lane has
+    uploaded: until then the earlier results stay visible to operators.
+    Reports of the lane's planned settings indices were already overwritten
+    by their upload_results steps; other lanes' reports are left alone.
+
+    Returns:
+        The removed entries, e.g. ["lane_1/settings_1"].
+    """
+    reports = _mapping_at(
+        doc.get("demux_realm_bclconvert_reports"), "demux_realm_bclconvert_reports"
+    )
+    lane_key = f"lane_{scenario['lane_id']}"
+    lane = _mapping_at(
+        reports.get(lane_key), f"demux_realm_bclconvert_reports.{lane_key}"
+    )
+    planned = {f"settings_{index}" for index in scenario["settings_indices"]}
+    superseded = sorted(key for key in lane if key not in planned)
+    if not superseded:
+        return []
+    for key in superseded:
+        del lane[key]
+    reports[lane_key] = lane
+    doc["demux_realm_bclconvert_reports"] = reports
+    return [f"{lane_key}/{key}" for key in superseded]
+
+
+def _branch_dirs(
+    base: Path, canonical_flowcell_id: str, drop_lane: Callable[[str], bool]
+) -> list[Path]:
+    """Return the branch directories under base/<FCID> whose lane drop_lane selects.
+
+    Raises:
+        PermanentStepError: If the flowcell ID could point outside base.
+    """
+    if (
+        not canonical_flowcell_id
+        or canonical_flowcell_id in (".", "..")
+        or ("/" in canonical_flowcell_id)
+    ):
+        raise PermanentStepError(
+            f"Refusing to clean up for flowcell ID {canonical_flowcell_id!r}.",
+            advice="The canonical flowcell ID must be a single path component.",
+        )
+    flowcell_dir = base / canonical_flowcell_id
+    if not flowcell_dir.is_dir():
+        return []
+    if not flowcell_dir.resolve().is_relative_to(base.resolve()):
+        raise PermanentStepError(
+            f"Refusing to clean up {flowcell_dir}: it resolves outside {base}.",
+            advice="Check the realm config's work_base and outdir_base.",
+        )
+    return sorted(
+        path
+        for path in flowcell_dir.iterdir()
+        if path.is_dir()
+        and not path.is_symlink()
+        and (match := _BRANCH_DIR_RE.match(path.name))
+        and drop_lane(match["lane"])
+    )
+
+
+def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
+    """Remove the links in demux_dir that point into any of outdirs.
+
+    Dangling links count too: their target may already be gone.
+    """
+    if not outdirs or not demux_dir.is_dir():
+        return []
+    # Resolve both sides, so links through symlinked directories still match.
+    resolved_outdirs = [outdir.resolve() for outdir in outdirs]
+    removed = []
+    for link in sorted(demux_dir.iterdir()):
+        if not link.is_symlink():
+            continue
+        target = link.resolve()
+        if any(target.is_relative_to(outdir) for outdir in resolved_outdirs):
+            link.unlink()
+            removed.append(str(link))
+    return removed
+
+
+def _remove_branch_results(
+    scenario: dict, drop_lane: Callable[[str], bool]
+) -> dict[str, Any]:
+    """Remove the selected lanes' demultiplexing results from earlier runs.
+
+    That is: their Nextflow results and work directories, and the links in
+    the runfolder's Demultiplexing directory that point into the results.
+    Removing the work directories means -resume cannot reuse any earlier
+    task, so the lane is demultiplexed from scratch. Settings indices that are
+    no longer planned are matched too, since directories are selected by lane
+    only.
+
+    The x_flowcells document is deliberately kept, so operators keep seeing
+    the earlier results while the lane is re-demultiplexed; the lane's own
+    steps overwrite them when they finish.
+
+    Returns:
+        Metrics listing what was removed.
+    """
+    settings = load_realm_config().nextflow
+    fcid = scenario["canonical_flowcell_id"]
+    outdirs = _branch_dirs(settings.outdir_base, fcid, drop_lane)
+    work_dirs = _branch_dirs(settings.work_base, fcid, drop_lane)
+    demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
+
+    links = _remove_branch_symlinks(demux_dir, outdirs)
+    for path in [*outdirs, *work_dirs]:
+        shutil.rmtree(path)
+        logger.info("Removed %s.", path)
+    return {
+        "removed_dirs": [str(path) for path in [*outdirs, *work_dirs]],
+        "removed_symlinks": links,
+    }
 
 
 def _parse_int(value: str | None) -> int:
@@ -314,6 +489,45 @@ def setup_common_demux_dir(ctx: StepContext, scenario: dict) -> StepResult:
 
 
 @step
+def clean_lane(ctx: StepContext, scenario: dict) -> StepResult:
+    """Remove every earlier demultiplexing result of one lane.
+
+    A lane is the smallest unit that is re-demultiplexed. This step's params
+    carry a digest of the lane's samplesheets, so any change in the lane
+    re-runs it. Each run writes a new random token to scenario's
+    cleanup_token path, which every later step of the lane declares as an
+    input: once the cleanup has run, their fingerprints no longer match and
+    all of them run again, even when the cleanup was forced by removing its
+    success marker. Without the cleanup, a sample removed from a samplesheet
+    would keep its FASTQ files and links from the earlier run. See
+    _remove_branch_results for what is kept.
+    """
+    lane_id = str(scenario["lane_id"])
+    metrics = _remove_branch_results(scenario, lambda lane: lane == lane_id)
+    token = Path(scenario["cleanup_token"])
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text(f"{uuid.uuid4().hex}\n", encoding="utf-8")
+    ctx.record_artifact(SimpleArtifactRef("cleanup_token", "lane"), path=token)
+    logger.info("Cleaned lane %s: %s", lane_id, metrics)
+    return StepResult(metrics={"lane_id": lane_id, **metrics})
+
+
+@step
+def prune_stale_lanes(ctx: StepContext, scenario: dict) -> StepResult:
+    """Remove the earlier demultiplexing results of lanes no longer planned.
+
+    clean_lane covers only the lanes in the plan; this covers a lane removed
+    from the samplesheets altogether, whose results would otherwise stay on
+    disk. Its params hold the planned lanes, so it re-runs whenever that set
+    changes.
+    """
+    planned = {str(lane) for lane in scenario["lanes"]}
+    metrics = _remove_branch_results(scenario, lambda lane: lane not in planned)
+    logger.info("Pruned lanes outside %s: %s", sorted(planned), metrics)
+    return StepResult(metrics=metrics)
+
+
+@step
 def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     """Builds the pre-demux x_flowcells document and persists it to CouchDB.
 
@@ -324,8 +538,13 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
 
     The document is identified by its `name` field (Mango selector). If no
     matching document exists it is created; if exactly one exists its whole body
-    is replaced by this payload, keeping only its _id and _rev. Fields written by
-    other processes, such as post-demux Json_Stats, are not preserved.
+    is replaced by this payload, keeping only its _id and _rev and the demux
+    results: the per-branch reports under demux_realm_bclconvert_reports and the
+    aggregated illumina and Undetermined fields. This step re-runs whenever any
+    samplesheet changes, while the branches of unchanged lanes are reused and
+    do not upload again, so dropping their reports would lose their results.
+    Re-run lanes overwrite their own reports instead. Other fields, such as
+    post-demux Json_Stats, are not preserved.
     """
     runfolder_path = Path(scenario["hpc_runfolder_path"])
     runfolder_id = scenario["runfolder_id"]
@@ -362,8 +581,14 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
     client = ctx.data.connection("x_flowcells_db")
+    existing = client.find_one({"name": {"$eq": name}}) or {}
+    kept = {
+        key: value
+        for key, value in existing.items()
+        if key in ("demux_realm_bclconvert_reports", "illumina", "Undetermined")
+    }
     write_result = client.save(
-        payload,
+        {**kept, **payload},
         selector={"name": {"$eq": name}},
         mode="upsert",
     )
@@ -378,6 +603,7 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
         metrics={
             "x_flowcell_name": name,
             "samplesheet_row_count": len(samplesheet_csv),
+            "kept_fields": sorted(kept),
             "write_status": write_result.status,
             "doc_id": write_result.doc_id,
         }
@@ -634,7 +860,12 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
-    """Symlinks fastq files from the branch's results directory to the common demux directory."""
+    """Symlinks fastq files from the branch's results directory to the common demux directory.
+
+    When the lane has several settings runs (scenario's lane_settings_count),
+    each run writes its own Undetermined FASTQs under the same file names, and
+    the links share one flat directory, so none of them is linked.
+    """
     settings = load_realm_config().nextflow
     tag = branch_run_tag(
         scenario["canonical_flowcell_id"],
@@ -649,12 +880,23 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
         )
     results_dir = outdir / scenario["canonical_flowcell_id"]
     fastqs = sorted(results_dir.rglob("*.fastq.gz"))
+    skipped = []
+    if scenario.get("lane_settings_count", 1) > 1:
+        skipped = [fq for fq in fastqs if fq.name.startswith("Undetermined")]
+        fastqs = [fq for fq in fastqs if fq not in skipped]
+        for fq in skipped:
+            logger.info("Not linking %s: the lane has several settings runs.", fq)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
     for fq in fastqs:
         symlink_path = (
             demux_dir / fq.name
         )  # TODO: should be demux_dir / project / sample / fq.name
-        if not symlink_path.exists():
+        # is_symlink() also sees a dangling link, which exists() does not.
+        if symlink_path.is_symlink() and symlink_path.resolve() != fq.resolve():
+            # Left by an earlier run that clean_lane did not cover.
+            logger.warning("Replacing stale symlink %s", symlink_path)
+            symlink_path.unlink()
+        if not symlink_path.is_symlink() and not symlink_path.exists():
             symlink_path.symlink_to(fq)
             logger.info("Symlinked %s to %s", fq, symlink_path)
         else:
@@ -663,6 +905,7 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
     return StepResult(
         metrics={
             "symlinked_fastq_count": len(fastqs),
+            "skipped_undetermined": [str(fq) for fq in skipped],
             "demux_dir": str(demux_dir),
         }
     )
@@ -671,13 +914,16 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
 @step
 def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
     """Fetch the current x_flowcells doc, add this branch's demux CSV metadata
-    under its own field, and save it back.
+    under its own entry, and save it back.
 
     Each lane/settings branch publishes its Demultiplex_Stats.csv,
-    Quality_Metrics.csv and Top_Unknown_Barcodes.csv rows under a dedicated
-    top-level field named Demultiplex_lane_<lane_id>_settings_<settings_index>.
-    Since the field is unique per branch, branches never collide and a
-    branch can be re-run without touching any other branch's results.
+    Quality_Metrics.csv and Top_Unknown_Barcodes.csv rows at
+    demux_realm_bclconvert_reports -> lane_<lane_id> -> settings_<settings_index>.
+    Only that entry is replaced (see _with_branch_report), so branches never
+    overwrite each other's reports and a branch can be re-run without
+    touching any other branch's results. Steps run one at a time, so no
+    other branch of the plan writes the document between the read and the
+    save.
     """
     logger.info("Uploading metrics to remote API...")
     if ctx.data is None:
@@ -699,28 +945,14 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
         )
 
     client = ctx.data.connection("x_flowcells_db")
-    existing: dict[str, Any] | None = None
-    if hasattr(client, "find_one"):
-        existing = client.find_one({"name": {"$eq": name}})
-    elif hasattr(client, "get"):
-        existing = client.get(name)
-    if existing is None:
-        existing = {"name": name}
-    elif not isinstance(existing, dict):
-        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+    existing = client.find_one({"name": {"$eq": name}}) or {"name": name}
 
-    branch_field = (
-        f"Demultiplex_lane_{scenario['lane_id']}_settings_{scenario['settings_index']}"
+    lane_id, settings_index = scenario["lane_id"], scenario["settings_index"]
+    branch_entry = f"lane_{lane_id}/settings_{settings_index}"
+    updated_doc = client.clean_doc(existing)
+    updated_doc["demux_realm_bclconvert_reports"] = _with_branch_report(
+        updated_doc, lane_id, settings_index, metadata
     )
-    # existing may carry CouchDB's own _id/_rev; DataAccess.save() manages
-    # those internally via the selector (fetching the current _rev and
-    # retrying on a 409 conflict itself), so the caller's job is only to
-    # strip them before passing the body back in — never to resolve conflicts.
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
-    updated_doc[branch_field] = metadata
 
     write_result = client.save(
         updated_doc,
@@ -737,7 +969,7 @@ def upload_results(ctx: StepContext, scenario: dict) -> StepResult:
         metrics={
             "upload_status": "simulated_success",
             "x_flowcell_name": name,
-            "demultiplex_field": branch_field,
+            "report_entry": branch_entry,
             "demultiplexing_metadata_files": list(metadata),
             "doc_id": getattr(write_result, "doc_id", None),
         }
@@ -749,16 +981,13 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     """Recompute the combined 'illumina' demux stats field from every branch
     already stored on the x_flowcells document, and save it back.
 
-    This is a common step, run once after all lane/settings branches'
-    upload_results steps (not a per-branch step): it reads every
-    Demultiplex_lane_<lane>_settings_<idx> field already persisted on the
-    document - including branches from earlier runs that were not rerun this
-    time - and rebuilds illumina.Demultiplex_Stats from their union. That
-    makes a rerun of a single lane safe: the aggregate always reflects
-    whatever is currently stored for every lane, not just the lanes that ran
-    in this invocation. Running this per-branch instead would require
-    merging a shared array field from concurrently-completing branches,
-    which risks lost updates/duplicate rows under _rev conflicts.
+    This is a lane step, run once after all of the lane's branches'
+    upload_results steps. It first drops the lane's reports of settings
+    indices no longer planned (see _drop_superseded_reports), then reads
+    every branch report under demux_realm_bclconvert_reports - including other
+    lanes' reports, which may still be from an earlier run - and rebuilds
+    illumina.Demultiplex_Stats from their union. That keeps the whole field correct whichever lane finishes last.
+    Steps run one at a time, so lanes never write the document concurrently.
     """
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
@@ -767,26 +996,21 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     name = derive_xflowcell_name(runfolder_id)
     client = ctx.data.connection("x_flowcells_db")
 
-    existing: dict[str, Any] | None = None
-    if hasattr(client, "find_one"):
-        existing = client.find_one({"name": {"$eq": name}})
-    elif hasattr(client, "get"):
-        existing = client.get(name)
+    existing = client.find_one({"name": {"$eq": name}})
     if existing is None:
         raise PermanentStepError(
             f"x_flowcells document '{name}' not found.",
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
-    if not isinstance(existing, dict):
-        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+
+    updated_doc = client.clean_doc(existing)
+    superseded = _drop_superseded_reports(updated_doc, scenario)
 
     demux_stats_rows: list[dict[str, str]] = []
     quality_rows: list[dict[str, str]] = []
-    for key, value in existing.items():
-        if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
-            continue
-        demux_stats_rows.extend(value.get("Demultiplex_Stats") or [])
-        quality_rows.extend(value.get("Quality_Metrics") or [])
+    for report in _branch_reports(updated_doc):
+        demux_stats_rows.extend(report.get("Demultiplex_Stats") or [])
+        quality_rows.extend(report.get("Quality_Metrics") or [])
 
     sample_project = {
         row["Sample_ID"]: row.get("Sample_Project", "default")
@@ -795,11 +1019,6 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
     }
 
     illumina = _build_illumina_stats(demux_stats_rows, quality_rows, sample_project)
-
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
     updated_doc["illumina"] = illumina
 
     write_result = client.save(
@@ -820,6 +1039,7 @@ def aggregate_illumina_stats(ctx: StepContext, scenario: dict) -> StepResult:
                 {row["Lane"] for row in demux_stats_rows if row.get("Lane")}
             ),
             "sample_row_count": len(demux_stats_rows),
+            "removed_superseded_reports": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )
@@ -830,15 +1050,11 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     """Recompute the combined 'Undetermined' demux stats field from every
     branch already stored on the x_flowcells document, and save it back.
 
-    This is a common step, run once after all lane/settings branches'
-    upload_results steps (same pattern as aggregate_illumina_stats): it reads
-    every Demultiplex_lane_<lane>_settings_<idx> field's Top_Unknown_Barcodes
-    rows already persisted on the document - including branches from earlier
-    runs that were not rerun this time - and rebuilds Undetermined from their
-    union, keyed by lane then by "<index>+<index2>" barcode with its read
-    count. That makes a rerun of a single lane safe: the aggregate always
-    reflects whatever is currently stored for every lane, not just the lanes
-    that ran in this invocation.
+    This is a lane step with the same pattern as aggregate_illumina_stats:
+    after dropping the lane's superseded reports, it reads the
+    Top_Unknown_Barcodes rows of every branch report under
+    demux_realm_bclconvert_reports and rebuilds Undetermined from their union,
+    keyed by lane then by "<index>+<index2>" barcode with its read count.
     """
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
@@ -847,31 +1063,21 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     name = derive_xflowcell_name(runfolder_id)
     client = ctx.data.connection("x_flowcells_db")
 
-    existing: dict[str, Any] | None = None
-    if hasattr(client, "find_one"):
-        existing = client.find_one({"name": {"$eq": name}})
-    elif hasattr(client, "get"):
-        existing = client.get(name)
+    existing = client.find_one({"name": {"$eq": name}})
     if existing is None:
         raise PermanentStepError(
             f"x_flowcells document '{name}' not found.",
             advice="Did upsert_x_flowcell_pre_demux run for this flowcell?",
         )
-    if not isinstance(existing, dict):
-        raise TypeError(f"x_flowcells lookup returned a non-dict value: {existing!r}")
+
+    updated_doc = client.clean_doc(existing)
+    superseded = _drop_superseded_reports(updated_doc, scenario)
 
     top_unknown_rows: list[dict[str, str]] = []
-    for key, value in existing.items():
-        if not _BRANCH_FIELD_RE.match(key) or not isinstance(value, dict):
-            continue
-        top_unknown_rows.extend(value.get("Top_Unknown_Barcodes") or [])
+    for report in _branch_reports(updated_doc):
+        top_unknown_rows.extend(report.get("Top_Unknown_Barcodes") or [])
 
     undetermined = _build_undetermined_stats(top_unknown_rows)
-
-    if hasattr(client, "clean_doc"):
-        updated_doc = client.clean_doc(existing)
-    else:
-        updated_doc = {k: v for k, v in existing.items() if k not in ("_id", "_rev")}
     updated_doc["Undetermined"] = undetermined
 
     write_result = client.save(
@@ -890,6 +1096,7 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
             "x_flowcell_name": name,
             "lane_count": len(undetermined),
             "barcode_row_count": len(top_unknown_rows),
+            "removed_superseded_reports": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
     )

@@ -1,3 +1,6 @@
+import hashlib
+import json
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -17,13 +20,37 @@ _PREFIX = "demux_realm.steps"
 VALIDATE_RUNFOLDER = "validate_runfolder"
 SETUP_COMMON_DEMUX_DIR = "setup_common_demux_dir"
 UPSERT_X_FLOWCELL = "upsert_x_flowcell_pre_demux"
-AGGREGATE_ILLUMINA_STATS = "aggregate_illumina_stats"
-AGGREGATE_UNDETERMINED_STATS = "aggregate_undetermined_stats"
+PRUNE_STALE_LANES = "prune_stale_lanes"
 
 
 def branch_namespace(lane_id: str, settings_index: str) -> str:
     """Return the step-ID prefix of one lane/settings branch, e.g. lane_2_settings_0."""
     return f"lane_{lane_id}_settings_{settings_index}"
+
+
+def clean_lane_step_id(lane_id: str) -> str:
+    """Return the ID of the step that removes a lane's earlier results."""
+    return f"lane_{lane_id}__clean_lane"
+
+
+#: Input key under which every step of a lane declares its cleanup token.
+LANE_CLEANUP_INPUT = "lane_cleanup"
+
+
+def _digest(data: Any) -> str:
+    """Return a stable sha256 of JSON-serializable data."""
+    text = json.dumps(data, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def group_by_lane(
+    branches: Sequence[SamplesheetBranch],
+) -> dict[str, list[SamplesheetBranch]]:
+    """Group branches by lane, keeping the order lanes and branches come in."""
+    lanes: defaultdict[str, list[SamplesheetBranch]] = defaultdict(list)
+    for branch in branches:
+        lanes[branch.lane_id].append(branch)
+    return dict(lanes)
 
 
 def build_demux_plan(
@@ -43,10 +70,19 @@ def build_demux_plan(
 ) -> Plan:
     """Build the flowcell's demux plan from validated planning data.
 
-    Two shared steps come first: runfolder validation, then the x_flowcells
-    metadata update. Each lane/settings branch follows as a chain of five
-    steps whose first step depends on branch_prerequisites; include
-    UPSERT_X_FLOWCELL there to make branches wait for the metadata update.
+    Shared steps come first: runfolder validation, the common demux
+    directory and the x_flowcells metadata update. Each lane follows: a
+    clean_lane step that depends on branch_prerequisites (include
+    UPSERT_X_FLOWCELL there to make lanes wait for the metadata update), then
+    every lane/settings branch of the lane as a chain of steps whose first
+    step depends on the clean_lane step, and finally the lane's post-demux
+    aggregate steps, which wait for every branch of the lane.
+
+    A lane is the smallest unit that is re-demultiplexed. The clean_lane
+    step carries a lane_digest, a hash of everything the lane's branches are
+    planned from, so a change to any branch of the lane re-runs it. It then
+    writes a new cleanup token, which every later step of the lane declares
+    as an input, so all of them run again too; unchanged lanes are reused.
 
     Args:
         plan_id: The combined plan ID.
@@ -61,7 +97,8 @@ def build_demux_plan(
             keyed by (lane_id, settings_index); carried only by each
             branch's execute_demux step.
         branches: Validated branches, in plan order.
-        branch_prerequisites: Shared step IDs each branch's first step depends on.
+        branch_prerequisites: Shared step IDs each lane's clean_lane step
+            depends on.
 
     Returns:
         The complete plan, run under continue_independent.
@@ -107,104 +144,167 @@ def build_demux_plan(
         ),
     ]
 
-    for branch in branches:
-        ns = branch_namespace(branch.lane_id, branch.settings_index)
-        label = f"lane {branch.lane_id}, settings {branch.settings_index}"
-        scenario = {
-            **common,
-            "lane_id": branch.lane_id,
-            "settings_index": branch.settings_index,
-            "samplesheet_payload": branch.payload,
-            "demux_sample_info_doc": {"metadata": metadata},
-        }
-
-        samplesheet_path = Path(artifact_base / ns / "SampleSheet.csv")
-        run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
-        # Relative outputs resolve inside each producer's own work directory.
-        steps += [
+    lanes = group_by_lane(branches)
+    # Lane level: one clean_lane step, then the lane's branches, then the
+    # lane's post-demux steps. Everything in this loop shares the lane's
+    # cleanup token, so a cleanup re-runs the whole lane.
+    for lane_id, lane_branches in lanes.items():
+        lane_digest = _digest(
+            {
+                "metadata": metadata,
+                "branches": [
+                    {
+                        "settings_index": b.settings_index,
+                        "payload": b.payload,
+                        "nextflow": branch_run_options[
+                            (b.lane_id, b.settings_index)
+                        ].to_dict(),
+                    }
+                    for b in lane_branches
+                ],
+            }
+        )
+        clean_lane = clean_lane_step_id(lane_id)
+        cleanup_token = artifact_base / f"lane_{lane_id}" / "cleanup.token"
+        lane_inputs = {LANE_CLEANUP_INPUT: str(cleanup_token)}
+        steps.append(
             StepSpec(
-                step_id=f"{ns}__materialize_config",
-                name=f"Materialize Demux Config ({label})",
-                fn_ref=f"{_PREFIX}.materialize_extra_config",
-                params={"scenario": scenario},
-                deps=list(branch_prerequisites),
-                outputs={"demux_config": DEMUX_CONFIG_FILENAME},
-            ),
-            StepSpec(
-                step_id=f"{ns}__generate_samplesheet",
-                name=f"Generate SampleSheet.csv ({label})",
-                fn_ref=f"{_PREFIX}.generate_samplesheet",
-                params={"scenario": scenario, "samplesheet": samplesheet_path},
-                deps=[f"{ns}__materialize_config"],
-                outputs={"samplesheet": str(samplesheet_path)},
-            ),
-            StepSpec(
-                step_id=f"{ns}__execute_demux",
-                name=f"Execute Demux (nf-core/demultiplex) ({label})",
-                fn_ref=f"{_PREFIX}.execute_demux",
+                step_id=clean_lane,
+                name=f"Clean Earlier Demux Results (lane {lane_id})",
+                fn_ref=f"{_PREFIX}.clean_lane",
                 params={
                     "scenario": {
-                        **scenario,
-                        "samplesheet_path": samplesheet_path,
-                        "nextflow": run_options.to_dict(),
-                    },
-                    "samplesheet": samplesheet_path,
+                        **common,
+                        "lane_id": lane_id,
+                        "lane_digest": lane_digest,
+                        "cleanup_token": str(cleanup_token),
+                    }
                 },
-                deps=[f"{ns}__generate_samplesheet"],
-                inputs={"samplesheet": str(samplesheet_path)},
+                deps=list(branch_prerequisites),
+                outputs={"cleanup_token": str(cleanup_token)},
+            )
+        )
+        # Settings level: one chain of steps per lane/settings branch.
+        for branch in lane_branches:
+            ns = branch_namespace(branch.lane_id, branch.settings_index)
+            label = f"lane {branch.lane_id}, settings {branch.settings_index}"
+            scenario = {
+                **common,
+                "lane_id": branch.lane_id,
+                "settings_index": branch.settings_index,
+                "samplesheet_payload": branch.payload,
+                "demux_sample_info_doc": {"metadata": metadata},
+            }
+
+            samplesheet_path = artifact_base / ns / "SampleSheet.csv"
+            run_options = branch_run_options[(branch.lane_id, branch.settings_index)]
+            # Relative outputs resolve inside each producer's own work directory.
+            steps += [
+                StepSpec(
+                    step_id=f"{ns}__materialize_config",
+                    name=f"Materialize Demux Config ({label})",
+                    fn_ref=f"{_PREFIX}.materialize_extra_config",
+                    params={"scenario": scenario},
+                    deps=[clean_lane],
+                    inputs=dict(lane_inputs),
+                    outputs={"demux_config": DEMUX_CONFIG_FILENAME},
+                ),
+                StepSpec(
+                    step_id=f"{ns}__generate_samplesheet",
+                    name=f"Generate SampleSheet.csv ({label})",
+                    fn_ref=f"{_PREFIX}.generate_samplesheet",
+                    params={"scenario": scenario, "samplesheet": samplesheet_path},
+                    deps=[f"{ns}__materialize_config"],
+                    inputs=dict(lane_inputs),
+                    outputs={"samplesheet": str(samplesheet_path)},
+                ),
+                StepSpec(
+                    step_id=f"{ns}__execute_demux",
+                    name=f"Execute Demux (nf-core/demultiplex) ({label})",
+                    fn_ref=f"{_PREFIX}.execute_demux",
+                    params={
+                        "scenario": {
+                            **scenario,
+                            "samplesheet_path": samplesheet_path,
+                            "nextflow": run_options.to_dict(),
+                        },
+                        "samplesheet": samplesheet_path,
+                    },
+                    deps=[f"{ns}__generate_samplesheet"],
+                    inputs={**lane_inputs, "samplesheet": str(samplesheet_path)},
+                ),
+                StepSpec(
+                    step_id=f"{ns}__collect_results",
+                    name=f"Collect Results and Artifacts ({label})",
+                    fn_ref=f"{_PREFIX}.collect_results",
+                    params={"scenario": scenario},
+                    deps=[f"{ns}__execute_demux"],
+                    inputs=dict(lane_inputs),
+                ),
+                StepSpec(
+                    step_id=f"{ns}__symlink_fastqs",
+                    name=f"Symlink Fastqs ({label})",
+                    fn_ref=f"{_PREFIX}.symlink_fastqs",
+                    params={
+                        "scenario": {
+                            **scenario,
+                            "lane_settings_count": len(lane_branches),
+                        }
+                    },
+                    deps=[f"{ns}__execute_demux"],
+                    inputs=dict(lane_inputs),
+                ),
+                StepSpec(
+                    step_id=f"{ns}__upload_results",
+                    name=f"Upload/Simulate Upload Results ({label})",
+                    fn_ref=f"{_PREFIX}.upload_results",
+                    params={"scenario": scenario},
+                    deps=[f"{ns}__collect_results"],
+                    inputs=dict(lane_inputs),
+                ),
+            ]
+        # End of the settings level: every branch of this lane is planned.
+
+        # Post-demux lane steps, back at the lane level: run once every branch
+        # of the lane uploaded, and recompute the combined fields from
+        # whatever is stored for every lane (see aggregate_illumina_stats).
+        lane_scenario = {
+            **common,
+            "lane_id": lane_id,
+            "settings_indices": [b.settings_index for b in lane_branches],
+        }
+        uploads = [
+            f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
+            for b in lane_branches
+        ]
+        steps += [
+            StepSpec(
+                step_id=f"lane_{lane_id}__aggregate_illumina_stats",
+                name=f"Aggregate Illumina Demux Stats (lane {lane_id})",
+                fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
+                params={"scenario": dict(lane_scenario)},
+                deps=list(uploads),
+                inputs=dict(lane_inputs),
             ),
             StepSpec(
-                step_id=f"{ns}__collect_results",
-                name=f"Collect Results and Artifacts ({label})",
-                fn_ref=f"{_PREFIX}.collect_results",
-                params={"scenario": scenario},
-                deps=[f"{ns}__execute_demux"],
-            ),
-            StepSpec(
-                step_id=f"{ns}__symlink_fastqs",
-                name=f"Symlink Fastqs ({label})",
-                fn_ref=f"{_PREFIX}.symlink_fastqs",
-                params={"scenario": scenario},
-                deps=[f"{ns}__execute_demux"],
-            ),
-            StepSpec(
-                step_id=f"{ns}__upload_results",
-                name=f"Upload/Simulate Upload Results ({label})",
-                fn_ref=f"{_PREFIX}.upload_results",
-                params={"scenario": scenario},
-                deps=[f"{ns}__collect_results"],
+                step_id=f"lane_{lane_id}__aggregate_undetermined_stats",
+                name=f"Aggregate Undetermined Barcode Stats (lane {lane_id})",
+                fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
+                params={"scenario": dict(lane_scenario)},
+                deps=list(uploads),
+                inputs=dict(lane_inputs),
             ),
         ]
+    # End of the lane level: every lane is planned. What follows is
+    # flowcell-wide again and does not depend on any lane.
 
     steps.append(
         StepSpec(
-            step_id=AGGREGATE_ILLUMINA_STATS,
-            name="Aggregate Illumina Demux Stats",
-            fn_ref=f"{_PREFIX}.aggregate_illumina_stats",
-            params={"scenario": dict(common)},
-            # Common step: runs once after every branch's upload_results, and
-            # recomputes the combined 'illumina' field from whatever is
-            # currently stored for each lane (see aggregate_illumina_stats).
-            deps=[
-                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
-                for b in branches
-            ],
-        )
-    )
-
-    steps.append(
-        StepSpec(
-            step_id=AGGREGATE_UNDETERMINED_STATS,
-            name="Aggregate Undetermined Barcode Stats",
-            fn_ref=f"{_PREFIX}.aggregate_undetermined_stats",
-            params={"scenario": dict(common)},
-            # Common step: runs once after every branch's upload_results, and
-            # recomputes the combined 'Undetermined' field from whatever is
-            # currently stored for each lane (see aggregate_undetermined_stats).
-            deps=[
-                f"{branch_namespace(b.lane_id, b.settings_index)}__upload_results"
-                for b in branches
-            ],
+            step_id=PRUNE_STALE_LANES,
+            name="Remove Demux Results of Unplanned Lanes",
+            fn_ref=f"{_PREFIX}.prune_stale_lanes",
+            params={"scenario": {**common, "lanes": list(lanes)}},
+            deps=list(branch_prerequisites),
         )
     )
 

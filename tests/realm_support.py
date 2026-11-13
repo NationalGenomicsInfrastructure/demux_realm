@@ -1,6 +1,7 @@
 """Source-document builders and a planning context shared by the realm tests."""
 
 import textwrap
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -119,10 +120,12 @@ def planning_ctx(
     *,
     demux_doc: dict[str, Any] | None,
     fc_doc: dict[str, Any] | None,
+    scope_dir: Path = Path("/scope"),
 ) -> MagicMock:
     """Return a PlanningContext stand-in whose planning reads return the documents."""
     ctx = MagicMock()
     ctx.scope = {"kind": "flowcell", "id": scope_id}
+    ctx.scope_dir = scope_dir
     demux_db = AsyncMock()
     demux_db.get.return_value = demux_doc
     demux_db.find_one.return_value = demux_doc
