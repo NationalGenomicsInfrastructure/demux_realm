@@ -165,8 +165,8 @@ def build_demux_plan(
             }
         )
         clean_lane = clean_lane_step_id(lane_id)
-        cleanup_token = artifact_base / f"lane_{lane_id}" / "cleanup.token"
-        lane_inputs = {LANE_CLEANUP_INPUT: str(cleanup_token)}
+        cleanup_token = str(artifact_base / f"lane_{lane_id}" / "cleanup.token")
+        lane_inputs = {LANE_CLEANUP_INPUT: cleanup_token}
         steps.append(
             StepSpec(
                 step_id=clean_lane,
@@ -177,11 +177,11 @@ def build_demux_plan(
                         **common,
                         "lane_id": lane_id,
                         "lane_digest": lane_digest,
-                        "cleanup_token": str(cleanup_token),
+                        "cleanup_token": cleanup_token,
                     }
                 },
                 deps=list(branch_prerequisites),
-                outputs={"cleanup_token": str(cleanup_token)},
+                outputs={"cleanup_token": cleanup_token},
             )
         )
         # Settings level: one chain of steps per lane/settings branch.
