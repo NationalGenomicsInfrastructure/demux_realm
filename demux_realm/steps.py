@@ -711,8 +711,6 @@ def generate_samplesheet(
     )
     ctx.record_artifact(SAMPLESHEET, path=samplesheet)
 
-    # Branch steps do not wait for setup_common_demux_dir, so _link creates
-    # the directory when it is missing.
     link = (
         Path(scenario["hpc_runfolder_path"])
         / SAMPLESHEETS_DIRNAME

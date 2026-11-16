@@ -163,9 +163,9 @@ async def test_single_lane_yields_one_plan(handler):
     ]
     assert {s.step_id: s.deps for s in plan.steps} == {
         VALIDATE_RUNFOLDER: [],
-        SETUP_COMMON_DEMUX_DIR: [],
+        SETUP_COMMON_DEMUX_DIR: [VALIDATE_RUNFOLDER],
         UPSERT_X_FLOWCELL: [VALIDATE_RUNFOLDER],
-        clean_lane_id("1"): [VALIDATE_RUNFOLDER],
+        clean_lane_id("1"): [VALIDATE_RUNFOLDER, SETUP_COMMON_DEMUX_DIR],
         **branch_deps(lane_1, [clean_lane_id("1")]),
         **dict.fromkeys(lane_aggregate_ids("1"), [lane_1[-1]]),
         PRUNE_STALE_LANES: [VALIDATE_RUNFOLDER],
@@ -204,7 +204,10 @@ async def test_lanes_and_settings_become_independent_branches(handler):
     deps = {s.step_id: s.deps for s in plan.steps}
     assert deps[UPSERT_X_FLOWCELL] == [VALIDATE_RUNFOLDER]
     for lane in ("1", "2"):
-        assert deps[clean_lane_id(lane)] == [VALIDATE_RUNFOLDER]
+        assert deps[clean_lane_id(lane)] == [
+            VALIDATE_RUNFOLDER,
+            SETUP_COMMON_DEMUX_DIR,
+        ]
     for ns in namespaces:
         ids = branch_ids(ns)
         lane = ns.split("_")[1]
@@ -488,7 +491,11 @@ async def test_metadata_can_be_made_a_branch_prerequisite(handler, monkeypatch):
     deps = {s.step_id: s.deps for s in draft.plan.steps}
 
     for lane in ("1", "2"):
-        assert deps[clean_lane_id(lane)] == [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
+        assert deps[clean_lane_id(lane)] == [
+            VALIDATE_RUNFOLDER,
+            UPSERT_X_FLOWCELL,
+            SETUP_COMMON_DEMUX_DIR,
+        ]
     assert draft.preview["metadata_required"] is True
 
 

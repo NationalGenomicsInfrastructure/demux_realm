@@ -328,7 +328,7 @@ def test_validation_failure_blocks_metadata_and_every_branch(
     assert report.outcome is ExecutionOutcome.FAILED
     assert report.step_outcomes == {
         VALIDATE_RUNFOLDER: FAILED,
-        SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
+        SETUP_COMMON_DEMUX_DIR: BLOCKED,
         UPSERT_X_FLOWCELL: BLOCKED,
         **dict.fromkeys(
             [CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, PRUNE_STALE_LANES, *AGGREGATES],

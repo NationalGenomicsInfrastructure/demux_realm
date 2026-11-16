@@ -133,20 +133,23 @@ lane) are reused instead.
 | `failure_policy` | `continue_independent` |
 
 ```text
-setup_common_demux_dir
 validate_runfolder
 ├── upsert_x_flowcell_pre_demux
-├── lane_1__clean_lane
-│   ├── lane_1_settings_0__generate_samplesheet
-│   │   └── lane_1_settings_0__execute_demux
-│   │       ├── lane_1_settings_0__symlink_fastqs
-│   │       └── lane_1_settings_0__collect_results
-│   │           └── lane_1_settings_0__upload_results
-│   └── lane_1_settings_1__generate_samplesheet
+├── setup_common_demux_dir
+│   ├── lane_1__clean_lane
+│   │   ├── lane_1_settings_0__generate_samplesheet
+│   │   │   └── lane_1_settings_0__execute_demux
+│   │   │       ├── lane_1_settings_0__symlink_fastqs
+│   │   │       └── lane_1_settings_0__collect_results
+│   │   │           └── lane_1_settings_0__upload_results
+│   │   └── lane_1_settings_1__generate_samplesheet
+│   │       └── ...
+│   └── lane_2__clean_lane
 │       └── ...
-├── lane_2__clean_lane
-│   └── ...
 └── prune_stale_lanes
+
+lane_<n>__clean_lane also depends on every step in the handler's
+branch_prerequisites (validate_runfolder by default).
 
 lane_<n>__aggregate_illumina_stats, lane_<n>__aggregate_undetermined_stats
     depend on every upload_results step of lane <n>

@@ -69,10 +69,12 @@ def build_demux_plan(
 ) -> Plan:
     """Build the flowcell's demux plan from validated planning data.
 
-    Shared steps come first: runfolder validation, the common demux
-    directory and the x_flowcells metadata update. Each lane follows: a
-    clean_lane step that depends on branch_prerequisites (include
-    UPSERT_X_FLOWCELL there to make lanes wait for the metadata update), then
+    Shared steps come first: runfolder validation, the shared runfolder
+    directories (setup_common_demux_dir, after validation) and the
+    x_flowcells metadata update. Each lane follows: a clean_lane step that
+    depends on branch_prerequisites (include UPSERT_X_FLOWCELL there to make
+    lanes wait for the metadata update) and always on
+    setup_common_demux_dir, then
     every lane/settings branch of the lane as a chain of steps whose first
     step depends on the clean_lane step, and finally the lane's post-demux
     aggregate steps, which wait for every branch of the lane.
@@ -97,7 +99,7 @@ def build_demux_plan(
             branch's execute_demux step.
         branches: Validated branches, in plan order.
         branch_prerequisites: Shared step IDs each lane's clean_lane step
-            depends on.
+            depends on, besides setup_common_demux_dir.
 
     Returns:
         The complete plan, run under continue_independent.
@@ -123,6 +125,7 @@ def build_demux_plan(
             name="Setup Common Demux Directory",
             fn_ref=f"{_PREFIX}.setup_common_demux_dir",
             params={"scenario": dict(common)},
+            deps=[VALIDATE_RUNFOLDER],
         ),
         StepSpec(
             step_id=UPSERT_X_FLOWCELL,
@@ -179,7 +182,11 @@ def build_demux_plan(
                         "cleanup_token": cleanup_token,
                     }
                 },
-                deps=list(branch_prerequisites),
+                # The lane's steps write into the shared runfolder directories,
+                # so every lane waits for them whatever the prerequisites are.
+                deps=list(
+                    dict.fromkeys([*branch_prerequisites, SETUP_COMMON_DEMUX_DIR])
+                ),
                 outputs={"cleanup_token": cleanup_token},
             )
         )

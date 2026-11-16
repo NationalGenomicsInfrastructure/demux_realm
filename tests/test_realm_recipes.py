@@ -82,7 +82,10 @@ def test_shared_steps_declare_the_xml_the_metadata_step_reads():
     assert plan.scope == {"kind": "flowcell", "id": "SC123"}
     assert plan.failure_policy == CONTINUE_INDEPENDENT_POLICY
     assert (validate.step_id, validate.deps) == (VALIDATE_RUNFOLDER, [])
-    assert (setup.step_id, setup.deps) == (SETUP_COMMON_DEMUX_DIR, [])
+    assert (setup.step_id, setup.deps) == (
+        SETUP_COMMON_DEMUX_DIR,
+        [VALIDATE_RUNFOLDER],
+    )
     assert (upsert.step_id, upsert.deps) == (UPSERT_X_FLOWCELL, [VALIDATE_RUNFOLDER])
     assert upsert.params["scenario"]["samplesheets"] == [{"lane": 3}, {"lane": 1}]
     assert upsert.inputs == {
@@ -175,7 +178,7 @@ def test_metadata_prerequisite_is_the_authors_choice():
     clean_steps = [s for s in plan.steps if s.step_id.endswith("__clean_lane")]
 
     assert [s.deps for s in clean_steps] == [
-        [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
+        [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL, SETUP_COMMON_DEMUX_DIR]
     ] * 2
 
 
@@ -184,7 +187,7 @@ def test_each_lane_starts_with_a_clean_lane_step():
     clean = _step(plan, "lane_1__clean_lane")
 
     assert clean.fn_ref == "demux_realm.steps.clean_lane"
-    assert clean.deps == [VALIDATE_RUNFOLDER]
+    assert clean.deps == [VALIDATE_RUNFOLDER, SETUP_COMMON_DEMUX_DIR]
     assert clean.params["scenario"]["lane_id"] == "1"
     step_ids = [s.step_id for s in plan.steps]
     assert step_ids.index("lane_1__clean_lane") < step_ids.index(
