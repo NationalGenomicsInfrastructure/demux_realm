@@ -28,6 +28,7 @@ from .nextflow import (
 from .utils import (
     RUN_INFO_XML,
     RUN_PARAMETERS_XML,
+    SAMPLESHEETS_DIRNAME,
     build_lims_lookup,
     build_x_flowcell_payload,
     derive_xflowcell_name,
@@ -35,6 +36,8 @@ from .utils import (
     parse_run_info_xml,
     parse_run_parameters_xml,
     render_bcl_convert_samplesheet,
+    samplesheet_link_lane,
+    samplesheet_link_name,
     validate_lane_payload,
 )
 
@@ -238,13 +241,56 @@ def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
     return sorted(removed)
 
 
+def _remove_samplesheet_links(
+    samplesheets_dir: Path,
+    canonical_flowcell_id: str,
+    drop_lane: Callable[[str], bool],
+) -> list[str]:
+    """Remove this flowcell's samplesheet links of the lanes drop_lane selects.
+
+    The links point into the plan's artifact directory, not into the Nextflow
+    results, so they are matched by name (see samplesheet_link_name). Only
+    links are removed; any other file in the directory is left alone.
+    """
+    if not samplesheets_dir.is_dir():
+        return []
+    removed = []
+    for link in sorted(samplesheets_dir.iterdir()):
+        if not link.is_symlink():
+            continue
+        lane = samplesheet_link_lane(canonical_flowcell_id, link.name)
+        if lane is not None and drop_lane(lane):
+            link.unlink()
+            removed.append(str(link))
+    return removed
+
+
+def _link(link: Path, target: Path) -> None:
+    """Make link point at target, replacing a stale or dangling link.
+
+    An existing file that is not a link is left in place, with a warning.
+    """
+    link.parent.mkdir(parents=True, exist_ok=True)
+    # is_symlink() also sees a dangling link, which exists() does not.
+    if link.is_symlink() and link.resolve() != target.resolve():
+        # Left by an earlier run that the cleanup did not cover.
+        logger.warning("Replacing stale symlink %s", link)
+        link.unlink()
+    if not link.is_symlink() and not link.exists():
+        link.symlink_to(target)
+        logger.info("Symlinked %s to %s", target, link)
+    else:
+        logger.warning("Symlink already exists: %s", link)
+
+
 def _remove_branch_results(
     scenario: dict, drop_lane: Callable[[str], bool]
 ) -> dict[str, Any]:
     """Remove the selected lanes' demultiplexing results from earlier runs.
 
-    That is: their Nextflow results and work directories, and the links in
-    the runfolder's Demultiplexing directory that point into the results.
+    That is: their Nextflow results and work directories, the links in the
+    runfolder's Demultiplexing directory that point into the results, and
+    their samplesheet links in the runfolder's Samplesheets directory.
     Removing the work directories means -resume cannot reuse any earlier
     task, so the lane is demultiplexed from scratch. Settings indices that are
     no longer planned are matched too, since directories are selected by lane
@@ -261,15 +307,19 @@ def _remove_branch_results(
     fcid = scenario["canonical_flowcell_id"]
     outdirs = _branch_dirs(settings.outdir_base, fcid, drop_lane)
     work_dirs = _branch_dirs(settings.work_base, fcid, drop_lane)
-    demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
+    runfolder = Path(scenario["hpc_runfolder_path"])
 
-    links = _remove_branch_symlinks(demux_dir, outdirs)
+    links = _remove_branch_symlinks(runfolder / "Demultiplexing", outdirs)
+    samplesheet_links = _remove_samplesheet_links(
+        runfolder / SAMPLESHEETS_DIRNAME, fcid, drop_lane
+    )
     for path in [*outdirs, *work_dirs]:
         shutil.rmtree(path)
         logger.info("Removed %s.", path)
     return {
         "removed_dirs": [str(path) for path in [*outdirs, *work_dirs]],
         "removed_symlinks": links,
+        "removed_samplesheet_links": samplesheet_links,
     }
 
 
@@ -494,14 +544,21 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def setup_common_demux_dir(ctx: StepContext, scenario: dict) -> StepResult:
-    """Create the common demux directory for all branches."""
+    """Create the runfolder directories shared by all branches.
+
+    These are Demultiplexing, where symlink_fastqs links the FASTQs, and
+    Samplesheets, where generate_samplesheet links each branch's sheet.
+    """
     hpc_path = Path(scenario["hpc_runfolder_path"])
     demux_dir = hpc_path / "Demultiplexing"
-    demux_dir.mkdir(exist_ok=True)
-    logger.info("Created common demux directory %s.", demux_dir)
+    samplesheets_dir = hpc_path / SAMPLESHEETS_DIRNAME
+    for directory in (demux_dir, samplesheets_dir):
+        directory.mkdir(exist_ok=True)
+        logger.info("Created common directory %s.", directory)
     return StepResult(
         metrics={
             "demux_dir": str(demux_dir),
+            "samplesheets_dir": str(samplesheets_dir),
         }
     )
 
@@ -632,7 +689,12 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
 def generate_samplesheet(
     ctx: StepContext, scenario: dict, samplesheet: Annotated[Path, Out(SAMPLESHEET)]
 ) -> StepResult:
-    """Generates and writes SampleSheet.csv from the lane-specific samplesheet payload."""
+    """Generates and writes SampleSheet.csv from the lane-specific samplesheet payload.
+
+    The sheet is also linked into the runfolder's Samplesheets directory under
+    a name carrying the flowcell, lane and settings index (see
+    samplesheet_link_name); clean_lane and prune_stale_lanes remove the link.
+    """
     ss_payload = scenario["samplesheet_payload"]
 
     validate_lane_payload(ss_payload, expected_lane=scenario.get("lane_id"))
@@ -648,7 +710,25 @@ def generate_samplesheet(
         samplesheet,
     )
     ctx.record_artifact(SAMPLESHEET, path=samplesheet)
-    return StepResult(metrics={"samplesheet_bytes": samplesheet.stat().st_size})
+
+    # Branch steps do not wait for setup_common_demux_dir, so _link creates
+    # the directory when it is missing.
+    link = (
+        Path(scenario["hpc_runfolder_path"])
+        / SAMPLESHEETS_DIRNAME
+        / samplesheet_link_name(
+            scenario["canonical_flowcell_id"],
+            str(scenario["lane_id"]),
+            str(scenario["settings_index"]),
+        )
+    )
+    _link(link, samplesheet.resolve())
+    return StepResult(
+        metrics={
+            "samplesheet_bytes": samplesheet.stat().st_size,
+            "samplesheet_link": str(link),
+        }
+    )
 
 
 @step
@@ -924,18 +1004,7 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
             logger.info("Not linking %s: the lane has several settings runs.", fq)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
     for fq in fastqs:
-        symlink_path = _fastq_link_path(demux_dir, results_dir, fq)
-        symlink_path.parent.mkdir(parents=True, exist_ok=True)
-        # is_symlink() also sees a dangling link, which exists() does not.
-        if symlink_path.is_symlink() and symlink_path.resolve() != fq.resolve():
-            # Left by an earlier run that clean_lane did not cover.
-            logger.warning("Replacing stale symlink %s", symlink_path)
-            symlink_path.unlink()
-        if not symlink_path.is_symlink() and not symlink_path.exists():
-            symlink_path.symlink_to(fq)
-            logger.info("Symlinked %s to %s", fq, symlink_path)
-        else:
-            logger.warning("Symlink already exists: %s", symlink_path)
+        _link(_fastq_link_path(demux_dir, results_dir, fq), fq)
 
     return StepResult(
         metrics={

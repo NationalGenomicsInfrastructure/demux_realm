@@ -158,8 +158,9 @@ re-demultiplexed, even when it holds several settings groups.
 samplesheet entries, their Nextflow options and the `demux_sample_info`
 metadata, so changing any of the lane's samplesheets re-runs it. It removes,
 for every settings index of the lane (including ones no longer planned), the
-Nextflow results and work directories and the links into the results in the
-runfolder's `Demultiplexing` directory. Removing the work directories means
+Nextflow results and work directories, the links into the results in the
+runfolder's `Demultiplexing` directory and the lane's samplesheet links in the
+runfolder's `Samplesheets` directory. Removing the work directories means
 `-resume` cannot reuse any earlier task, so the lane is demultiplexed from
 scratch. Each run then writes a new random token to
 `lane_<n>/cleanup.token` under the plan's artifact directory, and every later
@@ -190,8 +191,8 @@ settings indices no longer planned and rebuild `illumina` and `Undetermined`
 from every entry in the field. Only those two derived fields are read by the
 StatusDB views; the reports field is the realm's own source data for them.
 
-`prune_stale_lanes` removes the results and work directories and links of
-lanes no longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
+`prune_stale_lanes` removes the results and work directories, FASTQ links and
+samplesheet links of lanes no longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
 in the aggregated stats until removed by hand.
 
 A retry after a failed branch re-runs only that branch: the lane's
@@ -238,8 +239,9 @@ source are recorded in the draft's preview only, so they never invalidate reuse.
 | Step | What it does now |
 |---|---|
 | `validate_runfolder` | Validates that the run folder exists on the HPC |
+| `setup_common_demux_dir` | Creates the runfolder's `Demultiplexing` and `Samplesheets` directories |
 | `upsert_x_flowcell_pre_demux` | Reads `RunInfo.xml` and `RunParameters.xml`, then writes the `x_flowcells` document through DataAccess |
-| `generate_samplesheet` | Validates the entry again and writes `SampleSheet.csv` |
+| `generate_samplesheet` | Validates the entry again, writes `SampleSheet.csv` and links it as `Samplesheets/<FCID>_lane_<n>_settings_<i>_SampleSheet.csv` in the runfolder |
 | `execute_demux` | Runs one `nf-core/demultiplex` Nextflow instance per branch on the sheet its `generate_samplesheet` step wrote |
 | `collect_results`, `upload_results` | `collect_results` counts the branch's FASTQ and MultiQC outputs; `upload_results` is a simulation that only logs |
 
