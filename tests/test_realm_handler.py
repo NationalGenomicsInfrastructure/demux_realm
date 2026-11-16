@@ -22,7 +22,12 @@ from demux_realm.descriptor import (
 )
 from demux_realm import handler as handler_module
 from demux_realm.handler import DemuxHandler
-from demux_realm.recipes import UPSERT_X_FLOWCELL, VALIDATE_RUNFOLDER
+from demux_realm.recipes import (
+    PRUNE_STALE_LANES,
+    SETUP_COMMON_DEMUX_DIR,
+    UPSERT_X_FLOWCELL,
+    VALIDATE_RUNFOLDER,
+)
 
 PLAN_ID = "dmx_realm:SC123:demux"
 FLOWCELL_SCOPE = {"kind": "flowcell", "id": "SC123"}
@@ -31,12 +36,40 @@ BRANCH_STAGES = (
     "generate_samplesheet",
     "execute_demux",
     "collect_results",
+    "symlink_fastqs",
     "upload_results",
 )
+SHARED_STEPS = [VALIDATE_RUNFOLDER, SETUP_COMMON_DEMUX_DIR, UPSERT_X_FLOWCELL]
+def lane_aggregate_ids(lane: str) -> list[str]:
+    return [
+        f"lane_{lane}__aggregate_illumina_stats",
+        f"lane_{lane}__aggregate_undetermined_stats",
+    ]
 
 
 def branch_ids(namespace: str) -> list[str]:
     return [f"{namespace}__{stage}" for stage in BRANCH_STAGES]
+
+
+def clean_lane_id(lane: str) -> str:
+    return f"lane_{lane}__clean_lane"
+
+
+def branch_step_ids(plan: Plan) -> list[str]:
+    return [s.step_id for s in plan.steps if "_settings_" in s.step_id]
+
+
+def branch_deps(ids: list[str], first: list[str]) -> dict[str, list[str]]:
+    """Return the expected deps of one branch's steps, given its first step's."""
+    materialize, generate, execute, collect, symlink, upload = ids
+    return {
+        materialize: first,
+        generate: [materialize],
+        execute: [generate],
+        collect: [execute],
+        symlink: [execute],
+        upload: [collect],
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +145,7 @@ async def test_canonical_matching_scope():
 
 
 @pytest.mark.asyncio
-async def test_single_lane_yields_one_plan_with_seven_steps(handler):
+async def test_single_lane_yields_one_plan(handler):
     draft = await plan_for(handler, [lane_entry(1)])
     plan = draft.plan
 
@@ -124,20 +157,22 @@ async def test_single_lane_yields_one_plan_with_seven_steps(handler):
     assert plan.failure_policy == CONTINUE_INDEPENDENT_POLICY
     lane_1 = branch_ids("lane_1_settings_0")
     assert [s.step_id for s in plan.steps] == [
-        VALIDATE_RUNFOLDER,
-        UPSERT_X_FLOWCELL,
+        *SHARED_STEPS,
+        clean_lane_id("1"),
         *lane_1,
+        *lane_aggregate_ids("1"),
+        PRUNE_STALE_LANES,
     ]
     assert {s.step_id: s.deps for s in plan.steps} == {
         VALIDATE_RUNFOLDER: [],
+        SETUP_COMMON_DEMUX_DIR: [],
         UPSERT_X_FLOWCELL: [VALIDATE_RUNFOLDER],
-        lane_1[0]: [VALIDATE_RUNFOLDER],
-        lane_1[1]: [lane_1[0]],
-        lane_1[2]: [lane_1[1]],
-        lane_1[3]: [lane_1[2]],
-        lane_1[4]: [lane_1[3]],
+        clean_lane_id("1"): [VALIDATE_RUNFOLDER],
+        **branch_deps(lane_1, [clean_lane_id("1")]),
+        **dict.fromkeys(lane_aggregate_ids("1"), [lane_1[-1]]),
+        PRUNE_STALE_LANES: [VALIDATE_RUNFOLDER],
     }
-    scenario = plan.steps[2].params["scenario"]
+    scenario = step_dicts(plan)[lane_1[0]]["params"]["scenario"]
     assert scenario["hpc_runfolder_path"] == "/incoming/path/230314_A00000_0000_AXXXXX"
     assert scenario["lane_id"] == "1"
     assert scenario["settings_index"] == "0"
@@ -154,22 +189,28 @@ async def test_lanes_and_settings_become_independent_branches(handler):
     plan = draft.plan
     namespaces = ["lane_1_settings_0", "lane_2_settings_0", "lane_2_settings_1"]
 
-    assert len(plan.steps) == 2 + 5 * len(namespaces)
     assert [s.step_id for s in plan.steps] == [
-        VALIDATE_RUNFOLDER,
-        UPSERT_X_FLOWCELL,
-        *(step_id for ns in namespaces for step_id in branch_ids(ns)),
+        *SHARED_STEPS,
+        clean_lane_id("1"),
+        *branch_ids("lane_1_settings_0"),
+        *lane_aggregate_ids("1"),
+        clean_lane_id("2"),
+        *branch_ids("lane_2_settings_0"),
+        *branch_ids("lane_2_settings_1"),
+        *lane_aggregate_ids("2"),
+        PRUNE_STALE_LANES,
     ]
     assert [s.fn_ref for s in plan.steps].count(
         "demux_realm.steps.validate_runfolder"
     ) == 1
     deps = {s.step_id: s.deps for s in plan.steps}
     assert deps[UPSERT_X_FLOWCELL] == [VALIDATE_RUNFOLDER]
+    for lane in ("1", "2"):
+        assert deps[clean_lane_id(lane)] == [VALIDATE_RUNFOLDER]
     for ns in namespaces:
         ids = branch_ids(ns)
-        assert deps[ids[0]] == [VALIDATE_RUNFOLDER]
-        for previous, current in zip(ids, ids[1:]):
-            assert deps[current] == [previous]
+        lane = ns.split("_")[1]
+        assert {i: deps[i] for i in ids} == branch_deps(ids, [clean_lane_id(lane)])
 
     assert draft.preview["metadata_required"] is False
     assert [
@@ -177,6 +218,16 @@ async def test_lanes_and_settings_become_independent_branches(handler):
         for b in draft.preview["branches"]
     ] == [("1", "0", 1), ("2", "0", 2), ("2", "1", 0)]
     assert draft.preview["step_count"] == len(plan.steps)
+    assert draft.preview["shared_step_ids"] == [*SHARED_STEPS, PRUNE_STALE_LANES]
+    assert set(draft.preview["shared_step_ids"]) == {
+        s.step_id for s in plan.steps if not s.step_id.startswith("lane_")
+    }
+    assert [
+        (lane["lane_id"], lane["settings_indices"]) for lane in draft.preview["lanes"]
+    ] == [("1", ["0"]), ("2", ["0", "1"])]
+    assert draft.preview["lanes"][0]["lane_digest"] == step_dicts(plan)[
+        clean_lane_id("1")
+    ]["params"]["scenario"]["lane_digest"]
 
 
 @pytest.mark.asyncio
@@ -269,11 +320,35 @@ async def test_branch_payload_change_leaves_other_branches_unchanged(handler):
 
 
 @pytest.mark.asyncio
+async def test_settings_change_changes_only_its_lanes_cleanup(handler):
+    entries = [
+        lane_entry(1, settings_index=0),
+        lane_entry(1, settings_index=1),
+        lane_entry(2),
+    ]
+    changed = [*entries[:1], lane_entry(1, settings_index=1, samples=["NEW"]), entries[2]]
+    before = step_dicts((await plan_for(handler, entries)).plan)
+    after = step_dicts((await plan_for(handler, changed)).plan)
+
+    # The cleanup re-runs; its new token then re-runs the rest of the lane.
+    assert before[clean_lane_id("1")] != after[clean_lane_id("1")]
+    token = after[clean_lane_id("1")]["outputs"]["cleanup_token"]
+    for step_id in [*branch_ids("lane_1_settings_0"), *branch_ids("lane_1_settings_1")]:
+        assert after[step_id]["inputs"]["lane_cleanup"] == token
+    assert before["lane_1_settings_0__execute_demux"] == after[
+        "lane_1_settings_0__execute_demux"
+    ]
+    for step_id in [clean_lane_id("2"), *branch_ids("lane_2_settings_0")]:
+        assert before[step_id] == after[step_id]
+
+
+@pytest.mark.asyncio
 async def test_explicit_settings_index_names_the_branch(handler):
     draft = await plan_for(handler, [lane_entry(1, settings_index="02")])
 
-    assert [s.step_id for s in draft.plan.steps[2:]] == branch_ids("lane_1_settings_2")
-    assert draft.plan.steps[2].params["scenario"]["settings_index"] == "2"
+    ids = branch_ids("lane_1_settings_2")
+    assert branch_step_ids(draft.plan) == ids
+    assert step_dicts(draft.plan)[ids[0]]["params"]["scenario"]["settings_index"] == "2"
 
 
 def _without_lane(entry):
@@ -348,7 +423,10 @@ async def test_corrected_input_becomes_runnable(handler):
     assert rejected.auto_run is False
     assert corrected.auto_run is True
     assert corrected.plan.plan_id == rejected.plan.plan_id == PLAN_ID
-    assert len(corrected.plan.steps) == 12
+    assert branch_step_ids(corrected.plan) == [
+        *branch_ids("lane_1_settings_0"),
+        *branch_ids("lane_2_settings_0"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -411,8 +489,8 @@ async def test_metadata_can_be_made_a_branch_prerequisite(handler, monkeypatch):
     draft = await plan_for(handler, [lane_entry(1), lane_entry(2)])
     deps = {s.step_id: s.deps for s in draft.plan.steps}
 
-    for ns in ("lane_1_settings_0", "lane_2_settings_0"):
-        assert deps[branch_ids(ns)[0]] == [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
+    for lane in ("1", "2"):
+        assert deps[clean_lane_id(lane)] == [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
     assert draft.preview["metadata_required"] is True
 
 
@@ -435,8 +513,9 @@ async def test_hpc_base_path_prefixes_the_runfolder(
     )
 
     runfolder = f"{expected}/230314_A00000_0000_AXXXXX"
-    assert draft.plan.steps[0].params["scenario"]["hpc_runfolder_path"] == runfolder
-    assert draft.plan.steps[1].inputs["run_info_xml"] == f"{runfolder}/RunInfo.xml"
+    steps = {s.step_id: s for s in draft.plan.steps}
+    assert steps[VALIDATE_RUNFOLDER].params["scenario"]["hpc_runfolder_path"] == runfolder
+    assert steps[UPSERT_X_FLOWCELL].inputs["run_info_xml"] == f"{runfolder}/RunInfo.xml"
 
 
 @pytest.mark.asyncio
@@ -584,7 +663,9 @@ async def test_lane_zero_is_an_ordinary_branch(handler):
     draft = await plan_for(handler, [lane_entry(1), lane_entry(0)])
 
     assert draft.auto_run is True
-    assert [s.step_id for s in draft.plan.steps[2:7]] == branch_ids("lane_0_settings_0")
+    assert branch_step_ids(draft.plan)[: len(BRANCH_STAGES)] == branch_ids(
+        "lane_0_settings_0"
+    )
 
 
 @pytest.mark.asyncio
@@ -600,7 +681,7 @@ async def test_plan_survives_persistence_round_trip(handler):
         "demux_config": "extra_config_demultiplex.config"
     }
     assert specs["lane_2_settings_0__generate_samplesheet"].outputs == {
-        "samplesheet": "SampleSheet.csv"
+        "samplesheet": f"/scope/artifacts/{PLAN_ID}/lane_2_settings_0/SampleSheet.csv"
     }
     assert specs[UPSERT_X_FLOWCELL].inputs == {
         "run_info_xml": "/incoming/path/230314_A00000_0000_AXXXXX/RunInfo.xml",

@@ -10,10 +10,14 @@ from yggdrasil.watchers import EventType
 from .config import load_realm_config
 from .nextflow import resolve_run_options
 from .recipes import (
+    PRUNE_STALE_LANES,
+    SETUP_COMMON_DEMUX_DIR,
     UPSERT_X_FLOWCELL,
     VALIDATE_RUNFOLDER,
     branch_namespace,
     build_demux_plan,
+    clean_lane_step_id,
+    group_by_lane,
 )
 from .utils import group_samplesheet_branches, normalize_flowcell_id
 
@@ -314,6 +318,17 @@ class DemuxHandler(BaseHandler):
             branch_prerequisites=self.branch_prerequisites,
             artifact_base = ctx.scope_dir / "artifacts" / self._plan_id(canonical_fcid),
         )
+        steps = {s.step_id: s for s in plan.steps}
+        lane_summaries = [
+            {
+                "lane_id": lane_id,
+                "lane_digest": steps[clean_lane_step_id(lane_id)].params["scenario"][
+                    "lane_digest"
+                ],
+                "settings_indices": [b.settings_index for b in lane_branches],
+            }
+            for lane_id, lane_branches in group_by_lane(branches).items()
+        ]
         branch_summaries = []
         for branch in branches:
             prefix = f"{branch_namespace(branch.lane_id, branch.settings_index)}__"
@@ -348,9 +363,15 @@ class DemuxHandler(BaseHandler):
                     "runfolder_id": runfolder_id,
                     "hpc_runfolder_path": hpc_runfolder_path,
                     "failure_policy": plan.failure_policy,
-                    "shared_step_ids": [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL],
+                    "shared_step_ids": [
+                        VALIDATE_RUNFOLDER,
+                        SETUP_COMMON_DEMUX_DIR,
+                        UPSERT_X_FLOWCELL,
+                        PRUNE_STALE_LANES,
+                    ],
                     "branch_prerequisites": list(self.branch_prerequisites),
                     "metadata_required": UPSERT_X_FLOWCELL in self.branch_prerequisites,
+                    "lanes": lane_summaries,
                     "branches": branch_summaries,
                     "step_count": len(plan.steps),
                 },
