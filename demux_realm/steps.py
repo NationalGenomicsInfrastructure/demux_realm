@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -200,23 +201,41 @@ def _branch_dirs(
 
 
 def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
-    """Remove the links in demux_dir that point into any of outdirs.
+    """Remove the links under demux_dir that point into any of outdirs.
 
-    Dangling links count too: their target may already be gone.
+    Links are searched at any depth, since symlink_fastqs places sample FASTQs
+    in project/sample subdirectories. Dangling links count too: their target
+    may already be gone. Subdirectories left empty are removed as well.
     """
     if not outdirs or not demux_dir.is_dir():
         return []
     # Resolve both sides, so links through symlinked directories still match.
     resolved_outdirs = [outdir.resolve() for outdir in outdirs]
     removed = []
-    for link in sorted(demux_dir.iterdir()):
-        if not link.is_symlink():
-            continue
-        target = link.resolve()
-        if any(target.is_relative_to(outdir) for outdir in resolved_outdirs):
-            link.unlink()
-            removed.append(str(link))
-    return removed
+    # Directories that lost a link or a subdirectory; only these are pruned,
+    # so empty directories created by someone else stay.
+    emptied: set[Path] = set()
+    # Bottom-up, so a directory is visited after its contents were removed.
+    # Links to directories are listed in dirnames but never followed.
+    for dirpath, dirnames, filenames in os.walk(demux_dir, topdown=False):
+        directory = Path(dirpath)
+        for name in sorted([*dirnames, *filenames]):
+            link = directory / name
+            if not link.is_symlink():
+                continue
+            target = link.resolve()
+            if any(target.is_relative_to(outdir) for outdir in resolved_outdirs):
+                link.unlink()
+                removed.append(str(link))
+                emptied.add(directory)
+        if (
+            directory != demux_dir
+            and directory in emptied
+            and not any(directory.iterdir())
+        ):
+            directory.rmdir()
+            emptied.add(directory.parent)
+    return sorted(removed)
 
 
 def _remove_branch_results(
@@ -676,7 +695,9 @@ def execute_demux(
     )
     log_path = ctx.workdir / "nextflow_run.log"
     if settings.executor == "slurm":
-        return _execute_on_slurm(ctx, cmd=cmd, log_path=log_path, settings=settings, tag=tag)
+        return _execute_on_slurm(
+            ctx, cmd=cmd, log_path=log_path, settings=settings, tag=tag
+        )
     proc = run_nextflow(cmd, log_path)
     ctx.record_artifact(SimpleArtifactRef("nextflow_log", "logs"), path=log_path)
 
@@ -844,13 +865,42 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 # TODO: Add a step to aggregate demux stats for lanes with multiple demuxes
 
 
+def _fastq_link_path(demux_dir: Path, results_dir: Path, fastq: Path) -> Path:
+    """Return where fastq is linked in the runfolder's Demultiplexing directory.
+
+    When using the "--bcl-sampleproject-subdirectories true" and
+    "--sample-name-column-enabled true" options, bcl-convert writes sample
+    FASTQs as <lane>/<project>/<sample>/<file> under results_dir, e.g.
+    L001/A__Project_26_01/Sample_P12345_1001/P12345_1001_S1_L001_R1_001.fastq.gz;
+    they are linked as demux_dir/<project>/<sample>/<file>. Undetermined FASTQs
+    belong to no project and are linked directly in demux_dir.
+
+    Raises:
+        PermanentStepError: If a sample FASTQ is not in that layout.
+    """
+    if fastq.name.startswith("Undetermined"):
+        return demux_dir / fastq.name
+    parts = fastq.relative_to(results_dir).parts
+    if len(parts) != 4:
+        raise PermanentStepError(
+            f"Unexpected FASTQ location: {fastq}",
+            advice=(
+                "Sample FASTQs must be at <lane>/<project>/<sample>/<file> "
+                f"under {results_dir}."
+            ),
+        )
+    _lane, project, sample, name = parts
+    return demux_dir / project / sample / name
+
+
 @step
 def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
     """Symlinks fastq files from the branch's results directory to the common demux directory.
 
     When the lane has several settings runs (scenario's lane_settings_count),
     each run writes its own Undetermined FASTQs under the same file names, and
-    the links share one flat directory, so none of them is linked.
+    their links would share demux_dir, so none of them is linked. Sample
+    FASTQs are linked under their project and sample (see _fastq_link_path).
     """
     settings = load_realm_config().nextflow
     tag = branch_run_tag(
@@ -874,9 +924,8 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
             logger.info("Not linking %s: the lane has several settings runs.", fq)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
     for fq in fastqs:
-        symlink_path = (
-            demux_dir / fq.name
-        )  # TODO: should be demux_dir / project / sample / fq.name
+        symlink_path = _fastq_link_path(demux_dir, results_dir, fq)
+        symlink_path.parent.mkdir(parents=True, exist_ok=True)
         # is_symlink() also sees a dangling link, which exists() does not.
         if symlink_path.is_symlink() and symlink_path.resolve() != fq.resolve():
             # Left by an earlier run that clean_lane did not cover.
