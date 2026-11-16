@@ -114,14 +114,13 @@ The result must be absolute; a relative path would depend on the executing
 process's working directory, so the proposal is rejected instead.
 
 For a ready flowcell with `L` lanes and `N` valid lane/settings combinations
-the handler returns one plan, run automatically, with `4 + 3L + 6N` steps:
+the handler returns one plan, run automatically, with `4 + 3L + 5N` steps:
 
 - 4 flowcell steps: `validate_runfolder`, `setup_common_demux_dir`,
   `upsert_x_flowcell_pre_demux` and `prune_stale_lanes`;
 - 3 steps per lane: `clean_lane` and the two aggregate steps;
-- 6 steps per lane/settings branch: `materialize_config`,
-  `generate_samplesheet`, `execute_demux`, `collect_results`,
-  `symlink_fastqs` and `upload_results`.
+- 5 steps per lane/settings branch: `generate_samplesheet`,
+  `execute_demux`, `collect_results`, `symlink_fastqs` and `upload_results`.
 
 That counts the steps in the plan, not the steps that run: on a later run,
 steps whose fingerprint is unchanged (for example every step of an unchanged
@@ -138,13 +137,12 @@ setup_common_demux_dir
 validate_runfolder
 ├── upsert_x_flowcell_pre_demux
 ├── lane_1__clean_lane
-│   ├── lane_1_settings_0__materialize_config
-│   │   └── lane_1_settings_0__generate_samplesheet
-│   │       └── lane_1_settings_0__execute_demux
-│   │           ├── lane_1_settings_0__symlink_fastqs
-│   │           └── lane_1_settings_0__collect_results
-│   │               └── lane_1_settings_0__upload_results
-│   └── lane_1_settings_1__materialize_config
+│   ├── lane_1_settings_0__generate_samplesheet
+│   │   └── lane_1_settings_0__execute_demux
+│   │       ├── lane_1_settings_0__symlink_fastqs
+│   │       └── lane_1_settings_0__collect_results
+│   │           └── lane_1_settings_0__upload_results
+│   └── lane_1_settings_1__generate_samplesheet
 │       └── ...
 ├── lane_2__clean_lane
 │   └── ...
@@ -241,7 +239,6 @@ source are recorded in the draft's preview only, so they never invalidate reuse.
 |---|---|
 | `validate_runfolder` | Validates that the run folder exists on the HPC |
 | `upsert_x_flowcell_pre_demux` | Reads `RunInfo.xml` and `RunParameters.xml`, then writes the `x_flowcells` document through DataAccess |
-| `materialize_config` | Writes `extra_config_demultiplex.config` |
 | `generate_samplesheet` | Validates the entry again and writes `SampleSheet.csv` |
 | `execute_demux` | Runs one `nf-core/demultiplex` Nextflow instance per branch on the sheet its `generate_samplesheet` step wrote |
 | `collect_results`, `upload_results` | `collect_results` counts the branch's FASTQ and MultiQC outputs; `upload_results` is a simulation that only logs |
@@ -251,8 +248,8 @@ source are recorded in the draft's preview only, so they never invalidate reuse.
 the step's `inputs`), anchored on the plan directory. The path may not leave the
 plan directory and the file must exist; otherwise the step fails permanently.
 
-`materialize_config` and `generate_samplesheet` declare their files as required
-outputs, relative to their own step work directories. The metadata update
+`generate_samplesheet` declares its samplesheet as a required output, relative
+to its own step work directory. The metadata update
 declares both XML files as inputs, so editing either re-runs it. A step is
 reused on a later attempt when its parameters, declared inputs and declared
 outputs are unchanged and its outputs still exist; removing a declared output

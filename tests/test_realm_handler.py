@@ -13,6 +13,7 @@ from realm_support import (
 )
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan
 
+from demux_realm import handler as handler_module
 from demux_realm.config import realm_config_from_mapping
 from demux_realm.descriptor import (
     _build_demux_sample_info_payload,
@@ -20,7 +21,6 @@ from demux_realm.descriptor import (
     _build_flowcell_status_payload,
     _build_flowcell_status_scope,
 )
-from demux_realm import handler as handler_module
 from demux_realm.handler import DemuxHandler
 from demux_realm.recipes import (
     PRUNE_STALE_LANES,
@@ -32,7 +32,6 @@ from demux_realm.recipes import (
 PLAN_ID = "dmx_realm:SC123:demux"
 FLOWCELL_SCOPE = {"kind": "flowcell", "id": "SC123"}
 BRANCH_STAGES = (
-    "materialize_config",
     "generate_samplesheet",
     "execute_demux",
     "collect_results",
@@ -61,10 +60,9 @@ def branch_step_ids(plan: Plan) -> list[str]:
 
 def branch_deps(ids: list[str], first: list[str]) -> dict[str, list[str]]:
     """Return the expected deps of one branch's steps, given its first step's."""
-    materialize, generate, execute, collect, symlink, upload = ids
+    generate, execute, collect, symlink, upload = ids
     return {
-        materialize: first,
-        generate: [materialize],
+        generate: first,
         execute: [generate],
         collect: [execute],
         symlink: [execute],
@@ -677,9 +675,6 @@ async def test_plan_survives_persistence_round_trip(handler):
     assert restored.to_dict() == plan.to_dict()
     assert restored.failure_policy == CONTINUE_INDEPENDENT_POLICY
     specs = {s.step_id: s for s in restored.steps}
-    assert specs["lane_2_settings_0__materialize_config"].outputs == {
-        "demux_config": "extra_config_demultiplex.config"
-    }
     assert specs["lane_2_settings_0__generate_samplesheet"].outputs == {
         "samplesheet": f"/scope/artifacts/{PLAN_ID}/lane_2_settings_0/SampleSheet.csv"
     }

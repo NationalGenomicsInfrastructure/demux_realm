@@ -9,7 +9,6 @@ from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan, StepSpec
 
 from .nextflow import NextflowRunOptions
 from .utils import (
-    DEMUX_CONFIG_FILENAME,
     RUN_INFO_XML,
     RUN_PARAMETERS_XML,
     SamplesheetBranch,
@@ -201,20 +200,11 @@ def build_demux_plan(
             # Relative outputs resolve inside each producer's own work directory.
             steps += [
                 StepSpec(
-                    step_id=f"{ns}__materialize_config",
-                    name=f"Materialize Demux Config ({label})",
-                    fn_ref=f"{_PREFIX}.materialize_extra_config",
-                    params={"scenario": scenario},
-                    deps=[clean_lane],
-                    inputs=dict(lane_inputs),
-                    outputs={"demux_config": DEMUX_CONFIG_FILENAME},
-                ),
-                StepSpec(
                     step_id=f"{ns}__generate_samplesheet",
                     name=f"Generate SampleSheet.csv ({label})",
                     fn_ref=f"{_PREFIX}.generate_samplesheet",
                     params={"scenario": scenario, "samplesheet": samplesheet_path},
-                    deps=[f"{ns}__materialize_config"],
+                    deps=[clean_lane],
                     inputs=dict(lane_inputs),
                     outputs={"samplesheet": str(samplesheet_path)},
                 ),

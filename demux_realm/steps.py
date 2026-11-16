@@ -25,7 +25,6 @@ from .nextflow import (
     slurm_job_name,
 )
 from .utils import (
-    DEMUX_CONFIG_FILENAME,
     RUN_INFO_XML,
     RUN_PARAMETERS_XML,
     build_lims_lookup,
@@ -608,19 +607,6 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
             "doc_id": write_result.doc_id,
         }
     )
-
-
-@step
-def materialize_extra_config(ctx: StepContext, scenario: dict) -> StepResult:
-    """Materializes the extra demultiplex config file."""
-    config_file = ctx.workdir / DEMUX_CONFIG_FILENAME
-    logger.info(f"Materializing config to {config_file}")
-
-    # Writing a mock standard config
-    config_file.write_text("process {\n  executor = 'local'\n  cpus = 4\n}")
-
-    ctx.record_artifact(SimpleArtifactRef("demux_config", "config"), path=config_file)
-    return StepResult(metrics={"config_bytes": config_file.stat().st_size})
 
 
 @step
