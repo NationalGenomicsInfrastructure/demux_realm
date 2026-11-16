@@ -716,8 +716,8 @@ def generate_samplesheet(
         / SAMPLESHEETS_DIRNAME
         / samplesheet_link_name(
             scenario["canonical_flowcell_id"],
-            str(scenario["lane_id"]),
-            str(scenario["settings_index"]),
+            scenario["lane_id"],
+            scenario["settings_index"],
         )
     )
     _link(link, samplesheet.resolve())
