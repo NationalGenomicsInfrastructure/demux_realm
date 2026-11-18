@@ -1,4 +1,5 @@
 import io
+import re
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -9,7 +10,35 @@ from typing import Any
 # into their own work directories.
 RUN_INFO_XML = "RunInfo.xml"
 RUN_PARAMETERS_XML = "RunParameters.xml"
-DEMUX_CONFIG_FILENAME = "extra_config_demultiplex.config"
+# Runfolder directory holding a link to every branch's generated samplesheet.
+SAMPLESHEETS_DIRNAME = "Samplesheets"
+
+
+
+def samplesheet_link_name(
+    canonical_flowcell_id: str, lane_id: str, settings_index: str
+) -> str:
+    """Return the name of a branch's samplesheet link in the Samplesheets directory.
+
+    e.g. SC2177698-SC3_lane_2_settings_0_SampleSheet.csv. The cleanup finds
+    the links of a lane by this name (see samplesheet_link_lane), so the two
+    must stay in step.
+    """
+    return (
+        f"{canonical_flowcell_id}_lane_{lane_id}_settings_{settings_index}"
+        "_SampleSheet.csv"
+    )
+
+
+def samplesheet_link_lane(canonical_flowcell_id: str, name: str) -> str | None:
+    """Return the lane of a samplesheet link name of this flowcell, else None."""
+    match = re.fullmatch(
+        rf"{re.escape(canonical_flowcell_id)}_lane_([^_]+)_settings_[^_]+"
+        r"_SampleSheet\.csv",
+        name,
+    )
+    return match.group(1) if match else None
+
 
 # Settings index of a lane's only entry when it does not name one.
 DEFAULT_SETTINGS_INDEX = "0"

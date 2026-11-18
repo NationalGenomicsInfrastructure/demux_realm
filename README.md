@@ -114,14 +114,13 @@ The result must be absolute; a relative path would depend on the executing
 process's working directory, so the proposal is rejected instead.
 
 For a ready flowcell with `L` lanes and `N` valid lane/settings combinations
-the handler returns one plan, run automatically, with `4 + 3L + 6N` steps:
+the handler returns one plan, run automatically, with `4 + 3L + 5N` steps:
 
 - 4 flowcell steps: `validate_runfolder`, `setup_common_demux_dir`,
   `upsert_x_flowcell_pre_demux` and `prune_stale_lanes`;
 - 3 steps per lane: `clean_lane` and the two aggregate steps;
-- 6 steps per lane/settings branch: `materialize_config`,
-  `generate_samplesheet`, `execute_demux`, `collect_results`,
-  `symlink_fastqs` and `upload_results`.
+- 5 steps per lane/settings branch: `generate_samplesheet`,
+  `execute_demux`, `collect_results`, `symlink_fastqs` and `upload_results`.
 
 That counts the steps in the plan, not the steps that run: on a later run,
 steps whose fingerprint is unchanged (for example every step of an unchanged
@@ -134,21 +133,23 @@ lane) are reused instead.
 | `failure_policy` | `continue_independent` |
 
 ```text
-setup_common_demux_dir
 validate_runfolder
 ├── upsert_x_flowcell_pre_demux
-├── lane_1__clean_lane
-│   ├── lane_1_settings_0__materialize_config
-│   │   └── lane_1_settings_0__generate_samplesheet
-│   │       └── lane_1_settings_0__execute_demux
-│   │           ├── lane_1_settings_0__symlink_fastqs
-│   │           └── lane_1_settings_0__collect_results
-│   │               └── lane_1_settings_0__upload_results
-│   └── lane_1_settings_1__materialize_config
+├── setup_common_demux_dir
+│   ├── lane_1__clean_lane
+│   │   ├── lane_1_settings_0__generate_samplesheet
+│   │   │   └── lane_1_settings_0__execute_demux
+│   │   │       ├── lane_1_settings_0__symlink_fastqs
+│   │   │       └── lane_1_settings_0__collect_results
+│   │   │           └── lane_1_settings_0__upload_results
+│   │   └── lane_1_settings_1__generate_samplesheet
+│   │       └── ...
+│   └── lane_2__clean_lane
 │       └── ...
-├── lane_2__clean_lane
-│   └── ...
 └── prune_stale_lanes
+
+lane_<n>__clean_lane also depends on every step in the handler's
+branch_prerequisites (validate_runfolder by default).
 
 lane_<n>__aggregate_illumina_stats, lane_<n>__aggregate_undetermined_stats
     depend on every upload_results step of lane <n>
@@ -160,8 +161,9 @@ re-demultiplexed, even when it holds several settings groups.
 samplesheet entries, their Nextflow options and the `demux_sample_info`
 metadata, so changing any of the lane's samplesheets re-runs it. It removes,
 for every settings index of the lane (including ones no longer planned), the
-Nextflow results and work directories and the links into the results in the
-runfolder's `Demultiplexing` directory. Removing the work directories means
+Nextflow results and work directories, the links into the results in the
+runfolder's `Demultiplexing` directory and the lane's samplesheet links in the
+runfolder's `Samplesheets` directory. Removing the work directories means
 `-resume` cannot reuse any earlier task, so the lane is demultiplexed from
 scratch. Each run then writes a new random token to
 `lane_<n>/cleanup.token` under the plan's artifact directory, and every later
@@ -192,8 +194,8 @@ settings indices no longer planned and rebuild `illumina` and `Undetermined`
 from every entry in the field. Only those two derived fields are read by the
 StatusDB views; the reports field is the realm's own source data for them.
 
-`prune_stale_lanes` removes the results and work directories and links of
-lanes no longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
+`prune_stale_lanes` removes the results and work directories, FASTQ links and
+samplesheet links of lanes no longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
 in the aggregated stats until removed by hand.
 
 A retry after a failed branch re-runs only that branch: the lane's
@@ -240,9 +242,9 @@ source are recorded in the draft's preview only, so they never invalidate reuse.
 | Step | What it does now |
 |---|---|
 | `validate_runfolder` | Validates that the run folder exists on the HPC |
+| `setup_common_demux_dir` | Creates the runfolder's `Demultiplexing` and `Samplesheets` directories |
 | `upsert_x_flowcell_pre_demux` | Reads `RunInfo.xml` and `RunParameters.xml`, then writes the `x_flowcells` document through DataAccess |
-| `materialize_config` | Writes `extra_config_demultiplex.config` |
-| `generate_samplesheet` | Validates the entry again and writes `SampleSheet.csv` |
+| `generate_samplesheet` | Validates the entry again, writes `SampleSheet.csv` and links it as `Samplesheets/<FCID>_lane_<n>_settings_<i>_SampleSheet.csv` in the runfolder |
 | `execute_demux` | Runs one `nf-core/demultiplex` Nextflow instance per branch on the sheet its `generate_samplesheet` step wrote |
 | `collect_results`, `upload_results` | `collect_results` counts the branch's FASTQ and MultiQC outputs; `upload_results` is a simulation that only logs |
 
@@ -251,8 +253,8 @@ source are recorded in the draft's preview only, so they never invalidate reuse.
 the step's `inputs`), anchored on the plan directory. The path may not leave the
 plan directory and the file must exist; otherwise the step fails permanently.
 
-`materialize_config` and `generate_samplesheet` declare their files as required
-outputs, relative to their own step work directories. The metadata update
+`generate_samplesheet` declares its samplesheet as a required output, relative
+to its own step work directory. The metadata update
 declares both XML files as inputs, so editing either re-runs it. A step is
 reused on a later attempt when its parameters, declared inputs and declared
 outputs are unchanged and its outputs still exist; removing a declared output

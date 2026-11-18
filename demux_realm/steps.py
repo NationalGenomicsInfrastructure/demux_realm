@@ -25,9 +25,9 @@ from .nextflow import (
     slurm_job_name,
 )
 from .utils import (
-    DEMUX_CONFIG_FILENAME,
     RUN_INFO_XML,
     RUN_PARAMETERS_XML,
+    SAMPLESHEETS_DIRNAME,
     build_lims_lookup,
     build_x_flowcell_payload,
     derive_xflowcell_name,
@@ -35,6 +35,8 @@ from .utils import (
     parse_run_info_xml,
     parse_run_parameters_xml,
     render_bcl_convert_samplesheet,
+    samplesheet_link_lane,
+    samplesheet_link_name,
     validate_lane_payload,
 )
 
@@ -201,23 +203,83 @@ def _branch_dirs(
 
 
 def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
-    """Remove the links in demux_dir that point into any of outdirs.
+    """Remove the links under demux_dir that point into any of outdirs.
 
-    Dangling links count too: their target may already be gone.
+    Links are searched at any depth, since symlink_fastqs places sample FASTQs
+    in project/sample subdirectories. Dangling links count too: their target
+    may already be gone. Subdirectories left empty are removed as well.
     """
     if not outdirs or not demux_dir.is_dir():
         return []
     # Resolve both sides, so links through symlinked directories still match.
     resolved_outdirs = [outdir.resolve() for outdir in outdirs]
     removed = []
-    for link in sorted(demux_dir.iterdir()):
+    # Directories that lost a link or a subdirectory; only these are pruned,
+    # so empty directories created by someone else stay.
+    emptied: set[Path] = set()
+    # Bottom-up, so a directory is visited after its contents were removed.
+    # Links to directories are listed in dirnames but never followed.
+    for dirpath, dirnames, filenames in demux_dir.walk(top_down=False):
+        directory = Path(dirpath)
+        for name in sorted([*dirnames, *filenames]):
+            link = directory / name
+            if not link.is_symlink():
+                continue
+            target = link.resolve()
+            if any(target.is_relative_to(outdir) for outdir in resolved_outdirs):
+                link.unlink()
+                removed.append(str(link))
+                emptied.add(directory)
+        if (
+            directory != demux_dir
+            and directory in emptied
+            and not any(directory.iterdir())
+        ):
+            directory.rmdir()
+            emptied.add(directory.parent)
+    return sorted(removed)
+
+
+def _remove_samplesheet_links(
+    samplesheets_dir: Path,
+    canonical_flowcell_id: str,
+    drop_lane: Callable[[str], bool],
+) -> list[str]:
+    """Remove this flowcell's samplesheet links of the lanes drop_lane selects.
+
+    The links point into the plan's artifact directory, not into the Nextflow
+    results, so they are matched by name (see samplesheet_link_name). Only
+    links are removed; any other file in the directory is left alone.
+    """
+    if not samplesheets_dir.is_dir():
+        return []
+    removed = []
+    for link in sorted(samplesheets_dir.iterdir()):
         if not link.is_symlink():
             continue
-        target = link.resolve()
-        if any(target.is_relative_to(outdir) for outdir in resolved_outdirs):
+        lane = samplesheet_link_lane(canonical_flowcell_id, link.name)
+        if lane is not None and drop_lane(lane):
             link.unlink()
             removed.append(str(link))
     return removed
+
+
+def _link(link: Path, target: Path) -> None:
+    """Make link point at target, replacing a stale or dangling link.
+
+    An existing file that is not a link is left in place, with a warning.
+    """
+    link.parent.mkdir(parents=True, exist_ok=True)
+    # is_symlink() also sees a dangling link, which exists() does not.
+    if link.is_symlink() and link.resolve() != target.resolve():
+        # Left by an earlier run that the cleanup did not cover.
+        logger.warning("Replacing stale symlink %s", link)
+        link.unlink()
+    if not link.is_symlink() and not link.exists():
+        link.symlink_to(target)
+        logger.info("Symlinked %s to %s", target, link)
+    else:
+        logger.warning("Symlink already exists: %s", link)
 
 
 def _remove_branch_results(
@@ -225,8 +287,9 @@ def _remove_branch_results(
 ) -> dict[str, Any]:
     """Remove the selected lanes' demultiplexing results from earlier runs.
 
-    That is: their Nextflow results and work directories, and the links in
-    the runfolder's Demultiplexing directory that point into the results.
+    That is: their Nextflow results and work directories, the links in the
+    runfolder's Demultiplexing directory that point into the results, and
+    their samplesheet links in the runfolder's Samplesheets directory.
     Removing the work directories means -resume cannot reuse any earlier
     task, so the lane is demultiplexed from scratch. Settings indices that are
     no longer planned are matched too, since directories are selected by lane
@@ -243,15 +306,19 @@ def _remove_branch_results(
     fcid = scenario["canonical_flowcell_id"]
     outdirs = _branch_dirs(settings.outdir_base, fcid, drop_lane)
     work_dirs = _branch_dirs(settings.work_base, fcid, drop_lane)
-    demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
+    runfolder = Path(scenario["hpc_runfolder_path"])
 
-    links = _remove_branch_symlinks(demux_dir, outdirs)
+    links = _remove_branch_symlinks(runfolder / "Demultiplexing", outdirs)
+    samplesheet_links = _remove_samplesheet_links(
+        runfolder / SAMPLESHEETS_DIRNAME, fcid, drop_lane
+    )
     for path in [*outdirs, *work_dirs]:
         shutil.rmtree(path)
         logger.info("Removed %s.", path)
     return {
         "removed_dirs": [str(path) for path in [*outdirs, *work_dirs]],
         "removed_symlinks": links,
+        "removed_samplesheet_links": samplesheet_links,
     }
 
 
@@ -476,14 +543,21 @@ def validate_runfolder(ctx: StepContext, scenario: dict) -> StepResult:
 
 @step
 def setup_common_demux_dir(ctx: StepContext, scenario: dict) -> StepResult:
-    """Create the common demux directory for all branches."""
+    """Create the runfolder directories shared by all branches.
+
+    These are Demultiplexing, where symlink_fastqs links the FASTQs, and
+    Samplesheets, where generate_samplesheet links each branch's sheet.
+    """
     hpc_path = Path(scenario["hpc_runfolder_path"])
     demux_dir = hpc_path / "Demultiplexing"
-    demux_dir.mkdir(exist_ok=True)
-    logger.info("Created common demux directory %s.", demux_dir)
+    samplesheets_dir = hpc_path / SAMPLESHEETS_DIRNAME
+    for directory in (demux_dir, samplesheets_dir):
+        directory.mkdir(exist_ok=True)
+        logger.info("Created common directory %s.", directory)
     return StepResult(
         metrics={
             "demux_dir": str(demux_dir),
+            "samplesheets_dir": str(samplesheets_dir),
         }
     )
 
@@ -611,23 +685,15 @@ def upsert_x_flowcell_pre_demux(ctx: StepContext, scenario: dict) -> StepResult:
 
 
 @step
-def materialize_extra_config(ctx: StepContext, scenario: dict) -> StepResult:
-    """Materializes the extra demultiplex config file."""
-    config_file = ctx.workdir / DEMUX_CONFIG_FILENAME
-    logger.info(f"Materializing config to {config_file}")
-
-    # Writing a mock standard config
-    config_file.write_text("process {\n  executor = 'local'\n  cpus = 4\n}")
-
-    ctx.record_artifact(SimpleArtifactRef("demux_config", "config"), path=config_file)
-    return StepResult(metrics={"config_bytes": config_file.stat().st_size})
-
-
-@step
 def generate_samplesheet(
     ctx: StepContext, scenario: dict, samplesheet: Annotated[Path, Out(SAMPLESHEET)]
 ) -> StepResult:
-    """Generates and writes SampleSheet.csv from the lane-specific samplesheet payload."""
+    """Generates and writes SampleSheet.csv from the lane-specific samplesheet payload.
+
+    The sheet is also linked into the runfolder's Samplesheets directory under
+    a name carrying the flowcell, lane and settings index (see
+    samplesheet_link_name); clean_lane and prune_stale_lanes remove the link.
+    """
     ss_payload = scenario["samplesheet_payload"]
 
     validate_lane_payload(ss_payload, expected_lane=scenario.get("lane_id"))
@@ -643,7 +709,23 @@ def generate_samplesheet(
         samplesheet,
     )
     ctx.record_artifact(SAMPLESHEET, path=samplesheet)
-    return StepResult(metrics={"samplesheet_bytes": samplesheet.stat().st_size})
+
+    link = (
+        Path(scenario["hpc_runfolder_path"])
+        / SAMPLESHEETS_DIRNAME
+        / samplesheet_link_name(
+            scenario["canonical_flowcell_id"],
+            scenario["lane_id"],
+            scenario["settings_index"],
+        )
+    )
+    _link(link, samplesheet.resolve())
+    return StepResult(
+        metrics={
+            "samplesheet_bytes": samplesheet.stat().st_size,
+            "samplesheet_link": str(link),
+        }
+    )
 
 
 @step
@@ -690,7 +772,9 @@ def execute_demux(
     )
     log_path = ctx.workdir / "nextflow_run.log"
     if settings.executor == "slurm":
-        return _execute_on_slurm(ctx, cmd=cmd, log_path=log_path, settings=settings, tag=tag)
+        return _execute_on_slurm(
+            ctx, cmd=cmd, log_path=log_path, settings=settings, tag=tag
+        )
     proc = run_nextflow(cmd, log_path)
     ctx.record_artifact(SimpleArtifactRef("nextflow_log", "logs"), path=log_path)
 
@@ -858,13 +942,42 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 # TODO: Add a step to aggregate demux stats for lanes with multiple demuxes
 
 
+def _fastq_link_path(demux_dir: Path, results_dir: Path, fastq: Path) -> Path:
+    """Return where fastq is linked in the runfolder's Demultiplexing directory.
+
+    When using the "--bcl-sampleproject-subdirectories true" and
+    "--sample-name-column-enabled true" options, bcl-convert writes sample
+    FASTQs as <lane>/<project>/<sample>/<file> under results_dir, e.g.
+    L001/A__Project_26_01/Sample_P12345_1001/P12345_1001_S1_L001_R1_001.fastq.gz;
+    they are linked as demux_dir/<project>/<sample>/<file>. Undetermined FASTQs
+    belong to no project and are linked directly in demux_dir.
+
+    Raises:
+        PermanentStepError: If a sample FASTQ is not in that layout.
+    """
+    if fastq.name.startswith("Undetermined"):
+        return demux_dir / fastq.name
+    parts = fastq.relative_to(results_dir).parts
+    if len(parts) != 4:
+        raise PermanentStepError(
+            f"Unexpected FASTQ location: {fastq}",
+            advice=(
+                "Sample FASTQs must be at <lane>/<project>/<sample>/<file> "
+                f"under {results_dir}."
+            ),
+        )
+    _lane, project, sample, name = parts
+    return demux_dir / project / sample / name
+
+
 @step
 def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
     """Symlinks fastq files from the branch's results directory to the common demux directory.
 
     When the lane has several settings runs (scenario's lane_settings_count),
     each run writes its own Undetermined FASTQs under the same file names, and
-    the links share one flat directory, so none of them is linked.
+    their links would share demux_dir, so none of them is linked. Sample
+    FASTQs are linked under their project and sample (see _fastq_link_path).
     """
     settings = load_realm_config().nextflow
     tag = branch_run_tag(
@@ -888,19 +1001,7 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
             logger.info("Not linking %s: the lane has several settings runs.", fq)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
     for fq in fastqs:
-        symlink_path = (
-            demux_dir / fq.name
-        )  # TODO: should be demux_dir / project / sample / fq.name
-        # is_symlink() also sees a dangling link, which exists() does not.
-        if symlink_path.is_symlink() and symlink_path.resolve() != fq.resolve():
-            # Left by an earlier run that clean_lane did not cover.
-            logger.warning("Replacing stale symlink %s", symlink_path)
-            symlink_path.unlink()
-        if not symlink_path.is_symlink() and not symlink_path.exists():
-            symlink_path.symlink_to(fq)
-            logger.info("Symlinked %s to %s", fq, symlink_path)
-        else:
-            logger.warning("Symlink already exists: %s", symlink_path)
+        _link(_fastq_link_path(demux_dir, results_dir, fq), fq)
 
     return StepResult(
         metrics={

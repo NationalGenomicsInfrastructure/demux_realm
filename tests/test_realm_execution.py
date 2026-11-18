@@ -59,7 +59,6 @@ FCID = "SC2177698-SC3"
 LANE_1 = [
     f"lane_1_settings_0__{stage}"
     for stage in (
-        "materialize_config",
         "generate_samplesheet",
         "execute_demux",
         "collect_results",
@@ -79,9 +78,8 @@ AGGREGATES = AGGREGATES_1 + AGGREGATES_2
 
 def failed_branch(ids: list[str]) -> dict:
     """Outcomes of a branch whose execute_demux failed."""
-    materialize, generate, execute, collect, symlink, upload = ids
+    generate, execute, collect, symlink, upload = ids
     return {
-        materialize: SUCCEEDED,
         generate: SUCCEEDED,
         execute: FAILED,
         collect: BLOCKED,
@@ -309,8 +307,8 @@ def test_early_branch_failure_leaves_later_branch_running(ws, monkeypatch):
         **dict.fromkeys(LANE_2 + AGGREGATES_2, SUCCEEDED),
         **dict.fromkeys(AGGREGATES_1, BLOCKED),
     }
-    assert report.direct_blockers[LANE_1[3]] == [LANE_1[2]]
-    assert report.failed_ancestors[LANE_1[5]] == [LANE_1[2]]
+    assert report.direct_blockers[LANE_1[2]] == [LANE_1[1]]
+    assert report.failed_ancestors[LANE_1[4]] == [LANE_1[1]]
     # Lane 1 had already failed when lane 2 went on to its upload.
     assert calls == [
         ("execute_demux", "1", "0"),
@@ -330,7 +328,7 @@ def test_validation_failure_blocks_metadata_and_every_branch(
     assert report.outcome is ExecutionOutcome.FAILED
     assert report.step_outcomes == {
         VALIDATE_RUNFOLDER: FAILED,
-        SETUP_COMMON_DEMUX_DIR: SUCCEEDED,
+        SETUP_COMMON_DEMUX_DIR: BLOCKED,
         UPSERT_X_FLOWCELL: BLOCKED,
         **dict.fromkeys(
             [CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, PRUNE_STALE_LANES, *AGGREGATES],
@@ -356,8 +354,8 @@ def test_metadata_failure_lets_independent_branches_finish(ws, x_flowcells):
             [CLEAN_1, CLEAN_2, *LANE_1, *LANE_2, PRUNE_STALE_LANES], SUCCEEDED
         ),
         # The uploads write to the same unavailable database.
-        LANE_1[5]: FAILED,
-        LANE_2[5]: FAILED,
+        LANE_1[4]: FAILED,
+        LANE_2[4]: FAILED,
         **dict.fromkeys(AGGREGATES, BLOCKED),
     }
 
@@ -427,7 +425,7 @@ def test_unchanged_rerun_reuses_and_missing_output_reruns_its_producer(ws):
             key: str(path) for key, path in declared.items()
         }
     lane_1_sheet = Path(
-        next(s for s in plan.steps if s.step_id == LANE_1[1]).outputs["samplesheet"]
+        next(s for s in plan.steps if s.step_id == LANE_1[0]).outputs["samplesheet"]
     )
     assert "L1S0_1" in lane_1_sheet.read_text()
     assert "L2S0_1" not in lane_1_sheet.read_text()
@@ -442,7 +440,7 @@ def test_unchanged_rerun_reuses_and_missing_output_reruns_its_producer(ws):
 
     assert third.step_outcomes == {
         **dict.fromkeys(step_ids, REUSED),
-        LANE_1[1]: SUCCEEDED,
+        LANE_1[0]: SUCCEEDED,
     }
     assert lane_1_sheet.is_file()
 
@@ -692,7 +690,6 @@ async def test_finished_failed_continuation_needs_a_new_run_request(ws, monkeypa
         **dict.fromkeys([CLEAN_1, CLEAN_2, PRUNE_STALE_LANES], REUSED),
         **failed_branch(LANE_1),
         LANE_1[0]: REUSED,
-        LANE_1[1]: REUSED,
         **dict.fromkeys(LANE_2 + AGGREGATES_2, REUSED),
         **dict.fromkeys(AGGREGATES_1, BLOCKED),
     }

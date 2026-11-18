@@ -82,7 +82,10 @@ def test_shared_steps_declare_the_xml_the_metadata_step_reads():
     assert plan.scope == {"kind": "flowcell", "id": "SC123"}
     assert plan.failure_policy == CONTINUE_INDEPENDENT_POLICY
     assert (validate.step_id, validate.deps) == (VALIDATE_RUNFOLDER, [])
-    assert (setup.step_id, setup.deps) == (SETUP_COMMON_DEMUX_DIR, [])
+    assert (setup.step_id, setup.deps) == (
+        SETUP_COMMON_DEMUX_DIR,
+        [VALIDATE_RUNFOLDER],
+    )
     assert (upsert.step_id, upsert.deps) == (UPSERT_X_FLOWCELL, [VALIDATE_RUNFOLDER])
     assert upsert.params["scenario"]["samplesheets"] == [{"lane": 3}, {"lane": 1}]
     assert upsert.inputs == {
@@ -105,14 +108,9 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
 
     assert [(s.step_id, s.fn_ref, s.deps) for s in steps] == [
         (
-            "lane_3_settings_1__materialize_config",
-            "demux_realm.steps.materialize_extra_config",
-            ["lane_3__clean_lane"],
-        ),
-        (
             "lane_3_settings_1__generate_samplesheet",
             "demux_realm.steps.generate_samplesheet",
-            ["lane_3_settings_1__materialize_config"],
+            ["lane_3__clean_lane"],
         ),
         (
             "lane_3_settings_1__execute_demux",
@@ -137,7 +135,6 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
     ]
     sheet = "/work/artifacts/lane_3_settings_1/SampleSheet.csv"
     assert [s.outputs for s in steps] == [
-        {"demux_config": "extra_config_demultiplex.config"},
         {"samplesheet": sheet},
         {},
         {},
@@ -152,7 +149,6 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
     # Every later step of the lane re-runs whenever the lane's cleanup ran.
     assert [s.inputs for s in steps] == [
         {"lane_cleanup": token},
-        {"lane_cleanup": token},
         {"lane_cleanup": token, "samplesheet": sheet},
         {"lane_cleanup": token},
         {"lane_cleanup": token},
@@ -161,18 +157,18 @@ def test_each_branch_is_a_chain_of_namespaced_steps():
     assert scenario["samplesheet_payload"] == {"lane": 3}
     assert scenario["demux_sample_info_doc"] == {"metadata": {"m": 1}}
     # Only execute_demux gets the sheet location and the per-run options.
-    execute = steps[2].params["scenario"]
+    execute = steps[1].params["scenario"]
     assert execute == {
         **scenario,
         "samplesheet_path": Path(sheet),
         "nextflow": {"skip_tools": ["samshee"]},
     }
-    assert steps[1].params == {"scenario": scenario, "samplesheet": Path(sheet)}
-    assert steps[4].params == {"scenario": {**scenario, "lane_settings_count": 1}}
+    assert steps[0].params == {"scenario": scenario, "samplesheet": Path(sheet)}
+    assert steps[3].params == {"scenario": {**scenario, "lane_settings_count": 1}}
     assert all(
         s.params == {"scenario": scenario}
         for i, s in enumerate(steps)
-        if i not in (1, 2, 4)
+        if i not in (0, 1, 3)
     )
     assert all(s.name.endswith("(lane 3, settings 1)") for s in steps)
 
@@ -182,7 +178,7 @@ def test_metadata_prerequisite_is_the_authors_choice():
     clean_steps = [s for s in plan.steps if s.step_id.endswith("__clean_lane")]
 
     assert [s.deps for s in clean_steps] == [
-        [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL]
+        [VALIDATE_RUNFOLDER, UPSERT_X_FLOWCELL, SETUP_COMMON_DEMUX_DIR]
     ] * 2
 
 
@@ -191,11 +187,11 @@ def test_each_lane_starts_with_a_clean_lane_step():
     clean = _step(plan, "lane_1__clean_lane")
 
     assert clean.fn_ref == "demux_realm.steps.clean_lane"
-    assert clean.deps == [VALIDATE_RUNFOLDER]
+    assert clean.deps == [VALIDATE_RUNFOLDER, SETUP_COMMON_DEMUX_DIR]
     assert clean.params["scenario"]["lane_id"] == "1"
     step_ids = [s.step_id for s in plan.steps]
     assert step_ids.index("lane_1__clean_lane") < step_ids.index(
-        "lane_1_settings_0__materialize_config"
+        "lane_1_settings_0__generate_samplesheet"
     )
 
 

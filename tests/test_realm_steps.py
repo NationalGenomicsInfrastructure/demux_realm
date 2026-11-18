@@ -7,7 +7,7 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
-from realm_support import REQUIRED_NEXTFLOW
+from realm_support import REQUIRED_NEXTFLOW, lane_entry
 from yggdrasil.flow.errors import PermanentStepError
 
 from demux_realm.config import RealmConfig
@@ -17,12 +17,15 @@ from demux_realm.steps import (
     aggregate_undetermined_stats,
     clean_lane,
     collect_results,
+    generate_samplesheet,
     prune_stale_lanes,
+    setup_common_demux_dir,
     symlink_fastqs,
     upload_results,
     upsert_x_flowcell_pre_demux,
     validate_runfolder,
 )
+from demux_realm.utils import samplesheet_link_lane, samplesheet_link_name
 
 # The @step decorator changes the calling convention; the original function is
 # accessible via __wrapped__ for direct unit testing.
@@ -35,6 +38,8 @@ _clean_lane = clean_lane.__wrapped__  # type: ignore[attr-defined]
 _aggregate_undetermined_stats = aggregate_undetermined_stats.__wrapped__  # type: ignore[attr-defined]
 _prune_stale_lanes = prune_stale_lanes.__wrapped__  # type: ignore[attr-defined]
 _symlink_fastqs = symlink_fastqs.__wrapped__  # type: ignore[attr-defined]
+_generate_samplesheet = generate_samplesheet.__wrapped__  # type: ignore[attr-defined]
+_setup_common_demux_dir = setup_common_demux_dir.__wrapped__  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Shared XML content and samplesheet fixtures
@@ -555,6 +560,30 @@ def test_step_raises_when_data_not_injected(tmp_path, scenario):
 
 _FCID = "SC2177698-SC3"
 _BRANCHES = ("lane_1_settings_0", "lane_1_settings_1", "lane_2_settings_0")
+_PROJECT = "A__Project_26_01"
+
+
+def _branch_fastq(results: Path, branch: str) -> Path:
+    """Return the branch's sample FASTQ in bcl-convert's lane/project/sample layout."""
+    lane = branch.split("_")[1]
+    return (
+        results / _FCID / branch / _FCID / f"L00{lane}" / _PROJECT
+        / f"Sample_{branch}" / f"{branch}_R1.fastq.gz"
+    )
+
+
+def _fastq_link(demux_dir: Path, branch: str) -> Path:
+    """Return where symlink_fastqs links the branch's sample FASTQ."""
+    return demux_dir / _PROJECT / f"Sample_{branch}" / f"{branch}_R1.fastq.gz"
+
+
+def _demux_entries(demux_dir: Path) -> list[str]:
+    """Return every file and link under demux_dir, relative to it."""
+    return sorted(
+        str(p.relative_to(demux_dir))
+        for p in demux_dir.rglob("*")
+        if p.is_symlink() or p.is_file()
+    )
 
 
 @pytest.fixture
@@ -572,17 +601,33 @@ def earlier_run(tmp_path, monkeypatch):
     demux_dir = runfolder / "Demultiplexing"
     demux_dir.mkdir(parents=True)
     for branch in _BRANCHES:
-        fastq = results / _FCID / branch / _FCID / f"{branch}_R1.fastq.gz"
+        fastq = _branch_fastq(results, branch)
         fastq.parent.mkdir(parents=True)
         fastq.touch()
         (work / _FCID / branch / "ab").mkdir(parents=True)
-        (demux_dir / fastq.name).symlink_to(fastq)
+        link = _fastq_link(demux_dir, branch)
+        link.parent.mkdir(parents=True)
+        link.symlink_to(fastq)
     # A dangling link left by a branch whose results are already gone.
     (demux_dir / "gone_R1.fastq.gz").symlink_to(
         results / _FCID / "lane_1_settings_7" / "gone_R1.fastq.gz"
     )
     (results / _FCID / "lane_1_settings_7").mkdir()
     (demux_dir / "unrelated.txt").touch()
+
+    # Samplesheet links of every branch, of a settings index no longer
+    # planned, of another flowcell, and a file that is not a link.
+    samplesheets_dir = runfolder / "Samplesheets"
+    samplesheets_dir.mkdir()
+    for branch in (*_BRANCHES, "lane_1_settings_7"):
+        sheet = tmp_path / "artifacts" / branch / "SampleSheet.csv"
+        sheet.parent.mkdir(parents=True)
+        sheet.touch()
+        (samplesheets_dir / f"{_FCID}_{branch}_SampleSheet.csv").symlink_to(sheet)
+    (samplesheets_dir / "OTHERFC_lane_1_settings_0_SampleSheet.csv").symlink_to(
+        tmp_path / "artifacts" / "lane_1_settings_0" / "SampleSheet.csv"
+    )
+    (samplesheets_dir / f"{_FCID}_lane_1_settings_9_SampleSheet.csv").touch()
 
     doc = {
         "_id": "doc-123",
@@ -613,6 +658,7 @@ def earlier_run(tmp_path, monkeypatch):
         results=results,
         work=work,
         demux_dir=demux_dir,
+        samplesheets_dir=samplesheets_dir,
         ctx=ctx,
         client=client,
         scenario=scenario,
@@ -624,13 +670,108 @@ def test_clean_lane_removes_only_that_lanes_results(earlier_run):
 
     flowcell_results = earlier_run.results / _FCID
     assert sorted(p.name for p in flowcell_results.iterdir()) == ["lane_2_settings_0"]
-    assert sorted(p.name for p in earlier_run.demux_dir.iterdir()) == [
-        "lane_2_settings_0_R1.fastq.gz",
+    assert _demux_entries(earlier_run.demux_dir) == [
+        f"{_PROJECT}/Sample_lane_2_settings_0/lane_2_settings_0_R1.fastq.gz",
         "unrelated.txt",
+    ]
+    # The emptied sample directories of lane 1 are removed too.
+    assert sorted(p.name for p in (earlier_run.demux_dir / _PROJECT).iterdir()) == [
+        "Sample_lane_2_settings_0"
     ]
     assert len(result.metrics["removed_symlinks"]) == 3
     # Results of settings 0, 1 and 7, and work dirs of settings 0 and 1.
     assert len(result.metrics["removed_dirs"]) == 5
+
+
+def test_clean_lane_removes_only_that_lanes_samplesheet_links(earlier_run):
+    result = _clean_lane(earlier_run.ctx, {**earlier_run.scenario, "lane_id": "1"})
+
+    assert sorted(p.name for p in earlier_run.samplesheets_dir.iterdir()) == [
+        "OTHERFC_lane_1_settings_0_SampleSheet.csv",
+        f"{_FCID}_lane_1_settings_9_SampleSheet.csv",
+        f"{_FCID}_lane_2_settings_0_SampleSheet.csv",
+    ]
+    assert result.metrics["removed_samplesheet_links"] == [
+        str(earlier_run.samplesheets_dir / f"{_FCID}_lane_1_settings_{i}_SampleSheet.csv")
+        for i in (0, 1, 7)
+    ]
+
+
+def test_prune_stale_lanes_removes_samplesheet_links_outside_the_plan(earlier_run):
+    result = _prune_stale_lanes(
+        earlier_run.ctx, {**earlier_run.scenario, "lanes": ["1"]}
+    )
+
+    assert result.metrics["removed_samplesheet_links"] == [
+        str(earlier_run.samplesheets_dir / f"{_FCID}_lane_2_settings_0_SampleSheet.csv")
+    ]
+
+
+def test_setup_common_demux_dir_creates_the_shared_runfolder_dirs(tmp_path):
+    result = _setup_common_demux_dir(
+        MagicMock(), {"hpc_runfolder_path": str(tmp_path)}
+    )
+
+    assert (tmp_path / "Demultiplexing").is_dir()
+    assert (tmp_path / "Samplesheets").is_dir()
+    assert result.metrics["samplesheets_dir"] == str(tmp_path / "Samplesheets")
+
+
+def _sheet_scenario(runfolder: Path) -> dict:
+    return {
+        "canonical_flowcell_id": _FCID,
+        "hpc_runfolder_path": str(runfolder),
+        "lane_id": "2",
+        "settings_index": "1",
+        "samplesheet_payload": lane_entry(2, settings_index=1),
+    }
+
+
+def test_generate_samplesheet_links_the_sheet_by_flowcell_lane_and_settings(
+    tmp_path,
+):
+    runfolder = tmp_path / "runfolder"
+    runfolder.mkdir()
+    sheet = tmp_path / "artifacts" / "lane_2_settings_1" / "SampleSheet.csv"
+
+    result = _generate_samplesheet(MagicMock(), _sheet_scenario(runfolder), sheet)
+
+    link = runfolder / "Samplesheets" / f"{_FCID}_lane_2_settings_1_SampleSheet.csv"
+    assert link.is_symlink()
+    assert link.resolve() == sheet.resolve()
+    assert result.metrics["samplesheet_link"] == str(link)
+
+
+def test_generate_samplesheet_replaces_a_stale_link(tmp_path):
+    runfolder = tmp_path / "runfolder"
+    link = runfolder / "Samplesheets" / f"{_FCID}_lane_2_settings_1_SampleSheet.csv"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "gone" / "SampleSheet.csv")
+    sheet = tmp_path / "artifacts" / "lane_2_settings_1" / "SampleSheet.csv"
+
+    _generate_samplesheet(MagicMock(), _sheet_scenario(runfolder), sheet)
+
+    assert link.resolve() == sheet.resolve()
+
+
+@pytest.mark.parametrize(
+    ("name", "lane"),
+    [
+        (f"{_FCID}_lane_3_settings_0_SampleSheet.csv", "3"),
+        (f"{_FCID}_lane_3_settings_0_SampleSheet.csv.bak", None),
+        ("OTHERFC_lane_3_settings_0_SampleSheet.csv", None),
+        (f"X{_FCID}_lane_3_settings_0_SampleSheet.csv", None),
+    ],
+)
+def test_samplesheet_link_lane_matches_only_this_flowcells_links(name, lane):
+    assert samplesheet_link_lane(_FCID, name) == lane
+
+
+def test_samplesheet_link_name_round_trips():
+    name = samplesheet_link_name(_FCID, "4", "2")
+
+    assert name == f"{_FCID}_lane_4_settings_2_SampleSheet.csv"
+    assert samplesheet_link_lane(_FCID, name) == "4"
 
 
 def test_clean_lane_writes_a_new_token_every_run(earlier_run):
@@ -681,9 +822,13 @@ def test_prune_stale_lanes_removes_lanes_outside_the_plan(earlier_run):
         "lane_1_settings_1",
         "lane_1_settings_7",
     ]
-    assert "lane_2_settings_0_R1.fastq.gz" not in {
-        p.name for p in earlier_run.demux_dir.iterdir()
-    }
+    # The project directory is removed once its last sample link is gone.
+    assert _demux_entries(earlier_run.demux_dir) == [
+        f"{_PROJECT}/Sample_lane_1_settings_0/lane_1_settings_0_R1.fastq.gz",
+        f"{_PROJECT}/Sample_lane_1_settings_1/lane_1_settings_1_R1.fastq.gz",
+        "gone_R1.fastq.gz",
+        "unrelated.txt",
+    ]
     assert sorted(p.name for p in (earlier_run.work / _FCID).iterdir()) == [
         "lane_1_settings_0",
         "lane_1_settings_1",
@@ -699,16 +844,17 @@ def test_prune_stale_lanes_keeps_every_planned_lane(earlier_run):
         earlier_run.ctx, {**earlier_run.scenario, "lanes": ["1", "2"]}
     )
 
-    assert result.metrics == {"removed_dirs": [], "removed_symlinks": []}
+    assert result.metrics == {
+        "removed_dirs": [],
+        "removed_symlinks": [],
+        "removed_samplesheet_links": [],
+    }
 
 
 def test_symlink_fastqs_replaces_a_dangling_link(earlier_run):
     scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
-    fastq = (
-        earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
-        / "lane_1_settings_0_R1.fastq.gz"
-    )
-    link = earlier_run.demux_dir / fastq.name
+    fastq = _branch_fastq(earlier_run.results, "lane_1_settings_0")
+    link = _fastq_link(earlier_run.demux_dir, "lane_1_settings_0")
     link.unlink()
     link.symlink_to(earlier_run.results / "gone" / fastq.name)
 
@@ -719,7 +865,7 @@ def test_symlink_fastqs_replaces_a_dangling_link(earlier_run):
 
 def test_symlink_fastqs_keeps_a_current_link(earlier_run):
     scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
-    link = earlier_run.demux_dir / "lane_1_settings_0_R1.fastq.gz"
+    link = _fastq_link(earlier_run.demux_dir, "lane_1_settings_0")
     before = os.readlink(link)
 
     _symlink_fastqs(earlier_run.ctx, scenario)
@@ -867,6 +1013,17 @@ def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario):
     assert store.doc["Undetermined"] == {"1": {"GGGG": 14}, "2": {"GGGG": 7}}
 
 
+def test_symlink_fastqs_rejects_a_sample_fastq_outside_the_project_layout(
+    earlier_run,
+):
+    branch_results = earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
+    (branch_results / "L001" / "stray_R1.fastq.gz").touch()
+    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+
+    with pytest.raises(PermanentStepError, match="Unexpected FASTQ location"):
+        _symlink_fastqs(earlier_run.ctx, scenario)
+
+
 @pytest.mark.parametrize(
     ("settings_count", "undetermined_linked"), [(1, True), (2, False)]
 )
@@ -874,7 +1031,7 @@ def test_symlink_fastqs_links_undetermined_only_for_a_single_settings_run(
     earlier_run, settings_count, undetermined_linked
 ):
     branch_results = earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
-    undetermined = branch_results / "Undetermined_S0_L001_R1_001.fastq.gz"
+    undetermined = branch_results / "L001" / "Undetermined_S0_L001_R1_001.fastq.gz"
     undetermined.touch()
     scenario = {
         **earlier_run.scenario,
@@ -885,8 +1042,11 @@ def test_symlink_fastqs_links_undetermined_only_for_a_single_settings_run(
 
     result = _symlink_fastqs(earlier_run.ctx, scenario)
 
-    links = {p.name for p in earlier_run.demux_dir.iterdir()}
-    assert "lane_1_settings_0_R1.fastq.gz" in links
+    links = _demux_entries(earlier_run.demux_dir)
+    assert (
+        f"{_PROJECT}/Sample_lane_1_settings_0/lane_1_settings_0_R1.fastq.gz" in links
+    )
+    # Undetermined FASTQs belong to no project, so they are linked in demux_dir.
     assert (undetermined.name in links) is undetermined_linked
     assert result.metrics["skipped_undetermined"] == (
         [] if undetermined_linked else [str(undetermined)]
