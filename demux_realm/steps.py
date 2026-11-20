@@ -942,32 +942,74 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 # TODO: Add a step to aggregate demux stats for lanes with multiple demuxes
 
 
-def _fastq_link_path(demux_dir: Path, results_dir: Path, fastq: Path) -> Path:
+# bcl-convert's FASTQ file name: <prefix>_S<n>[_L<lane>]_<R|I><n>_001.fastq.gz,
+# where <prefix> is the Sample_Name (with --sample-name-column-enabled) or
+# else the Sample_ID, and <n> the sample's number in the samplesheet.
+_FASTQ_NAME = re.compile(
+    r"^(?P<prefix>.+)_S(?P<number>\d+)(?:_L\d{3})?_[RI]\d_\d{3}\.fastq\.gz$"
+)
+
+
+def _sample_dirs(samplesheet_payload: dict) -> dict[int, tuple[str, set[str], Path]]:
+    """Return each sample's number, file name prefixes and project/sample dir.
+
+    bcl-convert numbers the samples (the S<n> of the FASTQ names) by the
+    order in which each Sample_ID first appears in the samplesheet, starting
+    at 1. The branch's samplesheet is rendered from samplesheet_payload's
+    BCLConvert_Data rows in their order (see render_bcl_convert_samplesheet),
+    so the same numbering applies here.
+    """
+    samples: dict[str, tuple[set[str], Path]] = {}
+    for row in samplesheet_payload["BCLConvert_Data"]:
+        sample_id = str(row["Sample_ID"])
+        if sample_id not in samples:
+            samples[sample_id] = (
+                {sample_id, str(row["Sample_Name"])},
+                Path(str(row["Sample_Project"])) / sample_id,
+            )
+    return {
+        number: (sample_id, prefixes, sample_dir)
+        for number, (sample_id, (prefixes, sample_dir)) in enumerate(
+            samples.items(), start=1
+        )
+    }
+
+
+def _fastq_link_path(
+    demux_dir: Path,
+    sample_dirs: dict[int, tuple[str, set[str], Path]],
+    fastq: Path,
+) -> Path:
     """Return where fastq is linked in the runfolder's Demultiplexing directory.
 
-    When using the "--bcl-sampleproject-subdirectories true" and
-    "--sample-name-column-enabled true" options, bcl-convert writes sample
-    FASTQs as <lane>/<project>/<sample>/<file> under results_dir, e.g.
-    L001/A__Project_26_01/Sample_P12345_1001/P12345_1001_S1_L001_R1_001.fastq.gz;
-    they are linked as demux_dir/<project>/<sample>/<file>. Undetermined FASTQs
-    belong to no project and are linked directly in demux_dir.
+    Sample FASTQs are linked as demux_dir/<Sample_Project>/<Sample_ID>/<file>,
+    e.g. A__Project_26_01/Sample_P12345_1001/P12345_1001_S1_L001_R1_001.fastq.gz.
+    This is the layout bcl-convert writes with "--bcl-sampleproject-
+    subdirectories true", but nf-core/demultiplex (from 1.7.1, which
+    publishes through workflow outputs) publishes the FASTQs by file name
+    only, so the project and sample are looked up in the branch's
+    samplesheet (see _sample_dirs) instead of being taken from the path.
+    Undetermined FASTQs belong to no project and are linked directly in
+    demux_dir.
 
     Raises:
-        PermanentStepError: If a sample FASTQ is not in that layout.
+        PermanentStepError: If a sample FASTQ's name does not match a sample
+            of the samplesheet.
     """
     if fastq.name.startswith("Undetermined"):
         return demux_dir / fastq.name
-    parts = fastq.relative_to(results_dir).parts
-    if len(parts) != 4:
+    match = _FASTQ_NAME.match(fastq.name)
+    sample = sample_dirs.get(int(match["number"])) if match else None
+    if match is None or sample is None or match["prefix"] not in sample[1]:
         raise PermanentStepError(
-            f"Unexpected FASTQ location: {fastq}",
+            f"FASTQ matches no sample of the samplesheet: {fastq}",
             advice=(
-                "Sample FASTQs must be at <lane>/<project>/<sample>/<file> "
-                f"under {results_dir}."
+                "Sample FASTQs must be named <Sample_Name or Sample_ID>_S<n>_..."
+                ".fastq.gz, where S<n> is the sample's number in the branch's "
+                "samplesheet."
             ),
         )
-    _lane, project, sample, name = parts
-    return demux_dir / project / sample / name
+    return demux_dir / sample[2] / fastq.name  # sample[2] is the sample's directory
 
 
 @step
@@ -1000,8 +1042,12 @@ def symlink_fastqs(ctx: StepContext, scenario: dict) -> StepResult:
         for fq in skipped:
             logger.info("Not linking %s: the lane has several settings runs.", fq)
     demux_dir = Path(scenario["hpc_runfolder_path"]) / "Demultiplexing"
-    for fq in fastqs:
-        _link(_fastq_link_path(demux_dir, results_dir, fq), fq)
+    sample_dirs = _sample_dirs(scenario["samplesheet_payload"])
+    # Work out every link before creating any, so a FASTQ that matches no
+    # sample leaves the demux dir untouched.
+    links = [(_fastq_link_path(demux_dir, sample_dirs, fq), fq) for fq in fastqs]
+    for link, fq in links:
+        _link(link, fq)
 
     return StepResult(
         metrics={
