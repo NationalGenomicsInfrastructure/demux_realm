@@ -1009,7 +1009,7 @@ def _fastq_link_path(
                 "samplesheet."
             ),
         )
-    return demux_dir / sample[2] / fastq.name
+    return demux_dir / sample[2] / fastq.name  # sample[2] is the sample's directory
 
 
 @step
