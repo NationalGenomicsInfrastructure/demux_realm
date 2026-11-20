@@ -946,7 +946,7 @@ def collect_results(ctx: StepContext, scenario: dict) -> StepResult:
 # where <prefix> is the Sample_Name (with --sample-name-column-enabled) or
 # else the Sample_ID, and <n> the sample's number in the samplesheet.
 _FASTQ_NAME = re.compile(
-    r"^(?P<prefix>.+)_S(?P<number>\d+)(?:_L\d{3})?_[RI]\d+_\d{3}\.fastq\.gz$"
+    r"^(?P<prefix>.+)_S(?P<number>\d+)(?:_L\d{3})?_[RI]\d_\d{3}\.fastq\.gz$"
 )
 
 
