@@ -417,7 +417,8 @@ def _build_illumina_stats(
         barcode_lane_statistics.append(
             {
                 "Lane": lane,
-                "Sample": sample,
+                # Sample_ID is "Sample_<name>"; show bare name like legacy TACA.
+                "Sample": sample.removeprefix("Sample_"),
                 "Barcode sequence": _format_barcode_sequence(row.get("Index") or "")
                 or "unknown",
                 "Project": sample_project.get(sample, "default"),
