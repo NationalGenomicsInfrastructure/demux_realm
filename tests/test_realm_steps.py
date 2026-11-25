@@ -422,14 +422,14 @@ def test_aggregate_illumina_stats_combines_all_lanes():
         "_rev": "2-abc",
         "name": "20260312_ASC2177698-SC3",
         "samplesheet_csv": [
-            {"Sample_ID": "P1_101", "Sample_Project": "A__Proj"},
+            {"Sample_ID": "Sample_P1_101", "Sample_Project": "A__Proj"},
             {"Sample_ID": "P2_201", "Sample_Project": "B__Proj"},
         ],
         "lane_1_settings_0": {
             "Demultiplex_Stats": [
                 {
                     "Lane": "1",
-                    "SampleID": "P1_101",
+                    "SampleID": "Sample_P1_101",
                     "Index": "AAAA+TTTT",
                     "# Reads": "1000",
                     "# Perfect Index Reads": "900",
@@ -451,9 +451,9 @@ def test_aggregate_illumina_stats_combines_all_lanes():
                 },
             ],
             "Quality_Metrics": [
-                _qm_row("1", "P1_101", "1", 100_000_000, 90_000_000, 3_500_000_000),
-                _qm_row("1", "P1_101", "2", 100_000_000, 85_000_000, 3_400_000_000),
-                _qm_row("1", "P1_101", "I1", 999, 999, 999),
+                _qm_row("1", "Sample_P1_101", "1", 100_000_000, 90_000_000, 3_500_000_000),
+                _qm_row("1", "Sample_P1_101", "2", 100_000_000, 85_000_000, 3_400_000_000),
+                _qm_row("1", "Sample_P1_101", "I1", 999, 999, 999),
                 _qm_row(
                     "1", "Undetermined", "1", 50_000_000, 20_000_000, 1_000_000_000
                 ),
