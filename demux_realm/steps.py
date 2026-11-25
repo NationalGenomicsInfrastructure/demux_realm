@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -219,7 +220,7 @@ def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
     emptied: set[Path] = set()
     # Bottom-up, so a directory is visited after its contents were removed.
     # Links to directories are listed in dirnames but never followed.
-    for dirpath, dirnames, filenames in demux_dir.walk(top_down=False):
+    for dirpath, dirnames, filenames in os.walk(demux_dir, topdown=False):
         directory = Path(dirpath)
         for name in sorted([*dirnames, *filenames]):
             link = directory / name
