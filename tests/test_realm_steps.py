@@ -1065,7 +1065,7 @@ def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario, fake
 
 
 # ---------------------------------------------------------------------------
-# waif on lanes with several settings runs
+# Undetermined counts of lanes with several settings runs
 # ---------------------------------------------------------------------------
 
 
@@ -1106,7 +1106,7 @@ _SHARED_LANE_REPORTS = {
 }
 
 
-def test_waif_input_is_one_report_csv_per_branch_of_shared_lanes(fake_waif):
+def test_shared_lane_input_is_one_report_csv_per_branch(fake_waif):
     fake_waif.rows = [{"Lane": "1", "Barcode": "GGGGGG+AAAAAA", "Count": "80"}]
 
     undetermined, result = _aggregate_undetermined(
@@ -1123,9 +1123,9 @@ def test_waif_input_is_one_report_csv_per_branch_of_shared_lanes(fake_waif):
             + "1,CCCCCC,TTTTTT,1\n",
         }
     ]
-    # Only the shared lane takes waif's counts.
+    # Only the shared lane takes the common counts.
     assert undetermined == {"1": {"GGGGGG+AAAAAA": 80}, "2": {"TTTT": 7}}
-    assert result.metrics["waif_lanes"] == ["1"]
+    assert result.metrics["shared_lanes"] == ["1"]
 
 
 def test_shared_lane_without_common_barcodes_has_none(fake_waif):
@@ -1141,7 +1141,7 @@ def test_waif_does_not_run_without_shared_lanes(fake_waif):
 
     assert fake_waif.inputs == []
     assert undetermined == {"2": {"TTTT": 7}}
-    assert result.metrics["waif_lanes"] == []
+    assert result.metrics["shared_lanes"] == []
 
 
 @pytest.mark.parametrize(

@@ -525,7 +525,7 @@ def _build_undetermined_stats(
     return undetermined
 
 
-#: The BioMate waif CLI, run on lanes with several settings (see _waif_undetermined).
+#: The BioMate waif CLI, run on lanes with several settings (see _shared_lane_undetermined).
 WAIF_COMMAND = ("biomate", "waif")
 
 #: The Top_Unknown_Barcodes.csv columns waif reads.
@@ -538,7 +538,7 @@ def _run_waif(input_dir: Path) -> list[dict[str, str]]:
     Raises:
         PermanentStepError: If the CLI is missing or exits with an error.
     """
-    output = input_dir / "waif.csv"
+    output = input_dir / "common_undetermined.csv"
     cmd = [
         *WAIF_COMMAND,
         "--bclconvert-reports",
@@ -562,8 +562,8 @@ def _run_waif(input_dir: Path) -> list[dict[str, str]]:
     return _read_csv_rows(output)
 
 
-def _waif_undetermined(doc: dict[str, Any]) -> dict[str, dict[str, int]]:
-    """Return waif's Undetermined counts for every lane with several settings.
+def _shared_lane_undetermined(doc: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Return the Undetermined counts of every lane with several settings.
 
     Each settings run of a shared lane reports the reads of the lane's other
     projects as undetermined, with indexes of its own lengths, so summing the
@@ -592,7 +592,7 @@ def _waif_undetermined(doc: dict[str, Any]) -> dict[str, dict[str, int]]:
     if not shared:
         return {}
 
-    with tempfile.TemporaryDirectory(prefix="waif_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="shared_lane_reports_") as tmp:
         input_dir = Path(tmp)
         for lane_key, lane_reports in shared.items():
             for settings_key, report in lane_reports.items():
@@ -1306,7 +1306,7 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     demux_realm_bclconvert_reports and rebuilds Undetermined from their union,
     keyed by lane then by "<index>+<index2>" barcode with its read count.
     Lanes with several settings runs take BioMate waif's counts instead (see
-    _waif_undetermined).
+    _shared_lane_undetermined).
     """
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
@@ -1330,8 +1330,8 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
         top_unknown_rows.extend(report.get("Top_Unknown_Barcodes") or [])
 
     undetermined = _build_undetermined_stats(top_unknown_rows)
-    waif = _waif_undetermined(updated_doc)
-    undetermined.update(waif)
+    shared_lane_undetermined = _shared_lane_undetermined(updated_doc)
+    undetermined.update(shared_lane_undetermined)
     updated_doc["Undetermined"] = undetermined
 
     write_result = client.save(
@@ -1350,7 +1350,7 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
             "x_flowcell_name": name,
             "lane_count": len(undetermined),
             "barcode_row_count": len(top_unknown_rows),
-            "waif_lanes": sorted(waif),
+            "shared_lanes": sorted(shared_lane_undetermined),
             "removed_superseded_reports": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
