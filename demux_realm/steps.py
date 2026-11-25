@@ -1,7 +1,10 @@
 import csv
 import logging
+import os
 import re
 import shutil
+import subprocess
+import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -219,7 +222,7 @@ def _remove_branch_symlinks(demux_dir: Path, outdirs: list[Path]) -> list[str]:
     emptied: set[Path] = set()
     # Bottom-up, so a directory is visited after its contents were removed.
     # Links to directories are listed in dirnames but never followed.
-    for dirpath, dirnames, filenames in demux_dir.walk(top_down=False):
+    for dirpath, dirnames, filenames in os.walk(demux_dir, topdown=False):
         directory = Path(dirpath)
         for name in sorted([*dirnames, *filenames]):
             link = directory / name
@@ -520,6 +523,105 @@ def _build_undetermined_stats(
         lane_bucket = undetermined.setdefault(lane, {})
         lane_bucket[barcode] = lane_bucket.get(barcode, 0) + reads
     return undetermined
+
+
+#: The BioMate waif CLI, run on lanes with several settings (see _shared_lane_undetermined).
+WAIF_COMMAND = ("biomate", "waif")
+
+#: The Top_Unknown_Barcodes.csv columns waif reads.
+_TOP_UNKNOWN_COLUMNS = ("Lane", "index", "index2", "# Reads")
+
+
+def _run_waif(input_dir: Path) -> list[dict[str, str]]:
+    """Run waif on input_dir's bcl-convert reports and return its result rows.
+
+    Raises:
+        PermanentStepError: If the CLI is missing or exits with an error.
+    """
+    output = input_dir / "common_undetermined.csv"
+    cmd = [
+        *WAIF_COMMAND,
+        "--bclconvert-reports",
+        "--input-path",
+        str(input_dir),
+        "--output-file",
+        str(output),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise PermanentStepError(
+            f"waif CLI not found: {WAIF_COMMAND[0]}",
+            advice="Install BioMate so that `biomate` is on the PATH.",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise PermanentStepError(
+            f"waif failed (exit {exc.returncode}): {(exc.stderr or '')[-2000:]}",
+            advice="Check the lane's Top_Unknown_Barcodes reports.",
+        ) from exc
+    return _read_csv_rows(output)
+
+
+def _shared_lane_undetermined(doc: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Return the Undetermined counts of every lane with several settings.
+
+    Each settings run of a shared lane reports the reads of the lane's other
+    projects as undetermined, with indexes of its own lengths, so summing the
+    runs is wrong. waif keeps only the barcodes undetermined in every run.
+    waif reads <Dataset>/Reports/Top_Unknown_Barcodes.csv files; they are
+    written back from the stored rows, one dataset per branch, so waif sees
+    exactly the reports the rest of the aggregation uses. Lanes with one
+    settings run are not returned.
+
+    Returns:
+        {lane: {barcode: count}}; a shared lane with no common barcode maps
+        to {}.
+    """
+    reports = _mapping_at(
+        doc.get("demux_realm_bclconvert_reports"), "demux_realm_bclconvert_reports"
+    )
+    shared = {}
+    for lane_key, lane in reports.items():
+        where = f"demux_realm_bclconvert_reports.{lane_key}"
+        lane_reports = _mapping_at(lane, where)
+        if len(lane_reports) > 1:
+            shared[lane_key] = {
+                key: _mapping_at(report, f"{where}.{key}")
+                for key, report in lane_reports.items()
+            }
+    if not shared:
+        return {}
+
+    with tempfile.TemporaryDirectory(prefix="shared_lane_reports_") as tmp:
+        input_dir = Path(tmp)
+        for lane_key, lane_reports in shared.items():
+            for settings_key, report in lane_reports.items():
+                csv_file = (
+                    input_dir
+                    / f"{lane_key}_{settings_key}"
+                    / "Reports"
+                    / "Top_Unknown_Barcodes.csv"
+                )
+                csv_file.parent.mkdir(parents=True)
+                with csv_file.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=_TOP_UNKNOWN_COLUMNS,
+                        restval="",
+                        extrasaction="ignore",
+                    )
+                    writer.writeheader()
+                    writer.writerows(report.get("Top_Unknown_Barcodes") or [])
+            # An empty intersection gives no rows: the lane has no undetermined
+            # barcode in common rather than its summed counts.
+        result: dict[str, dict[str, int]] = {
+            lane_key.removeprefix("lane_"): {} for lane_key in shared
+        }
+        for row in _run_waif(input_dir):
+            result.setdefault(row["Lane"], {})[row["Barcode"]] = _parse_int(
+                row["Count"]
+            )
+    return result
 
 
 @step
@@ -1203,6 +1305,8 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
     Top_Unknown_Barcodes rows of every branch report under
     demux_realm_bclconvert_reports and rebuilds Undetermined from their union,
     keyed by lane then by "<index>+<index2>" barcode with its read count.
+    Lanes with several settings runs take BioMate waif's counts instead (see
+    _shared_lane_undetermined).
     """
     if ctx.data is None:
         raise RuntimeError("StepContext.data (DataAccess) was not injected.")
@@ -1226,6 +1330,8 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
         top_unknown_rows.extend(report.get("Top_Unknown_Barcodes") or [])
 
     undetermined = _build_undetermined_stats(top_unknown_rows)
+    shared_lane_undetermined = _shared_lane_undetermined(updated_doc)
+    undetermined.update(shared_lane_undetermined)
     updated_doc["Undetermined"] = undetermined
 
     write_result = client.save(
@@ -1244,6 +1350,7 @@ def aggregate_undetermined_stats(ctx: StepContext, scenario: dict) -> StepResult
             "x_flowcell_name": name,
             "lane_count": len(undetermined),
             "barcode_row_count": len(top_unknown_rows),
+            "shared_lanes": sorted(shared_lane_undetermined),
             "removed_superseded_reports": superseded,
             "doc_id": getattr(write_result, "doc_id", None),
         }
