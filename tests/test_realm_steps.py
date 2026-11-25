@@ -563,18 +563,64 @@ _BRANCHES = ("lane_1_settings_0", "lane_1_settings_1", "lane_2_settings_0")
 _PROJECT = "A__Project_26_01"
 
 
-def _branch_fastq(results: Path, branch: str) -> Path:
-    """Return the branch's sample FASTQ in bcl-convert's lane/project/sample layout."""
+def _fastq_name(branch: str) -> str:
+    """Return bcl-convert's name for the branch's sample FASTQ (Sample_Name based)."""
     lane = branch.split("_")[1]
-    return (
-        results / _FCID / branch / _FCID / f"L00{lane}" / _PROJECT
-        / f"Sample_{branch}" / f"{branch}_R1.fastq.gz"
-    )
+    return f"{branch}_S1_L00{lane}_R1_001.fastq.gz"
+
+
+def _branch_fastq(results: Path, branch: str) -> Path:
+    """Return the branch's sample FASTQ as nf-core/demultiplex publishes it.
+
+    Since 1.7.1 the pipeline publishes FASTQs flat under <outdir>/<fcid>,
+    without bcl-convert's project/sample directories.
+    """
+    return results / _FCID / branch / _FCID / _fastq_name(branch)
+
+
+def _fastq_link_rel(branch: str) -> str:
+    """Return where symlink_fastqs links the branch's sample FASTQ, relative to demux_dir."""
+    return f"{_PROJECT}/Sample_{branch}/{_fastq_name(branch)}"
 
 
 def _fastq_link(demux_dir: Path, branch: str) -> Path:
     """Return where symlink_fastqs links the branch's sample FASTQ."""
-    return demux_dir / _PROJECT / f"Sample_{branch}" / f"{branch}_R1.fastq.gz"
+    return demux_dir / _fastq_link_rel(branch)
+
+
+def _branch_payload(branch: str, extra_samples: tuple[str, ...] = ()) -> dict:
+    """Return the samplesheet payload of the branch's run.
+
+    Its first sample is the one _branch_fastq names (S1); extra_samples are
+    numbered after it.
+    """
+    lane = branch.split("_")[1]
+    return {
+        "Header": {"FileFormatVersion": "2"},
+        "BCLConvert_Settings": {},
+        "BCLConvert_Data": [
+            {
+                "Lane": lane,
+                "Sample_ID": f"Sample_{name}",
+                "Sample_Name": name,
+                "index": "ACGTACGT",
+                "Sample_Project": _PROJECT,
+            }
+            for name in (branch, *extra_samples)
+        ],
+    }
+
+
+def _branch_scenario(earlier_run, branch: str, **extra) -> dict:
+    """Return the scenario of the branch's symlink_fastqs step."""
+    _, lane, _, settings = branch.split("_")
+    return {
+        **earlier_run.scenario,
+        "lane_id": lane,
+        "settings_index": settings,
+        "samplesheet_payload": _branch_payload(branch),
+        **extra,
+    }
 
 
 def _demux_entries(demux_dir: Path) -> list[str]:
@@ -671,7 +717,7 @@ def test_clean_lane_removes_only_that_lanes_results(earlier_run):
     flowcell_results = earlier_run.results / _FCID
     assert sorted(p.name for p in flowcell_results.iterdir()) == ["lane_2_settings_0"]
     assert _demux_entries(earlier_run.demux_dir) == [
-        f"{_PROJECT}/Sample_lane_2_settings_0/lane_2_settings_0_R1.fastq.gz",
+        _fastq_link_rel("lane_2_settings_0"),
         "unrelated.txt",
     ]
     # The emptied sample directories of lane 1 are removed too.
@@ -824,8 +870,8 @@ def test_prune_stale_lanes_removes_lanes_outside_the_plan(earlier_run):
     ]
     # The project directory is removed once its last sample link is gone.
     assert _demux_entries(earlier_run.demux_dir) == [
-        f"{_PROJECT}/Sample_lane_1_settings_0/lane_1_settings_0_R1.fastq.gz",
-        f"{_PROJECT}/Sample_lane_1_settings_1/lane_1_settings_1_R1.fastq.gz",
+        _fastq_link_rel("lane_1_settings_0"),
+        _fastq_link_rel("lane_1_settings_1"),
         "gone_R1.fastq.gz",
         "unrelated.txt",
     ]
@@ -852,7 +898,7 @@ def test_prune_stale_lanes_keeps_every_planned_lane(earlier_run):
 
 
 def test_symlink_fastqs_replaces_a_dangling_link(earlier_run):
-    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+    scenario = _branch_scenario(earlier_run, "lane_1_settings_0")
     fastq = _branch_fastq(earlier_run.results, "lane_1_settings_0")
     link = _fastq_link(earlier_run.demux_dir, "lane_1_settings_0")
     link.unlink()
@@ -864,7 +910,7 @@ def test_symlink_fastqs_replaces_a_dangling_link(earlier_run):
 
 
 def test_symlink_fastqs_keeps_a_current_link(earlier_run):
-    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+    scenario = _branch_scenario(earlier_run, "lane_1_settings_0")
     link = _fastq_link(earlier_run.demux_dir, "lane_1_settings_0")
     before = os.readlink(link)
 
@@ -1013,15 +1059,52 @@ def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario):
     assert store.doc["Undetermined"] == {"1": {"GGGG": 14}, "2": {"GGGG": 7}}
 
 
-def test_symlink_fastqs_rejects_a_sample_fastq_outside_the_project_layout(
+def test_symlink_fastqs_links_flat_published_fastqs_by_project_and_sample(
     earlier_run,
 ):
-    branch_results = earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
-    (branch_results / "L001" / "stray_R1.fastq.gz").touch()
-    scenario = {**earlier_run.scenario, "lane_id": "1", "settings_index": "0"}
+    branch = "lane_1_settings_0"
+    branch_results = earlier_run.results / _FCID / branch / _FCID
+    # A second sample of the samplesheet (S2), with both reads.
+    r1 = branch_results / "other_S2_L001_R1_001.fastq.gz"
+    r2 = branch_results / "other_S2_L001_R2_001.fastq.gz"
+    r1.touch()
+    r2.touch()
+    for link in earlier_run.demux_dir.rglob("*"):
+        if link.is_symlink():
+            link.unlink()
+    scenario = _branch_scenario(earlier_run, branch)
+    scenario["samplesheet_payload"] = _branch_payload(branch, ("other",))
 
-    with pytest.raises(PermanentStepError, match="Unexpected FASTQ location"):
-        _symlink_fastqs(earlier_run.ctx, scenario)
+    result = _symlink_fastqs(earlier_run.ctx, scenario)
+
+    other = earlier_run.demux_dir / _PROJECT / "Sample_other"
+    assert (other / r1.name).resolve() == r1.resolve()
+    assert (other / r2.name).resolve() == r2.resolve()
+    assert _fastq_link(earlier_run.demux_dir, branch).resolve() == (
+        _branch_fastq(earlier_run.results, branch).resolve()
+    )
+    assert result.metrics["symlinked_fastq_count"] == 3
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "stray_R1.fastq.gz",  # not a bcl-convert FASTQ name
+        "lane_1_settings_0_S9_L001_R1_001.fastq.gz",  # no sample S9
+        "someone_else_S1_L001_R1_001.fastq.gz",  # S1 is another sample
+    ],
+)
+def test_symlink_fastqs_rejects_a_fastq_of_no_samplesheet_sample(
+    earlier_run, name
+):
+    branch = "lane_1_settings_0"
+    (earlier_run.results / _FCID / branch / _FCID / name).touch()
+    before = _demux_entries(earlier_run.demux_dir)
+
+    with pytest.raises(PermanentStepError, match="matches no sample"):
+        _symlink_fastqs(earlier_run.ctx, _branch_scenario(earlier_run, branch))
+
+    assert _demux_entries(earlier_run.demux_dir) == before
 
 
 @pytest.mark.parametrize(
@@ -1031,21 +1114,16 @@ def test_symlink_fastqs_links_undetermined_only_for_a_single_settings_run(
     earlier_run, settings_count, undetermined_linked
 ):
     branch_results = earlier_run.results / _FCID / "lane_1_settings_0" / _FCID
-    undetermined = branch_results / "L001" / "Undetermined_S0_L001_R1_001.fastq.gz"
+    undetermined = branch_results / "Undetermined_S0_L001_R1_001.fastq.gz"
     undetermined.touch()
-    scenario = {
-        **earlier_run.scenario,
-        "lane_id": "1",
-        "settings_index": "0",
-        "lane_settings_count": settings_count,
-    }
+    scenario = _branch_scenario(
+        earlier_run, "lane_1_settings_0", lane_settings_count=settings_count
+    )
 
     result = _symlink_fastqs(earlier_run.ctx, scenario)
 
     links = _demux_entries(earlier_run.demux_dir)
-    assert (
-        f"{_PROJECT}/Sample_lane_1_settings_0/lane_1_settings_0_R1.fastq.gz" in links
-    )
+    assert _fastq_link_rel("lane_1_settings_0") in links
     # Undetermined FASTQs belong to no project, so they are linked in demux_dir.
     assert (undetermined.name in links) is undetermined_linked
     assert result.metrics["skipped_undetermined"] == (
