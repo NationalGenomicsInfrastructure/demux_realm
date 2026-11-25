@@ -1,5 +1,6 @@
 import copy
 import os
+import shutil
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,9 +8,11 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import REAL_RUN_WAIF
 from realm_support import REQUIRED_NEXTFLOW, lane_entry
 from yggdrasil.flow.errors import PermanentStepError
 
+import demux_realm.steps as realm_steps
 from demux_realm.config import RealmConfig
 from demux_realm.nextflow import settings_from_mapping
 from demux_realm.steps import (
@@ -1037,13 +1040,14 @@ def test_upload_refuses_a_malformed_reports_field():
     assert store.doc["demux_realm_bclconvert_reports"] == []
 
 
-def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario):
+def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario, fake_waif):
     store = StoredXFlowcells({"name": "20260312_ASC2177698-SC3"})
     _upload(store, "1", "0", "A")
     _upload(store, "1", "1", "B")
     _upload(store, "2", "0", "C")
     ctx = MagicMock()
     ctx.data.connection.return_value = store
+    fake_waif.rows = [{"Lane": "1", "Barcode": "GGGG", "Count": "10"}]
 
     _step(ctx, scenario)
     lane_1 = {**scenario, "lane_id": "1", "settings_indices": ["0", "1"]}
@@ -1056,7 +1060,112 @@ def test_upsert_and_aggregates_keep_every_lanes_reports(tmp_path, scenario):
     }
     rows = store.doc["illumina"]["Demultiplex_Stats"]["Barcode_lane_statistics"]
     assert sorted(row["Sample"] for row in rows) == ["A", "B", "C"]
-    assert store.doc["Undetermined"] == {"1": {"GGGG": 14}, "2": {"GGGG": 7}}
+    # Lane 1 has two settings runs: waif's count, not the 7 + 7 sum.
+    assert store.doc["Undetermined"] == {"1": {"GGGG": 10}, "2": {"GGGG": 7}}
+
+
+# ---------------------------------------------------------------------------
+# waif on lanes with several settings runs
+# ---------------------------------------------------------------------------
+
+
+def _unknown(lane, *barcodes):
+    """A branch report with Top_Unknown_Barcodes rows (index, index2, reads)."""
+    return {
+        "Top_Unknown_Barcodes": [
+            {"Lane": lane, "index": i1, "index2": i2, "# Reads": reads}
+            for i1, i2, reads in barcodes
+        ]
+    }
+
+
+def _aggregate_undetermined(reports, lane_id, settings_indices):
+    store = StoredXFlowcells(
+        {"name": "20260312_ASC2177698-SC3", "demux_realm_bclconvert_reports": reports}
+    )
+    ctx = MagicMock()
+    ctx.data.connection.return_value = store
+    scenario = {
+        "canonical_flowcell_id": _FCID,
+        "runfolder_id": "20260312_SH01140_0005_ASC2177698-SC3",
+        "lane_id": lane_id,
+        "settings_indices": settings_indices,
+    }
+    result = _aggregate_undetermined_stats(ctx, scenario)
+    return store.doc["Undetermined"], result
+
+
+_SHARED_LANE_REPORTS = {
+    "lane_1": {
+        "settings_0": _unknown("1", ("GGGGGGGG", "AAAAAAAA", "100")),
+        "settings_1": _unknown(
+            "1", ("GGGGGG", "AAAAAA", "50"), ("CCCCCC", "TTTTTT", "1")
+        ),
+    },
+    "lane_2": {"settings_0": _unknown("2", ("TTTT", "", "7"))},
+}
+
+
+def test_waif_input_is_one_report_csv_per_branch_of_shared_lanes(fake_waif):
+    fake_waif.rows = [{"Lane": "1", "Barcode": "GGGGGG+AAAAAA", "Count": "80"}]
+
+    undetermined, result = _aggregate_undetermined(
+        _SHARED_LANE_REPORTS, "1", ["0", "1"]
+    )
+
+    header = "Lane,index,index2,# Reads\n"
+    assert fake_waif.inputs == [
+        {
+            "lane_1_settings_0/Reports/Top_Unknown_Barcodes.csv": header
+            + "1,GGGGGGGG,AAAAAAAA,100\n",
+            "lane_1_settings_1/Reports/Top_Unknown_Barcodes.csv": header
+            + "1,GGGGGG,AAAAAA,50\n"
+            + "1,CCCCCC,TTTTTT,1\n",
+        }
+    ]
+    # Only the shared lane takes waif's counts.
+    assert undetermined == {"1": {"GGGGGG+AAAAAA": 80}, "2": {"TTTT": 7}}
+    assert result.metrics["waif_lanes"] == ["1"]
+
+
+def test_shared_lane_without_common_barcodes_has_none(fake_waif):
+    undetermined, _ = _aggregate_undetermined(_SHARED_LANE_REPORTS, "1", ["0", "1"])
+
+    assert undetermined == {"1": {}, "2": {"TTTT": 7}}
+
+
+def test_waif_does_not_run_without_shared_lanes(fake_waif):
+    reports = {"lane_2": {"settings_0": _unknown("2", ("TTTT", "", "7"))}}
+
+    undetermined, result = _aggregate_undetermined(reports, "2", ["0"])
+
+    assert fake_waif.inputs == []
+    assert undetermined == {"2": {"TTTT": 7}}
+    assert result.metrics["waif_lanes"] == []
+
+
+@pytest.mark.parametrize(
+    ("command", "match"),
+    [
+        (("biomate-missing-for-test",), "waif CLI not found"),
+        (("false",), "waif failed"),
+    ],
+)
+def test_waif_cli_errors_are_permanent(monkeypatch, tmp_path, command, match):
+    monkeypatch.setattr(realm_steps, "WAIF_COMMAND", command)
+
+    with pytest.raises(PermanentStepError, match=match):
+        REAL_RUN_WAIF(tmp_path)
+
+
+@pytest.mark.skipif(shutil.which("biomate") is None, reason="biomate not installed")
+def test_shared_lane_counts_come_from_the_real_waif_cli(monkeypatch):
+    monkeypatch.setattr(realm_steps, "_run_waif", REAL_RUN_WAIF)
+
+    undetermined, _ = _aggregate_undetermined(_SHARED_LANE_REPORTS, "1", ["0", "1"])
+
+    # 100 and 50 after truncating to 6+6: mean 75, rounded up to 80.
+    assert undetermined == {"1": {"GGGGGG+AAAAAA": 80}, "2": {"TTTT": 7}}
 
 
 def test_symlink_fastqs_links_flat_published_fastqs_by_project_and_sample(

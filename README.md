@@ -194,6 +194,17 @@ settings indices no longer planned and rebuild `illumina` and `Undetermined`
 from every entry in the field. Only those two derived fields are read by the
 StatusDB views; the reports field is the realm's own source data for them.
 
+`Undetermined` sums each lane's `Top_Unknown_Barcodes` counts, except on a
+shared lane (one with two or more settings entries, e.g. projects with
+different index lengths). There each run reports the other projects' reads as
+undetermined, so the lane takes the counts from BioMate's
+[waif](https://github.com/NationalGenomicsInfrastructure/BioMate/blob/main/docs/waif.md)
+instead: only the barcodes undetermined in every run, with the mean count.
+The aggregate step writes the stored reports back as
+`<branch>/Reports/Top_Unknown_Barcodes.csv` files and runs
+`biomate waif --bclconvert-reports` on them; a BioMate version with that
+option must be on the `PATH` of the Yggdrasil process.
+
 `prune_stale_lanes` removes the results and work directories, FASTQ links and
 samplesheet links of lanes no longer in the samplesheets. Their `lane_<n>` reports are not removed, and stay
 in the aggregated stats until removed by hand.
